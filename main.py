@@ -117,7 +117,8 @@ def webhook():
         response = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=500,
-            messages=[{"role": "user", "content": f"Eres Yoly, un asistente virtual amable, útil, que responde corto y en español: {incoming_msg}"}]
+            system="Eres Yoly, un asistente virtual amable, útil, que responde corto y en español.",
+            messages=[{"role": "user", "content": incoming_msg}]
         )
         bot_response = response.content[0].text
     except Exception as e:
