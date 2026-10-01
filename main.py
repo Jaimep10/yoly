@@ -1,4 +1,6 @@
 import os
+import json
+from datetime import datetime, timedelta
 from flask import Flask, request, send_file
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
@@ -15,6 +17,281 @@ from datetime import datetime
 app = Flask(__name__)
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 twilio_client = Client(os.environ.get("TWILIO_ACCOUNT_SID"), os.environ.get("TWILIO_AUTH_TOKEN"))
+
+GOALS_FILE = 'goals.json'
+
+# ==================== GOAL MANAGEMENT FUNCTIONS ====================
+
+def cargar_metas():
+    """Carga las metas desde el archivo JSON"""
+    if os.path.exists(GOALS_FILE):
+        try:
+            with open(GOALS_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error cargando metas: {e}")
+            return []
+    return []
+
+def guardar_metas(metas):
+    """Guarda las metas en el archivo JSON"""
+    try:
+        with open(GOALS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(metas, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error guardando metas: {e}")
+        return False
+
+def registrar_meta(nombre, monto_objetivo, fecha_limite, categoria, monto_actual=0):
+    """
+    Registra una nueva meta financiera
+    Categorías: 'debt_payoff', 'savings', 'investment'
+    """
+    metas = cargar_metas()
+
+    # Verificar si ya existe una meta con el mismo nombre
+    for meta in metas:
+        if meta['nombre'].lower() == nombre.lower():
+            return False, "Ya existe una meta con ese nombre"
+
+    nueva_meta = {
+        'nombre': nombre,
+        'monto_objetivo': monto_objetivo,
+        'monto_actual': monto_actual,
+        'fecha_limite': fecha_limite,
+        'categoria': categoria,
+        'fecha_creacion': datetime.now().isoformat(),
+        'actualizaciones': []
+    }
+
+    metas.append(nueva_meta)
+    if guardar_metas(metas):
+        return True, f"Meta '{nombre}' registrada exitosamente"
+    return False, "Error al registrar la meta"
+
+def obtener_metas():
+    """Obtiene todas las metas con información de progreso"""
+    metas = cargar_metas()
+    metas_con_progreso = []
+
+    for meta in metas:
+        porcentaje = (meta['monto_actual'] / meta['monto_objetivo'] * 100) if meta['monto_objetivo'] > 0 else 0
+        falta = max(0, meta['monto_objetivo'] - meta['monto_actual'])
+
+        # Calcular días faltantes
+        fecha_limite = datetime.fromisoformat(meta['fecha_limite'])
+        hoy = datetime.now()
+        dias_faltantes = (fecha_limite - hoy).days
+
+        meta_con_progreso = {
+            **meta,
+            'porcentaje_progreso': round(porcentaje, 1),
+            'monto_faltante': round(falta, 2),
+            'dias_faltantes': dias_faltantes,
+            'completada': porcentaje >= 100
+        }
+        metas_con_progreso.append(meta_con_progreso)
+
+    return metas_con_progreso
+
+def actualizar_progreso_meta(nombre, cantidad):
+    """Actualiza el progreso de una meta"""
+    metas = cargar_metas()
+
+    for meta in metas:
+        if meta['nombre'].lower() == nombre.lower():
+            meta['monto_actual'] += cantidad
+            # Registrar la actualización
+            meta['actualizaciones'].append({
+                'fecha': datetime.now().isoformat(),
+                'cantidad': cantidad
+            })
+
+            if guardar_metas(metas):
+                return True, f"Progreso actualizado: ${cantidad:.2f} agregado a '{nombre}'"
+            return False, "Error al actualizar la meta"
+
+    return False, f"Meta '{nombre}' no encontrada"
+
+def analizar_metas_y_dar_consejos():
+    """Usa Claude API para analizar metas y dar consejos personalizados"""
+    metas = obtener_metas()
+
+    if not metas:
+        return "No tienes metas registradas. ¡Crea algunas para empezar!"
+
+    # Preparar resumen de metas para Claude
+    resumen_metas = ""
+    for meta in metas:
+        estado = "✓ Completada" if meta['completada'] else f"{meta['porcentaje_progreso']}% avance"
+        resumen_metas += f"\n- {meta['nombre']}: ${meta['monto_actual']:.2f}/${meta['monto_objetivo']:.2f} ({estado})"
+        if not meta['completada'] and meta['dias_faltantes'] > 0:
+            monto_mensual = meta['monto_faltante'] / max(1, meta['dias_faltantes'] / 30)
+            resumen_metas += f" | Necesitas ahorrar ${monto_mensual:.2f}/mes"
+
+    # Solicitar análisis a Claude
+    try:
+        response = client.messages.create(
+            model="claude-3-5-sonnet-20241022",
+            max_tokens=800,
+            system="""Eres Yoly, un asesor financiero amable y motivador.
+Analiza las metas del usuario y proporciona:
+1. Un resumen motivador del progreso
+2. Consejos prácticos para alcanzar las metas
+3. Sugerencias específicas para ahorrar más o acelerar el progreso
+4. Recordatorio de la importancia de cada meta
+Responde siempre en español, de forma amable y motivadora.""",
+            messages=[{
+                "role": "user",
+                "content": f"Analiza mis metas financieras y dame consejos: {resumen_metas}"
+            }]
+        )
+        return response.content[0].text
+    except Exception as e:
+        print(f"Error analizando metas: {e}")
+        return "Error al analizar tus metas. Intenta de nuevo más tarde."
+
+def generar_proyecciones(meses=12):
+    """Genera proyecciones financieras de 6 y 12 meses"""
+    metas = obtener_metas()
+
+    if not metas:
+        return {}
+
+    proyecciones = {
+        '6_meses': {},
+        '12_meses': {}
+    }
+
+    for meta in metas:
+        if meta['monto_objetivo'] <= meta['monto_actual']:
+            proyecciones['6_meses'][meta['nombre']] = {
+                'estado': 'completada',
+                'fecha_cumplimiento': 'Ya completada'
+            }
+            proyecciones['12_meses'][meta['nombre']] = {
+                'estado': 'completada',
+                'fecha_cumplimiento': 'Ya completada'
+            }
+            continue
+
+        # Calcular velocidad de ahorro promedio
+        fecha_creacion = datetime.fromisoformat(meta['fecha_creacion'])
+        dias_transcurridos = (datetime.now() - fecha_creacion).days
+
+        if dias_transcurridos > 0:
+            velocidad_diaria = meta['monto_actual'] / dias_transcurridos
+        else:
+            velocidad_diaria = 0
+
+        # Proyectar para 6 meses
+        monto_6_meses = meta['monto_actual'] + (velocidad_diaria * 180)
+        completada_6_meses = monto_6_meses >= meta['monto_objetivo']
+
+        # Proyectar para 12 meses
+        monto_12_meses = meta['monto_actual'] + (velocidad_diaria * 365)
+        completada_12_meses = monto_12_meses >= meta['monto_objetivo']
+
+        # Calcular fecha proyectada de cumplimiento
+        if velocidad_diaria > 0:
+            dias_faltantes = (meta['monto_objetivo'] - meta['monto_actual']) / velocidad_diaria
+            fecha_proyectada = datetime.now() + timedelta(days=int(dias_faltantes))
+        else:
+            fecha_proyectada = None
+
+        proyecciones['6_meses'][meta['nombre']] = {
+            'monto_proyectado': round(min(monto_6_meses, meta['monto_objetivo']), 2),
+            'completada': completada_6_meses,
+            'porcentaje': round((monto_6_meses / meta['monto_objetivo'] * 100), 1)
+        }
+
+        proyecciones['12_meses'][meta['nombre']] = {
+            'monto_proyectado': round(min(monto_12_meses, meta['monto_objetivo']), 2),
+            'completada': completada_12_meses,
+            'porcentaje': round((monto_12_meses / meta['monto_objetivo'] * 100), 1),
+            'fecha_cumplimiento': fecha_proyectada.strftime('%d/%m/%Y') if fecha_proyectada else 'No estimado'
+        }
+
+    return proyecciones
+
+def generar_informe_metas():
+    """Genera un PDF con progreso de metas financieras"""
+    metas = obtener_metas()
+
+    if not metas:
+        return None
+
+    pdf_path = '/tmp/informe_metas.pdf'
+    chart_path = '/tmp/metas_chart.png'
+
+    # Preparar datos para gráfico
+    nombres_metas = [m['nombre'][:15] for m in metas]  # Limitar nombre a 15 caracteres
+    porcentajes = [m['porcentaje_progreso'] for m in metas]
+    colores = ['#FF6B6B' if p < 50 else '#FFA07A' if p < 80 else '#90EE90' for p in porcentajes]
+
+    # Generar gráfico de barras
+    plt.figure(figsize=(10, 6))
+    bars = plt.barh(nombres_metas, porcentajes, color=colores)
+    plt.xlabel('Porcentaje de Progreso (%)', fontsize=11)
+    plt.title('Progreso de Tus Metas Financieras', fontsize=14, fontweight='bold')
+    plt.xlim(0, 100)
+
+    # Agregar porcentajes en las barras
+    for i, (bar, pct) in enumerate(zip(bars, porcentajes)):
+        plt.text(pct + 2, i, f'{pct:.1f}%', va='center', fontsize=9)
+
+    plt.tight_layout()
+    plt.savefig(chart_path, dpi=100, bbox_inches='tight')
+    plt.close()
+
+    # Crear PDF
+    c = canvas.Canvas(pdf_path, pagesize=letter)
+    width, height = letter
+
+    # Título
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(50, height - 50, "📊 Informe de Metas Financieras")
+
+    # Fecha
+    c.setFont("Helvetica", 10)
+    c.drawString(50, height - 75, f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+
+    # Tabla de metas
+    c.setFont("Helvetica-Bold", 11)
+    y_pos = height - 120
+    c.drawString(50, y_pos, "Meta")
+    c.drawString(200, y_pos, "Progreso")
+    c.drawString(320, y_pos, "Faltante")
+    c.drawString(420, y_pos, "Plazo")
+
+    c.setFont("Helvetica", 9)
+    y_pos -= 20
+
+    for meta in metas:
+        estado_emoji = "✓" if meta['completada'] else "→"
+        c.drawString(50, y_pos, f"{estado_emoji} {meta['nombre'][:20]}")
+        c.drawString(200, y_pos, f"${meta['monto_actual']:.0f}/${meta['monto_objetivo']:.0f}")
+        c.drawString(320, y_pos, f"${meta['monto_faltante']:.2f}")
+
+        if meta['dias_faltantes'] > 0:
+            dias_text = f"{meta['dias_faltantes']}d"
+        else:
+            dias_text = "Vencido" if not meta['completada'] else "✓"
+        c.drawString(420, y_pos, dias_text)
+        y_pos -= 18
+
+        if y_pos < 80:  # Nueva página si es necesario
+            c.showPage()
+            c.setFont("Helvetica", 9)
+            y_pos = height - 50
+
+    # Agregar gráfico
+    c.showPage()
+    c.drawImage(chart_path, 30, height - 400, width=530, height=320)
+
+    c.save()
+    return pdf_path
 
 def generar_informe_gastos():
     """Genera un PDF con gráfico de gastos de ejemplo"""
@@ -313,14 +590,122 @@ def download_presupuesto():
         return send_file(pdf_path, mimetype='application/pdf', as_attachment=True, download_name='presupuesto_analisis.pdf')
     return "Presupuesto no encontrado", 404
 
+@app.route("/download/informe_metas.pdf", methods=["GET"])
+def download_informe_metas():
+    """Sirve el PDF de informe de metas"""
+    pdf_path = generar_informe_metas()
+    if pdf_path and os.path.exists(pdf_path):
+        return send_file(pdf_path, mimetype='application/pdf', as_attachment=True, download_name='informe_metas.pdf')
+    return "Informe de metas no disponible", 404
+
 @app.route("/webhook/whatsapp", methods=["POST", "GET"])
 def webhook():
     incoming_msg = request.values.get('Body', '').strip()
     from_number = request.values.get('From', '')
     print(f"Mensaje: {incoming_msg}")
 
+    resp = MessagingResponse()
+    msg_lower = incoming_msg.lower()
+
+    # ==================== GOALS KEYWORDS ====================
+
+    # Ver metas o solicitar análisis de metas
+    if any(keyword in msg_lower for keyword in ['metas', 'objetivos', 'mis objetivos', 'ver metas', 'estado metas']):
+        metas = obtener_metas()
+        if not metas:
+            resp.message("No tienes metas registradas. Puedo ayudarte a crearlas. ¿Cuál es tu objetivo financiero?")
+            return str(resp)
+
+        # Generar resumen de metas
+        resumen = "📊 *Tus Metas Financieras:*\n"
+        for meta in metas:
+            emoji = "✓" if meta['completada'] else "→"
+            resumen += f"\n{emoji} {meta['nombre']}\n"
+            resumen += f"   Progreso: ${meta['monto_actual']:.2f}/${meta['monto_objetivo']:.2f}\n"
+            resumen += f"   {meta['porcentaje_progreso']:.1f}% | Faltante: ${meta['monto_faltante']:.2f}"
+            if meta['dias_faltantes'] > 0:
+                resumen += f" | {meta['dias_faltantes']} días"
+            resumen += "\n"
+
+        resp.message(resumen)
+        return str(resp)
+
+    # Solicitar consejos y análisis de metas
+    if any(keyword in msg_lower for keyword in ['consejo', 'consejos metas', 'analiza metas', 'tips', 'motivación']):
+        consejo = analizar_metas_y_dar_consejos()
+        resp.message(consejo)
+        return str(resp)
+
+    # Ver progreso de una meta específica
+    if 'progreso' in msg_lower or 'avance' in msg_lower:
+        metas = obtener_metas()
+        if not metas:
+            resp.message("No tienes metas. Crea una para empezar.")
+            return str(resp)
+
+        resumen_progreso = "📈 *Progreso de Metas:*\n"
+        for meta in metas:
+            barra_progreso = "█" * int(meta['porcentaje_progreso'] / 10) + "░" * (10 - int(meta['porcentaje_progreso'] / 10))
+            resumen_progreso += f"\n{meta['nombre']}\n[{barra_progreso}] {meta['porcentaje_progreso']:.1f}%\n"
+
+        resp.message(resumen_progreso)
+        return str(resp)
+
+    # Descargar informe de metas
+    if 'informe metas' in msg_lower or 'reporte metas' in msg_lower:
+        try:
+            pdf_path = generar_informe_metas()
+            if pdf_path and os.path.exists(pdf_path):
+                server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
+                pdf_url = f"{server_url}/download/informe_metas.pdf"
+
+                twilio_client.messages.create(
+                    from_="whatsapp:+14155552671",
+                    to=from_number,
+                    body="📊 Aquí está tu informe de metas financieras:",
+                    media_url=[pdf_url]
+                )
+                resp.message("Informe de metas enviado ✓")
+                return str(resp)
+            else:
+                resp.message("No tienes metas para generar el informe. ¡Crea algunas!")
+                return str(resp)
+        except Exception as e:
+            print(f"Error generando informe de metas: {e}")
+            resp.message(f"Error al generar informe: {str(e)}")
+            return str(resp)
+
+    # Registrar nueva meta - detectar patrones
+    if any(keyword in msg_lower for keyword in ['quiero ahorrar', 'quiero pagar', 'meta:', 'objetivo:', 'nueva meta', 'nueva objetivo']):
+        # Respuesta con guía para crear meta
+        respuesta = """Para crear una meta, necesito estos datos:
+🎯 Nombre: ¿Cuál es tu objetivo?
+💰 Monto: ¿Cuánto necesitas?
+📅 Plazo: ¿Para cuándo? (ej: 3 meses, 31/12/2024)
+📂 Tipo: deuda, ahorro o inversión
+
+Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
+"""
+        resp.message(respuesta)
+        return str(resp)
+
+    # Actualizar progreso de meta
+    if 'actualizar' in msg_lower or 'ahorré' in msg_lower or 'pagué' in msg_lower:
+        metas = obtener_metas()
+        if not metas:
+            resp.message("No tienes metas. Crea una primero.")
+            return str(resp)
+
+        respuesta = "¿Cuál meta actualizaste? Dime el nombre:\n"
+        for meta in metas:
+            respuesta += f"\n• {meta['nombre']}"
+        resp.message(respuesta)
+        return str(resp)
+
+    # ==================== EXISTING KEYWORDS ====================
+
     # Detectar si el usuario pide "informe de gastos"
-    if 'informe de gastos' in incoming_msg.lower():
+    if 'informe de gastos' in msg_lower:
         try:
             # Generar PDF con gráfico
             generar_informe_gastos()
@@ -337,12 +722,10 @@ def webhook():
                 media_url=[pdf_url]
             )
 
-            resp = MessagingResponse()
             resp.message("Informe de gastos enviado. Descárgalo desde el enlace.")
             return str(resp)
         except Exception as e:
             print(f"Error generando informe: {e}")
-            resp = MessagingResponse()
             resp.message(f"Error al generar informe: {str(e)}")
             return str(resp)
 
@@ -382,14 +765,13 @@ def webhook():
         response = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=500,
-            system="Eres Yoly, un asistente virtual amable, útil, que responde corto y en español.",
+            system="Eres Yoly, un asistente virtual amable, útil, que responde corto y en español. Eres especialista en finanzas personales y ayudas a tus usuarios a gestionar sus metas financieras.",
             messages=[{"role": "user", "content": incoming_msg}]
         )
         bot_response = response.content[0].text
     except Exception as e:
         print(f"Error: {e}")
         bot_response = f"Error: {e}"
-    resp = MessagingResponse()
     resp.message(bot_response)
     return str(resp)
 
