@@ -1,3 +1,6 @@
 flask
 twilio
 anthropic
+gunicorn
+matplotlib
+reportlab
