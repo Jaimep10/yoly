@@ -2,5 +2,4 @@ flask
 twilio
 anthropic
 gunicorn
-matplotlib
-reportlab
+python-dotenv
