@@ -1,9 +1,11 @@
 import os
 import json
+import logging
 from datetime import datetime, timedelta
 from flask import Flask, request, send_file
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
+from twilio.request_validator import RequestValidator
 import anthropic
 import matplotlib.pyplot as plt
 from reportlab.lib.pagesizes import letter
@@ -17,6 +19,10 @@ from datetime import datetime
 app = Flask(__name__)
 client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 twilio_client = Client(os.environ.get("TWILIO_ACCOUNT_SID"), os.environ.get("TWILIO_AUTH_TOKEN"))
+
+# Logging configuration
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 GOALS_FILE = 'goals.json'
 
@@ -600,85 +606,149 @@ def download_informe_metas():
 
 @app.route("/webhook/whatsapp", methods=["POST", "GET"])
 def webhook():
+    """
+    WhatsApp webhook handler with Twilio signature validation.
+    Validates incoming requests and processes messages for budget and goal management.
+    """
+    logger.info("Webhook request received")
+
+    # ==================== REQUEST VALIDATION ====================
+
+    # Get Twilio credentials for signature validation
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN")
+    if not auth_token:
+        logger.error("TWILIO_AUTH_TOKEN not configured")
+        return "Error: Missing Twilio credentials", 500
+
+    # Validate Twilio signature
+    validator = RequestValidator(auth_token)
+    twilio_signature = request.headers.get('X-Twilio-Signature', '')
+
+    # Build URL for signature validation
+    request_url = request.url
+    post_data = request.values if request.method == 'POST' else {}
+
+    # Validate signature
+    if not validator.validate(request_url, post_data, twilio_signature):
+        logger.warning(f"Invalid Twilio signature: {twilio_signature}")
+        logger.warning(f"Request URL: {request_url}")
+        logger.warning(f"POST data: {post_data}")
+        resp = MessagingResponse()
+        resp.message("❌ Validación fallida: Firma Twilio inválida")
+        return str(resp), 403
+
+    logger.info("Twilio signature validated successfully")
+
+    # ==================== EXTRACT MESSAGE DATA ====================
+
+    # Handle missing required fields
     incoming_msg = request.values.get('Body', '').strip()
     from_number = request.values.get('From', '')
-    print(f"Mensaje: {incoming_msg}")
+    message_sid = request.values.get('MessageSid', 'unknown')
+    account_sid = request.values.get('AccountSid', 'unknown')
 
+    if not incoming_msg:
+        logger.warning(f"Empty message body received from {from_number}")
+        resp = MessagingResponse()
+        resp.message("❌ Error: Mensaje vacío recibido")
+        return str(resp), 400
+
+    if not from_number:
+        logger.error("Missing 'From' field in request")
+        resp = MessagingResponse()
+        resp.message("❌ Error: No se pudo identificar el remitente")
+        return str(resp), 400
+
+    # Log incoming message details
+    logger.info(f"Message received | From: {from_number} | MessageSID: {message_sid} | Body: {incoming_msg}")
+
+    # Initialize response
     resp = MessagingResponse()
     msg_lower = incoming_msg.lower()
 
-    # ==================== GOALS KEYWORDS ====================
+    try:
+        # ==================== GOALS KEYWORDS ====================
 
-    # Ver metas o solicitar análisis de metas
-    if any(keyword in msg_lower for keyword in ['metas', 'objetivos', 'mis objetivos', 'ver metas', 'estado metas']):
-        metas = obtener_metas()
-        if not metas:
-            resp.message("No tienes metas registradas. Puedo ayudarte a crearlas. ¿Cuál es tu objetivo financiero?")
-            return str(resp)
-
-        # Generar resumen de metas
-        resumen = "📊 *Tus Metas Financieras:*\n"
-        for meta in metas:
-            emoji = "✓" if meta['completada'] else "→"
-            resumen += f"\n{emoji} {meta['nombre']}\n"
-            resumen += f"   Progreso: ${meta['monto_actual']:.2f}/${meta['monto_objetivo']:.2f}\n"
-            resumen += f"   {meta['porcentaje_progreso']:.1f}% | Faltante: ${meta['monto_faltante']:.2f}"
-            if meta['dias_faltantes'] > 0:
-                resumen += f" | {meta['dias_faltantes']} días"
-            resumen += "\n"
-
-        resp.message(resumen)
-        return str(resp)
-
-    # Solicitar consejos y análisis de metas
-    if any(keyword in msg_lower for keyword in ['consejo', 'consejos metas', 'analiza metas', 'tips', 'motivación']):
-        consejo = analizar_metas_y_dar_consejos()
-        resp.message(consejo)
-        return str(resp)
-
-    # Ver progreso de una meta específica
-    if 'progreso' in msg_lower or 'avance' in msg_lower:
-        metas = obtener_metas()
-        if not metas:
-            resp.message("No tienes metas. Crea una para empezar.")
-            return str(resp)
-
-        resumen_progreso = "📈 *Progreso de Metas:*\n"
-        for meta in metas:
-            barra_progreso = "█" * int(meta['porcentaje_progreso'] / 10) + "░" * (10 - int(meta['porcentaje_progreso'] / 10))
-            resumen_progreso += f"\n{meta['nombre']}\n[{barra_progreso}] {meta['porcentaje_progreso']:.1f}%\n"
-
-        resp.message(resumen_progreso)
-        return str(resp)
-
-    # Descargar informe de metas
-    if 'informe metas' in msg_lower or 'reporte metas' in msg_lower:
-        try:
-            pdf_path = generar_informe_metas()
-            if pdf_path and os.path.exists(pdf_path):
-                server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
-                pdf_url = f"{server_url}/download/informe_metas.pdf"
-
-                twilio_client.messages.create(
-                    from_="whatsapp:+14155552671",
-                    to=from_number,
-                    body="📊 Aquí está tu informe de metas financieras:",
-                    media_url=[pdf_url]
-                )
-                resp.message("Informe de metas enviado ✓")
+        # Ver metas o solicitar análisis de metas
+        if any(keyword in msg_lower for keyword in ['metas', 'objetivos', 'mis objetivos', 'ver metas', 'estado metas']):
+            logger.info(f"Goals request detected for {from_number}")
+            metas = obtener_metas()
+            if not metas:
+                logger.info("No goals found for user")
+                resp.message("No tienes metas registradas. Puedo ayudarte a crearlas. ¿Cuál es tu objetivo financiero?")
                 return str(resp)
-            else:
-                resp.message("No tienes metas para generar el informe. ¡Crea algunas!")
-                return str(resp)
-        except Exception as e:
-            print(f"Error generando informe de metas: {e}")
-            resp.message(f"Error al generar informe: {str(e)}")
+
+            # Generar resumen de metas
+            resumen = "📊 *Tus Metas Financieras:*\n"
+            for meta in metas:
+                emoji = "✓" if meta['completada'] else "→"
+                resumen += f"\n{emoji} {meta['nombre']}\n"
+                resumen += f"   Progreso: ${meta['monto_actual']:.2f}/${meta['monto_objetivo']:.2f}\n"
+                resumen += f"   {meta['porcentaje_progreso']:.1f}% | Faltante: ${meta['monto_faltante']:.2f}"
+                if meta['dias_faltantes'] > 0:
+                    resumen += f" | {meta['dias_faltantes']} días"
+                resumen += "\n"
+
+            logger.info(f"Goals summary sent to {from_number}")
+            resp.message(resumen)
             return str(resp)
 
-    # Registrar nueva meta - detectar patrones
-    if any(keyword in msg_lower for keyword in ['quiero ahorrar', 'quiero pagar', 'meta:', 'objetivo:', 'nueva meta', 'nueva objetivo']):
-        # Respuesta con guía para crear meta
-        respuesta = """Para crear una meta, necesito estos datos:
+        # Solicitar consejos y análisis de metas
+        if any(keyword in msg_lower for keyword in ['consejo', 'consejos metas', 'analiza metas', 'tips', 'motivación']):
+            logger.info(f"Financial advice request from {from_number}")
+            consejo = analizar_metas_y_dar_consejos()
+            resp.message(consejo)
+            return str(resp)
+
+        # Ver progreso de una meta específica
+        if 'progreso' in msg_lower or 'avance' in msg_lower:
+            logger.info(f"Progress check requested by {from_number}")
+            metas = obtener_metas()
+            if not metas:
+                resp.message("No tienes metas. Crea una para empezar.")
+                return str(resp)
+
+            resumen_progreso = "📈 *Progreso de Metas:*\n"
+            for meta in metas:
+                barra_progreso = "█" * int(meta['porcentaje_progreso'] / 10) + "░" * (10 - int(meta['porcentaje_progreso'] / 10))
+                resumen_progreso += f"\n{meta['nombre']}\n[{barra_progreso}] {meta['porcentaje_progreso']:.1f}%\n"
+
+            logger.info(f"Progress report sent to {from_number}")
+            resp.message(resumen_progreso)
+            return str(resp)
+
+        # Descargar informe de metas
+        if 'informe metas' in msg_lower or 'reporte metas' in msg_lower:
+            logger.info(f"Goals report request from {from_number}")
+            try:
+                pdf_path = generar_informe_metas()
+                if pdf_path and os.path.exists(pdf_path):
+                    server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
+                    pdf_url = f"{server_url}/download/informe_metas.pdf"
+                    logger.info(f"Goals report generated: {pdf_url}")
+
+                    twilio_client.messages.create(
+                        from_="whatsapp:+14155552671",
+                        to=from_number,
+                        body="📊 Aquí está tu informe de metas financieras:",
+                        media_url=[pdf_url]
+                    )
+                    logger.info(f"Goals report sent to {from_number}")
+                    resp.message("Informe de metas enviado ✓")
+                    return str(resp)
+                else:
+                    logger.warning(f"Goals report generation failed for {from_number}")
+                    resp.message("No tienes metas para generar el informe. ¡Crea algunas!")
+                    return str(resp)
+            except Exception as e:
+                logger.error(f"Error generando informe de metas: {e}", exc_info=True)
+                resp.message(f"Error al generar informe: {str(e)}")
+                return str(resp)
+
+        # Registrar nueva meta - detectar patrones
+        if any(keyword in msg_lower for keyword in ['quiero ahorrar', 'quiero pagar', 'meta:', 'objetivo:', 'nueva meta', 'nueva objetivo']):
+            logger.info(f"New goal creation request from {from_number}")
+            respuesta = """Para crear una meta, necesito estos datos:
 🎯 Nombre: ¿Cuál es tu objetivo?
 💰 Monto: ¿Cuánto necesitas?
 📅 Plazo: ¿Para cuándo? (ej: 3 meses, 31/12/2024)
@@ -686,82 +756,83 @@ def webhook():
 
 Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
 """
-        resp.message(respuesta)
-        return str(resp)
-
-    # Actualizar progreso de meta
-    if 'actualizar' in msg_lower or 'ahorré' in msg_lower or 'pagué' in msg_lower:
-        metas = obtener_metas()
-        if not metas:
-            resp.message("No tienes metas. Crea una primero.")
+            resp.message(respuesta)
             return str(resp)
 
-        respuesta = "¿Cuál meta actualizaste? Dime el nombre:\n"
-        for meta in metas:
-            respuesta += f"\n• {meta['nombre']}"
-        resp.message(respuesta)
-        return str(resp)
+        # Actualizar progreso de meta
+        if 'actualizar' in msg_lower or 'ahorré' in msg_lower or 'pagué' in msg_lower:
+            logger.info(f"Goal progress update request from {from_number}")
+            metas = obtener_metas()
+            if not metas:
+                resp.message("No tienes metas. Crea una primero.")
+                return str(resp)
 
-    # ==================== EXISTING KEYWORDS ====================
-
-    # Detectar si el usuario pide "informe de gastos"
-    if 'informe de gastos' in msg_lower:
-        try:
-            # Generar PDF con gráfico
-            generar_informe_gastos()
-
-            # Construir URL del PDF
-            server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
-            pdf_url = f"{server_url}/download/informe_gastos.pdf"
-
-            # Enviar por Twilio/WhatsApp
-            twilio_client.messages.create(
-                from_="whatsapp:+14155552671",  # Número de Twilio (sandbox)
-                to=from_number,
-                body="Aquí está tu informe de gastos:",
-                media_url=[pdf_url]
-            )
-
-            resp.message("Informe de gastos enviado. Descárgalo desde el enlace.")
-            return str(resp)
-        except Exception as e:
-            print(f"Error generando informe: {e}")
-            resp.message(f"Error al generar informe: {str(e)}")
+            respuesta = "¿Cuál meta actualizaste? Dime el nombre:\n"
+            for meta in metas:
+                respuesta += f"\n• {meta['nombre']}"
+            resp.message(respuesta)
             return str(resp)
 
-    # Detectar palabras clave para asesor financiero: presupuesto, gastos, asesor, ahorro
-    financial_keywords = ['presupuesto', 'gastos', 'asesor', 'ahorro']
-    should_generate_budget = any(keyword in incoming_msg.lower() for keyword in financial_keywords)
+        # ==================== BUDGET & EXPENSE KEYWORDS ====================
 
-    if should_generate_budget:
-        try:
-            print("Generando análisis de presupuesto...")
-            # Generar PDF con análisis de presupuesto y asesoramiento financiero
-            generar_presupuesto()
+        # Detectar si el usuario pide "informe de gastos"
+        if 'informe de gastos' in msg_lower:
+            logger.info(f"Expense report request from {from_number}")
+            try:
+                generar_informe_gastos()
+                server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
+                pdf_url = f"{server_url}/download/informe_gastos.pdf"
+                logger.info(f"Expense report generated: {pdf_url}")
 
-            # Construir URL del PDF
-            server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
-            pdf_url = f"{server_url}/download/presupuesto_analisis.pdf"
+                twilio_client.messages.create(
+                    from_="whatsapp:+14155552671",
+                    to=from_number,
+                    body="Aquí está tu informe de gastos:",
+                    media_url=[pdf_url]
+                )
+                logger.info(f"Expense report sent to {from_number}")
+                resp.message("Informe de gastos enviado. Descárgalo desde el enlace.")
+                return str(resp)
+            except Exception as e:
+                logger.error(f"Error generando informe de gastos: {e}", exc_info=True)
+                resp.message(f"Error al generar informe: {str(e)}")
+                return str(resp)
 
-            # Enviar por Twilio/WhatsApp
-            twilio_client.messages.create(
-                from_="whatsapp:+14155552671",  # Número de Twilio (sandbox)
-                to=from_number,
-                body="📊 Aquí está tu análisis de presupuesto mensual con recomendaciones del asesor financiero de IA:",
-                media_url=[pdf_url]
-            )
+        # Detectar palabras clave para asesor financiero
+        financial_keywords = ['presupuesto', 'gastos', 'asesor', 'ahorro']
+        should_generate_budget = any(keyword in incoming_msg.lower() for keyword in financial_keywords)
 
-            resp = MessagingResponse()
-            resp.message("✅ Reporte de presupuesto enviado. Incluye tu análisis financiero y recomendaciones personalizadas.")
-            return str(resp)
-        except Exception as e:
-            print(f"Error generando presupuesto: {e}")
-            resp = MessagingResponse()
-            resp.message(f"❌ Error al generar presupuesto: {str(e)}")
-            return str(resp)
+        if should_generate_budget:
+            logger.info(f"Budget analysis request from {from_number}")
+            try:
+                logger.debug("Generating budget analysis...")
+                generar_presupuesto()
 
-    # Respuesta normal con Claude
-    try:
+                server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
+                pdf_url = f"{server_url}/download/presupuesto_analisis.pdf"
+                logger.info(f"Budget analysis generated: {pdf_url}")
+
+                twilio_client.messages.create(
+                    from_="whatsapp:+14155552671",
+                    to=from_number,
+                    body="📊 Aquí está tu análisis de presupuesto mensual con recomendaciones del asesor financiero de IA:",
+                    media_url=[pdf_url]
+                )
+
+                logger.info(f"Budget analysis sent to {from_number}")
+                resp = MessagingResponse()
+                resp.message("✅ Reporte de presupuesto enviado. Incluye tu análisis financiero y recomendaciones personalizadas.")
+                return str(resp)
+            except Exception as e:
+                logger.error(f"Error generando presupuesto: {e}", exc_info=True)
+                resp = MessagingResponse()
+                resp.message(f"❌ Error al generar presupuesto: {str(e)}")
+                return str(resp)
+
+        # ==================== DEFAULT RESPONSE ====================
+
+        # Respuesta normal con Claude
+        logger.info(f"Processing message with Claude API for {from_number}")
         response = client.messages.create(
             model="claude-3-5-sonnet-20241022",
             max_tokens=500,
@@ -769,10 +840,14 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
             messages=[{"role": "user", "content": incoming_msg}]
         )
         bot_response = response.content[0].text
+        logger.info(f"Claude response generated for {from_number}")
+
     except Exception as e:
-        print(f"Error: {e}")
-        bot_response = f"Error: {e}"
+        logger.error(f"Unexpected error in webhook: {e}", exc_info=True)
+        bot_response = f"Disculpa, hubo un error procesando tu mensaje: {str(e)}"
+
     resp.message(bot_response)
+    logger.info(f"Response sent to {from_number}")
     return str(resp)
 
 if __name__ == "__main__":
