@@ -577,7 +577,7 @@ def generar_presupuesto():
     return pdf_path
 
 @app.route("/", methods=["GET"])
-def health():
+def home():
     return "Yoly Bot Running OK"
 
 @app.route("/download/informe_gastos.pdf", methods=["GET"])
@@ -604,8 +604,8 @@ def download_informe_metas():
         return send_file(pdf_path, mimetype='application/pdf', as_attachment=True, download_name='informe_metas.pdf')
     return "Informe de metas no disponible", 404
 
-@app.route("/webhook/whatsapp", methods=["POST", "GET"])
-def webhook():
+@app.route("/whatsapp", methods=["POST", "GET"])
+def whatsapp():
     """
     WhatsApp webhook handler with Twilio signature validation.
     Validates incoming requests and processes messages for budget and goal management.
