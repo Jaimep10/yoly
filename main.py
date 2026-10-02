@@ -669,7 +669,7 @@ def webhook():
     try:
         # ==================== GOALS KEYWORDS ====================
 
-        # Ver metas o solicitar análisis de metas
+                # Ver metas o solicitar análisis de metas
         if any(keyword in msg_lower for keyword in ['metas', 'objetivos', 'mis objetivos', 'ver metas', 'estado metas']):
             logger.info(f"Goals request detected for {from_number}")
             metas = obtener_metas()
