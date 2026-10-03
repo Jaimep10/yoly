@@ -2,7 +2,7 @@ import os
 import json
 import logging
 from datetime import datetime, timedelta
-from flask import Flask, request, send_file
+from flask import Flask, request, send_file, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
@@ -17,12 +17,58 @@ from reportlab.lib.units import inch
 from datetime import datetime
 
 app = Flask(__name__)
-client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-twilio_client = Client(os.environ.get("TWILIO_ACCOUNT_SID"), os.environ.get("TWILIO_AUTH_TOKEN"))
 
 # Logging configuration
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# ==================== ENVIRONMENT VALIDATION ====================
+
+print("[STARTUP] Initializing Yoly Bot...")
+
+# Check required environment variables
+required_env_vars = {
+    'TWILIO_ACCOUNT_SID': 'Twilio Account SID',
+    'TWILIO_AUTH_TOKEN': 'Twilio Auth Token',
+    'ANTHROPIC_API_KEY': 'Anthropic API Key'
+}
+
+missing_vars = []
+for var_name, var_desc in required_env_vars.items():
+    if not os.environ.get(var_name):
+        error_msg = f"[WARNING] Missing environment variable: {var_desc} ({var_name})"
+        print(error_msg)
+        logger.warning(error_msg)
+        missing_vars.append(var_name)
+    else:
+        print(f"[OK] {var_desc} is configured")
+        logger.info(f"Environment variable {var_name} is configured")
+
+# Initialize clients
+try:
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    logger.info("[OK] Anthropic client initialized")
+except Exception as e:
+    print(f"[WARNING] Failed to initialize Anthropic client: {e}")
+    logger.warning(f"Failed to initialize Anthropic client: {e}")
+    client = None
+
+try:
+    twilio_client = Client(os.environ.get("TWILIO_ACCOUNT_SID"), os.environ.get("TWILIO_AUTH_TOKEN"))
+    logger.info("[OK] Twilio client initialized")
+except Exception as e:
+    print(f"[WARNING] Failed to initialize Twilio client: {e}")
+    logger.warning(f"Failed to initialize Twilio client: {e}")
+    twilio_client = None
+
+if missing_vars:
+    print(f"[WARNING] App will start but some features may not work. Missing: {', '.join(missing_vars)}")
+    logger.warning(f"App starting with missing environment variables: {missing_vars}")
+else:
+    print("[OK] All required environment variables are configured")
+    logger.info("All required environment variables are configured")
+
+print("[STARTUP] Yoly Bot initialization complete")
 
 GOALS_FILE = 'goals.json'
 
@@ -578,7 +624,20 @@ def generar_presupuesto():
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Yoly Bot Running OK"
+    logger.info("GET / - Home endpoint called")
+    print("[REQUEST] GET / - Home check")
+    return "Yoly Bot Running OK", 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint for Render"""
+    logger.info("GET /health - Health check endpoint called")
+    print("[REQUEST] GET /health - Health check")
+    return jsonify({
+        "status": "ok",
+        "service": "Yoly Bot",
+        "timestamp": datetime.now().isoformat()
+    }), 200
 
 @app.route("/download/informe_gastos.pdf", methods=["GET"])
 def download_informe():
@@ -610,7 +669,8 @@ def whatsapp():
     WhatsApp webhook handler with Twilio signature validation.
     Validates incoming requests and processes messages for budget and goal management.
     """
-    logger.info("Webhook request received")
+    print(f"[REQUEST] {request.method} /whatsapp - Webhook request received")
+    logger.info(f"Webhook request received via {request.method}")
 
     # ==================== REQUEST VALIDATION ====================
 
@@ -647,19 +707,24 @@ def whatsapp():
     message_sid = request.values.get('MessageSid', 'unknown')
     account_sid = request.values.get('AccountSid', 'unknown')
 
+    print(f"[WHATSAPP] Extracted - From: {from_number}, MessageSID: {message_sid}, Body length: {len(incoming_msg)}")
+
     if not incoming_msg:
         logger.warning(f"Empty message body received from {from_number}")
+        print(f"[WARNING] Empty message body from {from_number}")
         resp = MessagingResponse()
         resp.message("❌ Error: Mensaje vacío recibido")
         return str(resp), 400
 
     if not from_number:
         logger.error("Missing 'From' field in request")
+        print(f"[ERROR] Missing 'From' field in request")
         resp = MessagingResponse()
         resp.message("❌ Error: No se pudo identificar el remitente")
         return str(resp), 400
 
     # Log incoming message details
+    print(f"[WHATSAPP MESSAGE] From: {from_number} | SID: {message_sid} | Body: {incoming_msg[:100]}")
     logger.info(f"Message received | From: {from_number} | MessageSID: {message_sid} | Body: {incoming_msg}")
 
     # Initialize response
@@ -844,12 +909,22 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
 
     except Exception as e:
         logger.error(f"Unexpected error in webhook: {e}", exc_info=True)
+        print(f"[ERROR] Unexpected error processing message: {e}")
         bot_response = f"Disculpa, hubo un error procesando tu mensaje: {str(e)}"
 
     resp.message(bot_response)
+    print(f"[RESPONSE] Sent to {from_number}: {bot_response[:100]}")
     logger.info(f"Response sent to {from_number}")
     return str(resp)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", 8000))
+    print(f"\n{'='*60}")
+    print(f"[STARTING] Yoly Bot on 0.0.0.0:{port}")
+    print(f"[INFO] Endpoints available:")
+    print(f"  - GET  http://0.0.0.0:{port}/          (Health check)")
+    print(f"  - GET  http://0.0.0.0:{port}/health    (JSON Health)")
+    print(f"  - POST http://0.0.0.0:{port}/whatsapp  (Webhook)")
+    print(f"{'='*60}\n")
+    logger.info(f"Starting Flask app on 0.0.0.0:{port}")
+    app.run(host="0.0.0.0", port=port, debug=False)
