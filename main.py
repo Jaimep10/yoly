@@ -185,7 +185,7 @@ def analizar_metas_y_dar_consejos():
     # Solicitar análisis a Claude
     try:
         response = client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
+            model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
             max_tokens=800,
             system="""Eres Yoly, un asesor financiero amable y motivador.
 Analiza las metas del usuario y proporciona:
@@ -584,7 +584,7 @@ def generar_presupuesto():
 
     try:
         advisor_response = client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
+            model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
             max_tokens=800,
             system="Eres un asesor financiero profesional. Proporciona análisis financiero detallado pero conciso en español.",
             messages=[{"role": "user", "content": advisor_message}]
@@ -879,7 +879,7 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
         # Respuesta normal con Claude
         logger.info(f"Processing message with Claude API for {from_number}")
         response = client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
+            model=os.getenv("ANTHROPIC_MODEL", "claude-haiku-4-5"),
             max_tokens=500,
             system="Eres Yoly, un asistente virtual amable, útil, que responde corto y en español. Eres especialista en finanzas personales y ayudas a tus usuarios a gestionar sus metas financieras.",
             messages=[{"role": "user", "content": incoming_msg}]
