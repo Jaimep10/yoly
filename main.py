@@ -3175,8 +3175,8 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
         if tiene_intent_balance and phone_clean in memoria_usuarios:
             datos = memoria_usuarios[phone_clean]
             if datos.get('tipo') == 'deuda':
-                deuda = datos.get('deuda_total', 0)
-                pagado = datos.get('total_pagado', 0)
+                deuda = datos.get('deuda', 0)
+                pagado = datos.get('pagado', 0)
                 balance = datos.get('balance', 0)
                 fecha = datos.get('fecha_final', '')
 
@@ -3202,8 +3202,8 @@ Link: {server_url}/dashboard/{phone_clean}"""
                 # Es respuesta a balance - mostrar el balance
                 datos = memoria_usuarios[phone_clean]
                 if datos.get('tipo') == 'deuda':
-                    deuda = datos.get('deuda_total', 0)
-                    pagado = datos.get('total_pagado', 0)
+                    deuda = datos.get('deuda', 0)
+                    pagado = datos.get('pagado', 0)
                     balance = datos.get('balance', 0)
                     fecha = datos.get('fecha_final', '')
 
