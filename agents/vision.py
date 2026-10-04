@@ -3,7 +3,7 @@
 import base64
 import logging
 
-from agent_classifier import FACTURAS, LIBRETITA, TRANSFERENCIA, leer_json
+from agents.classifier import FACTURAS, LIBRETITA, TRANSFERENCIA, leer_json
 
 logger = logging.getLogger(__name__)
 
@@ -92,3 +92,10 @@ def extraer_json(imagen, tipo=None, cliente=None, modelo=None):
         datos['deuda'] = datos['deuda_total']
     datos.pop('deuda_total', None)
     return datos
+
+
+class Ojo:
+    """Agente 2: lee una foto con Claude Vision y devuelve JSON (fecha, monto, metodo, cliente...)."""
+
+    def extraer(self, img, tipo=None, cliente=None, modelo=None):
+        return extraer_json(img, tipo, cliente, modelo)

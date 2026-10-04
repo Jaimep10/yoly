@@ -209,3 +209,11 @@ def generar_reporte(datos_calculados, phone, guardar=None, factura_path="", incl
         "pdf_bytes": pdf_cobro(datos_calculados) if incluir_archivos else None,
         "excel_bytes": excel_cobro(datos_calculados) if incluir_archivos else None,
     }
+
+
+class Contadora:
+    """Agente 4: respuesta de WhatsApp, tarjetas del dashboard, PDF y Excel; guarda el registro."""
+
+    def generar(self, phone, calculo, tipo=None, guardar=None, factura_path="", incluir_archivos=True):
+        return generar_reporte(calculo, phone, guardar=guardar, factura_path=factura_path,
+                               incluir_archivos=incluir_archivos)

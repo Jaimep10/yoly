@@ -6,10 +6,10 @@ from unittest.mock import MagicMock
 import pytest
 from openpyxl import load_workbook
 
-import agent_calculator
-import agent_classifier
-import agent_reporter
-import agent_vision
+from agents import calculator as agent_calculator
+from agents import classifier as agent_classifier
+from agents import reporter as agent_reporter
+from agents import vision as agent_vision
 import main
 
 TEL = "whatsapp:+593991234567"
@@ -137,7 +137,7 @@ def test_contadora_no_guarda_duplicados():
     assert not guardados and "ya la tenía guardada" in reporte["mensaje_wa"]
 
 
-# ---------- Flujo completo (app.py) ----------
+# ---------- Flujo completo (orchestrator.py) ----------
 
 @pytest.fixture
 def entorno(tmp_path, monkeypatch):
@@ -192,3 +192,22 @@ def test_descargas_pdf_y_excel_del_cobro(entorno):
     assert pdf.status_code == 200 and pdf.data.startswith(b"%PDF")
     assert excel.status_code == 200
     assert load_workbook(io.BytesIO(excel.data))["Resumen"]["B5"].value == 1220
+
+
+def test_orquestador_jefe_usa_los_4_agentes():
+    from orchestrator import OrquestadorYoly
+    claude = MagicMock()
+    claude.messages.create.side_effect = [respuesta_claude({"tipos": ["libretita_deuda"]}), respuesta_claude(LIBRETA)]
+    guardados, vistas = [], []
+    ctx = main.Contexto(
+        cliente=claude, modelo="m", phone_clean=PHONE, guardar_imagen=lambda img: "/tmp/foto.webp",
+        guardar_cobro=lambda p, d: guardados.append(d), cobro_actual=lambda: None,
+        guardar_gasto=None, guardar_transferencia=None, huellas_vistas=lambda: vistas,
+        marcar_vistas=vistas.extend, marcar_pregunta_tabla=lambda: None)
+    jefe = OrquestadorYoly()
+    assert {type(a).__name__ for a in (jefe.portero, jefe.ojo, jefe.calculadora, jefe.contadora)} == \
+        {"Portero", "Ojo", "Calculadora", "Contadora"}
+    texto = jefe.handle_whatsapp(PHONE, [b"foto"], "", ctx=ctx)
+    assert "Te falta: $1,220" in texto
+    assert guardados[0]["deuda"] == 3000 and guardados[0]["pagado"] == 1780 and len(vistas) == 1
+    assert jefe.handle_whatsapp(PHONE, [b"foto"], "", ctx=ctx) == "👍 Esa foto ya la había procesado, no la guardé otra vez."

@@ -115,3 +115,15 @@ def clasificar_documentos(imagenes, cliente=None, modelo=None, vistas=()):
     resultado["tipo"] = max(dict.fromkeys(conteo), key=conteo.count)
     resultado["confianza"] = confianza
     return resultado
+
+
+class Portero:
+    """Agente 1: ¿qué es?, ¿cuántas fotos?, ¿es repetida?"""
+
+    def clasificar(self, images, texto="", cliente=None, modelo=None, vistas=()):
+        """Devuelve lo de clasificar_documentos más "count" y "es_duplicado"."""
+        resultado = clasificar_documentos(images, cliente, modelo, vistas)
+        resultado["count"] = resultado["cantidad"]
+        resultado["es_duplicado"] = resultado["tipo"] == DUPLICADO
+        resultado["texto_usuario"] = texto or ""
+        return resultado

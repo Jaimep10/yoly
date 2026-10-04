@@ -30,8 +30,8 @@ import html
 from urllib.parse import quote_plus
 import precios
 import reportes
-import agent_reporter
-import app as orquestador  # 4 agentes: Portero, Ojo, Calculadora, Contadora
+from agents import reporter as agent_reporter
+from orchestrator import Contexto, OrquestadorYoly  # el jefe de los 4 agentes
 import io
 try:
     import pandas as pd
@@ -278,8 +278,8 @@ def guardar_gastos(telefono, gastos):
 # ==================== COBRO DE DEUDA (lista de pagos) ====================
 
 
-# Cuentas en Python puro: viven en la Calculadora (agent_calculator)
-from agent_calculator import (a_numero, fecha_valida, METODOS_PAGO, normalizar_metodo,
+# Cuentas en Python puro: viven en la Calculadora (agents/calculator.py)
+from agents.calculator import (a_numero, fecha_valida, METODOS_PAGO, normalizar_metodo,
                               normalizar_pagos, fecha_corta, armar_cobro)
 
 def guardar_cobro(phone_clean, datos):
@@ -608,14 +608,14 @@ def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo
     return respuesta
 
 def contexto_agentes(telefono):
-    """Lo que el orquestador (app.py) necesita de main para guardar cada cosa en su lugar."""
+    """Lo que el orquestador (orchestrator.py) necesita de main para guardar cada cosa en su lugar."""
     phone_clean = normalizar_telefono(telefono)
 
     def marcar_pregunta_tabla():
         memoria_usuarios.setdefault(phone_clean, {})['ultima_pregunta'] = 'dashboard'
         guardar_memoria(memoria_usuarios)
 
-    return orquestador.Contexto(
+    return Contexto(
         cliente=client,
         modelo=MODELO_CLAUDE,
         phone_clean=phone_clean,
@@ -630,9 +630,11 @@ def contexto_agentes(telefono):
         marcar_pregunta_tabla=marcar_pregunta_tabla,
     )
 
+orquestador = OrquestadorYoly(herramientas=contexto_agentes)
+
 def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None):
     """
-    Descarga las fotos de Twilio, las pasa a WEBP y las manda por los 4 agentes (app.procesar_fotos):
+    Descarga las fotos de Twilio, las pasa a WEBP y las manda por los 4 agentes (OrquestadorYoly en orchestrator.py):
     Portero (tipo y repetidas) -> Ojo (Vision) -> Calculadora (sumas en Python) -> Contadora (respuesta).
     """
     try:
@@ -645,7 +647,7 @@ def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None):
             if not webp_bytes:
                 return "❌ No pude procesar la imagen. Intenta con otra."
             imagenes.append(webp_bytes)
-        return orquestador.procesar_fotos(imagenes, texto_usuario, contexto_agentes(telefono), info)
+        return orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info)
     except Exception as e:
         logger.error(f"Error en procesar_fotos_whatsapp: {e}", exc_info=True)
         return f"❌ Error procesando factura: {str(e)}"
@@ -1961,7 +1963,7 @@ def gastos_del_mes(phone):
             gastos_mes.append(g)
     return sorted(gastos_mes, key=lambda x: x.get('fecha', ''))
 
-# Estado de cuenta (PDF/Excel de la libretita): lo arma la Contadora (agent_reporter)
+# Estado de cuenta (PDF/Excel de la libretita): lo arma la Contadora (agents/reporter.py)
 titulo_cobro = agent_reporter.titulo_cobro
 estilo_tabla = agent_reporter.estilo_tabla
 

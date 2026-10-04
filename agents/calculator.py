@@ -1,5 +1,5 @@
 # Agente 3 - "La Calculadora": Python puro, sin Vision ni IA.
-# Recibe el JSON que leyó el Ojo (agent_vision) y saca las cuentas:
+# Recibe el JSON que leyó el Ojo (agents/vision.py) y saca las cuentas:
 # pagado = sum(montos), saldo = deuda - pagado, saldo restante pago por pago,
 # y un hash para no guardar dos veces el mismo registro.
 import hashlib
@@ -166,3 +166,15 @@ def total_documento(datos_vision):
     """Factura o transferencia: pagos normalizados y su suma (en Python, nunca la de Vision)."""
     pagos = normalizar_pagos((datos_vision or {}).get('pagos', []))
     return pagos, sum(p['monto'] for p in pagos)
+
+
+class Calculadora:
+    """Agente 3: sumas determinísticas en Python, saldo y duplicados por hash."""
+
+    def calcular(self, extracciones, tipo=None, existente=None):
+        """Varias fotos de libretita -> un solo cobro con pagado, saldo, hash y duplicado."""
+        return calcular_totales(list(extracciones), existente)
+
+    def total_documento(self, extraccion):
+        """Factura o transferencia -> (pagos, total)."""
+        return total_documento(extraccion)
