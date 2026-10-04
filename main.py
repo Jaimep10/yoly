@@ -3412,6 +3412,61 @@ def buscar_precios(producto_query):
         logger.error(f"Error buscando precios: {e}", exc_info=True)
         return None
 
+# ==================== CONTEXTO: RESPUESTA A "¿TE MANDO TABLA AL DASHBOARD?" ====================
+
+PALABRAS_AFIRMATIVAS = {'si', 'sii', 'siii', 'sip', 'yes', 'ok', 'okay', 'okey', 'vale', 'dale', 'claro',
+                        'correcto', 'listo', 'perfecto', 'bueno', 'va', 'porfa', 'porfavor', 'mandala',
+                        'mandamela', 'enviala', 'envíala', 'mándala', 'mándamela', 'manda', 'envia',
+                        'envía', 'quiero', 'obvio', 'simon', 'afirmativo', '👍', '👌', '✅'}
+
+def sin_acentos(texto):
+    return (texto.replace('á', 'a').replace('é', 'e').replace('í', 'i')
+                 .replace('ó', 'o').replace('ú', 'u'))
+
+def es_afirmativo(msg_lower):
+    """True para "si", "Sí.", "si porfa", "sí mándala", "dale", "ok 👍", "si quiero la tabla"...
+    False si el mensaje dice "no" o es largo (entonces no es solo una respuesta)."""
+    texto = sin_acentos(msg_lower.strip())
+    palabras = re.findall(r"[a-zñ]+|[👍👌✅]", texto)
+    if not palabras or len(palabras) > 8 or 'no' in palabras:
+        return False
+    return palabras[0] in {sin_acentos(p) for p in PALABRAS_AFIRMATIVAS}
+
+def obtener_ultima_pregunta(phone_clean):
+    """Lee la última pregunta pendiente (memoria en RAM y, si no está, el archivo).
+    Busca por los últimos 10 dígitos porque la clave puede venir con o sin prefijo."""
+    ultimos10 = phone_clean[-10:]
+    for memoria in (memoria_usuarios, cargar_memoria()):
+        for clave, datos in memoria.items():
+            if normalizar_telefono(clave)[-10:] == ultimos10 and isinstance(datos, dict):
+                pregunta = (datos.get('ultima_pregunta') or '').lower()
+                if pregunta:
+                    return pregunta
+    return ''
+
+def limpiar_ultima_pregunta(phone_clean):
+    ultimos10 = phone_clean[-10:]
+    for clave, datos in memoria_usuarios.items():
+        if normalizar_telefono(clave)[-10:] == ultimos10 and isinstance(datos, dict):
+            datos['ultima_pregunta'] = ''
+    guardar_memoria(memoria_usuarios)
+
+def tiene_datos(phone_clean):
+    try:
+        return bool(obtener_cobro(phone_clean) or cargar_gastos(phone_clean))
+    except Exception:
+        return False
+
+def mensaje_link_dashboard(server_url, phone_clean):
+    return f"""✅ Perfecto, aquí está tu panel:
+{server_url}/dashboard/{phone_clean}
+
+📊 Descargas disponibles:
+- Excel con todos tus pagos
+- PDF con el reporte financiero
+
+Los datos están listos para descargar."""
+
 def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     """Arma la respuesta de Yoly. `resp` junta los textos (ver Salida)."""
     global temp_gastos, temp_productos, memoria_usuarios
@@ -3443,25 +3498,23 @@ Link: {server_url}/dashboard/{phone_clean}"""
         rechazo_palabras = ['no', 'nope', 'incorrecto', 'de nuevo', 'de vueltas', 'otra vez']
 
         # CONFIRMACIÓN SI/NO - Chequear si es respuesta a "¿Te mando tabla al dashboard?"
-        if msg_lower.strip() in confirmacion_palabras and phone_clean in memoria_usuarios:
-            ultima_pregunta = memoria_usuarios[phone_clean].get("ultima_pregunta", "").lower()
+        # Acepta "sí.", "si porfa", "dale", "mándala", "si quiero la tabla"... (antes solo "si" exacto,
+        # y lo demás caía a Claude que respondía "¿qué necesitas?").
+        # Si pide PDF o Excel, lo atiende el bloque de descargas de más abajo.
+        hay_confirmacion_pendiente = from_number in temp_gastos or from_number in temp_productos
+        pide_archivo = 'pdf' in msg_lower or 'excel' in msg_lower
+        afirmativo = es_afirmativo(msg_lower)
+        if afirmativo and not hay_confirmacion_pendiente and not pide_archivo:
+            ultima_pregunta = obtener_ultima_pregunta(phone_clean)
 
-            # PRIORIDAD 1: Respuesta a "¿dashboard?"
-            if "dashboard" in ultima_pregunta:
-                dashboard_url = f"{server_url}/dashboard/{phone_clean}"
-                respuesta_dashboard = f"""✅ Perfecto, aquí está tu panel:
-{dashboard_url}
-
-📊 Descargas disponibles:
-- Excel con todos tus pagos
-- PDF con el reporte financiero
-
-Los datos están listos para descargar."""
-                resp.message(respuesta_dashboard)
+            # PRIORIDAD 1: Respuesta a "¿dashboard?" / "¿tabla?"
+            # Sin pregunta guardada (p. ej. Render reinició y se borró la memoria) pero con datos:
+            # un "sí" suelto casi siempre es a la tabla, así que mandamos el link igual.
+            if "dashboard" in ultima_pregunta or "tabla" in ultima_pregunta or (
+                    not ultima_pregunta and tiene_datos(phone_clean)):
+                resp.message(mensaje_link_dashboard(server_url, phone_clean))
                 # Limpiar contexto para siguiente pregunta
-                if phone_clean in memoria_usuarios:
-                    memoria_usuarios[phone_clean]["ultima_pregunta"] = ""
-                    guardar_memoria(memoria_usuarios)
+                limpiar_ultima_pregunta(phone_clean)
                 return
 
             # PRIORIDAD 2: Respuesta a "¿balance?" (código existente)
@@ -3475,9 +3528,15 @@ Te falta: ${cobro['saldo']:,.0f}
 
 📊 Documentar aquí: {server_url}/dashboard/{phone_clean}"""
                     resp.message(respuesta_balance)
-                    memoria_usuarios[phone_clean]["ultima_pregunta"] = ""
-                    guardar_memoria(memoria_usuarios)
+                    limpiar_ultima_pregunta(phone_clean)
                     return
+
+        # "No" a "¿Te mando tabla al dashboard?": cerrar la pregunta en vez de caer a Claude
+        if (msg_lower.strip().rstrip('.!') in rechazo_palabras and not hay_confirmacion_pendiente
+                and "dashboard" in obtener_ultima_pregunta(phone_clean)):
+            limpiar_ultima_pregunta(phone_clean)
+            resp.message("Listo 👍 Cuando quieras la tabla, escríbeme \"tabla\" o \"link\".")
+            return
 
         if msg_lower.strip() in confirmacion_palabras and from_number in temp_gastos:
             # User confirmed the expense!
@@ -3574,7 +3633,12 @@ Te falta: ${cobro['saldo']:,.0f}
 
         # ==================== DETECCIÓN DE PALABRAS CLAVE: PDF, EXCEL, LINK, PANEL, DASHBOARD ====================
 
-        palabras_clave_link = ['pdf', 'excel', 'link', 'panel', 'dashboard', 'descargar']
+        palabras_clave_link = ['pdf', 'excel', 'link', 'panel', 'dashboard', 'descargar', 'tabla']
+
+        # "no quiero la tabla" no es pedir la tabla
+        palabras_msg = re.findall(r"[a-zñáéíóú]+", msg_lower)
+        if 'no' in palabras_msg and not any(k in msg_lower for k in palabras_clave_link if k != 'tabla'):
+            palabras_clave_link = [k for k in palabras_clave_link if k != 'tabla']
 
         if any(keyword in msg_lower for keyword in palabras_clave_link):
             logger.info(f"Keyword detection for dashboard/downloads: {from_number}")
@@ -3611,7 +3675,7 @@ Te falta: ${cobro['saldo']:,.0f}
                     logger.error(f"Error generando Excel: {e}")
 
             # Si pide link, dashboard, panel o descargar
-            if any(keyword in msg_lower for keyword in ['link', 'panel', 'dashboard']):
+            if any(keyword in msg_lower for keyword in ['link', 'panel', 'dashboard', 'tabla']):
                 phone_clean = normalizar_telefono(from_number)
                 dashboard_url = f"{server_url}/dashboard/{phone_clean}"
                 resp.message(f"Aquí está: {dashboard_url}\n\nTienes opciones para descargar Excel o PDF una vez ahí.")
