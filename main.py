@@ -171,6 +171,10 @@ FINANCIAL_CONTEXT_FILE = 'financial_context.json'
 # Global dict to store expenses temporarily until user confirms with SI/NO
 temp_gastos = {}
 
+# ==================== TEMPORARY PRODUCTS FOR PRICE LIBRARY ====================
+# Global dict to store products extracted from tickets/receipts temporarily
+temp_productos = {}
+
 # ==================== FINANCIAL CONTEXT PERSISTENCE ====================
 
 def cargar_contexto_financiero():
@@ -2201,6 +2205,238 @@ def descargar_pdf(phone):
         logger.error(f"Error descargando PDF: {e}", exc_info=True)
         return f"Error al generar PDF: {str(e)}", 500
 
+@app.route("/dashboard/<phone>/precios", methods=["GET"])
+def dashboard_precios(phone):
+    """Dashboard con biblioteca de precios y comparaciones"""
+    try:
+        phone_clean = normalizar_telefono(phone)
+        ruta = f"/home/claude/yoly/data/{phone_clean}/biblioteca_precios.json"
+
+        if not os.path.exists(ruta):
+            return render_template_string("""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Mi Biblioteca de Precios</title>
+                <style>
+                    body { font-family: Arial; margin: 20px; background: #f5f5f5; }
+                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+                    h1 { color: #333; }
+                    .empty { text-align: center; color: #999; padding: 40px; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>📚 Mi Biblioteca de Precios</h1>
+                    <div class="empty">
+                        <p>No tienes precios guardados aún.</p>
+                        <p>Envía una foto de un ticket o factura para empezar a comparar precios.</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+            """)
+
+        try:
+            with open(ruta, 'r', encoding='utf-8') as f:
+                precios = json.load(f)
+        except:
+            precios = []
+
+        if not precios:
+            return render_template_string("""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <meta charset="utf-8">
+                <meta name="viewport" content="width=device-width, initial-scale=1">
+                <title>Mi Biblioteca de Precios</title>
+                <style>
+                    body { font-family: Arial; margin: 20px; background: #f5f5f5; }
+                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
+                    h1 { color: #333; }
+                    .empty { text-align: center; color: #999; padding: 40px; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>📚 Mi Biblioteca de Precios</h1>
+                    <div class="empty">
+                        <p>No tienes precios guardados aún.</p>
+                    </div>
+                </div>
+            </body>
+            </html>
+            """)
+
+        # Agrupar por producto_norm
+        by_product = {}
+        for p in precios:
+            key = p.get('producto_norm', 'otro')
+            if key not in by_product:
+                by_product[key] = []
+            by_product[key].append(p)
+
+        # Calcular estadísticas
+        stats = {}
+        for key, prods in by_product.items():
+            precios_list = [p.get('precio', 0) for p in prods]
+            stats[key] = {
+                'producto': prods[0].get('producto', key),
+                'minimo': min(precios_list),
+                'maximo': max(precios_list),
+                'promedio': round(sum(precios_list) / len(precios_list), 2),
+                'tiendas': list(set(p.get('tienda', '') for p in prods)),
+                'compras': len(prods),
+                'ultima_fecha': prods[-1].get('fecha', '')
+            }
+
+        # HTML del dashboard
+        html_content = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Mi Biblioteca de Precios</title>
+            <style>
+                body {{
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: #f5f5f5;
+                    margin: 0;
+                    padding: 20px;
+                }}
+                .container {{
+                    max-width: 1000px;
+                    margin: 0 auto;
+                    background: white;
+                    padding: 30px;
+                    border-radius: 10px;
+                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+                }}
+                h1 {{
+                    color: #1e40af;
+                    margin-top: 0;
+                    display: flex;
+                    align-items: center;
+                    gap: 10px;
+                }}
+                .stats {{
+                    display: grid;
+                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+                    gap: 15px;
+                    margin-bottom: 30px;
+                }}
+                .stat-card {{
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    padding: 20px;
+                    border-radius: 8px;
+                    text-align: center;
+                }}
+                .stat-card h3 {{
+                    margin: 0 0 10px 0;
+                    font-size: 14px;
+                    opacity: 0.9;
+                }}
+                .stat-card .value {{
+                    font-size: 28px;
+                    font-weight: bold;
+                }}
+                table {{
+                    width: 100%;
+                    border-collapse: collapse;
+                }}
+                th {{
+                    background: #1e40af;
+                    color: white;
+                    padding: 12px;
+                    text-align: left;
+                    font-weight: 600;
+                }}
+                td {{
+                    padding: 12px;
+                    border-bottom: 1px solid #eee;
+                }}
+                tr:hover {{
+                    background: #f9f9f9;
+                }}
+                .price {{
+                    font-weight: bold;
+                    color: #16a34a;
+                }}
+                .tiendas {{
+                    font-size: 12px;
+                    color: #666;
+                }}
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>📚 Mi Biblioteca de Precios</h1>
+
+                <div class="stats">
+                    <div class="stat-card">
+                        <h3>Productos Diferentes</h3>
+                        <div class="value">{len(stats)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Total de Compras</h3>
+                        <div class="value">{len(precios)}</div>
+                    </div>
+                    <div class="stat-card">
+                        <h3>Tiendas Diferentes</h3>
+                        <div class="value">{len(set(p.get('tienda', '') for p in precios))}</div>
+                    </div>
+                </div>
+
+                <h2>Comparación de Precios</h2>
+                <table>
+                    <tr>
+                        <th>Producto</th>
+                        <th>Precio Min</th>
+                        <th>Precio Max</th>
+                        <th>Promedio</th>
+                        <th>Tiendas</th>
+                        <th>Compras</th>
+                    </tr>
+        """
+
+        for producto_norm in sorted(stats.keys()):
+            s = stats[producto_norm]
+            tiendas_str = ", ".join(s['tiendas'][:2])
+            if len(s['tiendas']) > 2:
+                tiendas_str += f" +{len(s['tiendas'])-2}"
+
+            html_content += f"""
+                    <tr>
+                        <td><strong>{s['producto']}</strong></td>
+                        <td class="price">${s['minimo']:.2f}</td>
+                        <td class="price">${s['maximo']:.2f}</td>
+                        <td class="price">${s['promedio']:.2f}</td>
+                        <td class="tiendas">{tiendas_str}</td>
+                        <td>{s['compras']}</td>
+                    </tr>
+            """
+
+        html_content += """
+                </table>
+                <div style="text-align: center; margin-top: 30px; color: #999; font-size: 12px;">
+                    <p>Última actualización: """ + precios[-1].get('fecha', '')[:10] + """</p>
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        return render_template_string(html_content)
+
+    except Exception as e:
+        logger.error(f"Error en dashboard de precios: {e}", exc_info=True)
+        return f"Error al cargar dashboard: {str(e)}", 500
+
 @app.route("/api/gastos/<phone>", methods=["GET"])
 def api_gastos(phone):
     """API endpoint para obtener gastos en JSON"""
@@ -2438,6 +2674,44 @@ def atender_con_imagen(media_url, incoming_msg, from_number, server_url):
 
     def trabajar():
         try:
+            global temp_productos
+            msg_lower = incoming_msg.lower() if incoming_msg else ""
+
+            # Detectar si es una imagen de precios/comparación
+            es_precio = any(keyword in msg_lower for keyword in ['precio', 'compara', 'donde es mas barato', 'dónde es más barato', 'ticket', 'mercado'])
+
+            if es_precio:
+                # Extraer productos con Vision
+                productos_dict, error = extraer_productos_vision(media_url, from_number)
+
+                if error:
+                    salida.message(error)
+                    return
+
+                if not productos_dict or not productos_dict.get('productos'):
+                    salida.message("No pude leer los precios de la imagen. Asegúrate que sea un ticket o factura clara con precios visibles.")
+                    return
+
+                # Almacenar temporalmente para confirmación
+                temp_productos[from_number] = productos_dict
+
+                # Mostrar resumen
+                tienda = productos_dict.get('tienda', 'desconocida')
+                msg = f"🧾 Encontré en tu ticket de *{tienda}*:\n\n"
+
+                for p in productos_dict['productos'][:5]:  # Mostrar máximo 5
+                    producto = p.get('producto', '')
+                    precio = p.get('precio', 0)
+                    msg += f"  • {producto}: ${precio:.2f}\n"
+
+                if len(productos_dict['productos']) > 5:
+                    msg += f"  ... y {len(productos_dict['productos']) - 5} más\n"
+
+                msg += f"\n¿Lo guardo para comparar precios? Responde *SI* o *NO*"
+                salida.message(msg)
+                return
+
+            # Si no es precio, usar el flujo normal de gastos
             # Procesar la imagen con visión
             resultado = procesar_foto_inteligente(media_url, from_number)
             salida.message(resultado)
@@ -2520,9 +2794,226 @@ def atender_con_audio(media_url, incoming_msg, from_number, server_url):
     return str(resp)
 
 
+# ==================== PRICE LIBRARY & GLOBAL MARKET ====================
+
+def extraer_productos_vision(media_url, telefono):
+    """Usa Claude Vision para extraer productos de un ticket/recibo"""
+    try:
+        # Descargar imagen
+        imagen_bytes = descargar_media_twilio(media_url)
+        if not imagen_bytes:
+            return None, "❌ No pude descargar la imagen. Intenta de nuevo."
+
+        # Convertir a WEBP
+        webp_bytes = convertir_a_webp(imagen_bytes)
+        if not webp_bytes:
+            return None, "❌ No pude procesar la imagen. Intenta con otra."
+
+        # Convertir a base64
+        imagen_base64 = base64.standard_b64encode(webp_bytes).decode('utf-8')
+
+        # Llamar a Claude Vision
+        response = client.messages.create(
+            model=MODELO_CLAUDE,
+            max_tokens=800,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/webp",
+                            "data": imagen_base64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": """Analiza esta imagen de ticket/factura. Extrae SOLO un JSON válido, sin explicaciones:
+{
+  "tienda": "nombre de la tienda",
+  "ciudad": "ciudad donde está la tienda",
+  "productos": [
+    {
+      "producto": "nombre del producto",
+      "producto_norm": "nombre normalizado a minusculas",
+      "precio": número,
+      "marca": "marca si aparece",
+      "medida": "tamaño/cantidad",
+      "categoria": "granos, aceites, bebidas, lacteos, etc"
+    }
+  ]
+}
+
+INSTRUCCION CRITICA:
+- SOLO extrae números que REALMENTE aparecen en la factura
+- Normaliza producto_norm a minusculas sin acentos
+- Si no ves tienda, pon "desconocida"
+- Si no ves ciudad, pon "no especificada"
+- Si no ves marca, medida o categoria, deja vacío o "desconocido"
+- NUNCA inventes precios"""
+                    }
+                ]
+            }]
+        )
+
+        # Parsear respuesta
+        try:
+            texto_respuesta = response.content[0].text.strip()
+            # Limpiar posibles marcas de código
+            if texto_respuesta.startswith('```'):
+                texto_respuesta = texto_respuesta.split('```')[1]
+                if texto_respuesta.startswith('json'):
+                    texto_respuesta = texto_respuesta[4:]
+            if texto_respuesta.endswith('```'):
+                texto_respuesta = texto_respuesta[:-3]
+
+            productos_dict = json.loads(texto_respuesta)
+            return productos_dict, None
+        except json.JSONDecodeError as e:
+            logger.error(f"Error parseando JSON de productos: {e}")
+            return None, "❌ No pude procesar la imagen. Asegúrate que sea un ticket o factura clara."
+
+    except Exception as e:
+        logger.error(f"Error en extraer_productos_vision: {e}", exc_info=True)
+        return None, f"❌ Error procesando imagen: {str(e)}"
+
+def guardar_en_biblioteca(telefono, producto_dict, tienda, ciudad):
+    """Guarda un producto en la biblioteca privada de precios del usuario"""
+    try:
+        phone_clean = normalizar_telefono(telefono)
+        ruta = f"/home/claude/yoly/data/{phone_clean}/biblioteca_precios.json"
+
+        # Crear directorio si no existe
+        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+
+        # Leer documentos existentes
+        docs = []
+        if os.path.exists(ruta):
+            try:
+                with open(ruta, 'r', encoding='utf-8') as f:
+                    docs = json.load(f)
+            except:
+                docs = []
+
+        # Crear nuevo documento
+        doc = {
+            "id": len(docs) + 1,
+            "phone": phone_clean,
+            "producto": producto_dict.get('producto', ''),
+            "producto_norm": producto_dict.get('producto_norm', ''),
+            "precio": producto_dict.get('precio', 0),
+            "tienda": tienda,
+            "ciudad": ciudad,
+            "marca": producto_dict.get('marca', ''),
+            "medida": producto_dict.get('medida', ''),
+            "categoria": producto_dict.get('categoria', ''),
+            "fecha": datetime.now().isoformat()
+        }
+
+        docs.append(doc)
+
+        # Guardar
+        with open(ruta, 'w', encoding='utf-8') as f:
+            json.dump(docs, f, indent=2, ensure_ascii=False)
+
+        return True
+    except Exception as e:
+        logger.error(f"Error guardando en biblioteca: {e}", exc_info=True)
+        return False
+
+def guardar_en_mercado_global(producto_dict, tienda, ciudad):
+    """Guarda un producto en el mercado global anónimo (sin phone)"""
+    try:
+        ruta = "/home/claude/yoly/data/mercado_global/precios.json"
+
+        # Crear directorio si no existe
+        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+
+        # Leer documentos existentes
+        docs = []
+        if os.path.exists(ruta):
+            try:
+                with open(ruta, 'r', encoding='utf-8') as f:
+                    docs = json.load(f)
+            except:
+                docs = []
+
+        # Crear nuevo documento
+        doc = {
+            "id": len(docs) + 1,
+            "producto_norm": producto_dict.get('producto_norm', ''),
+            "producto": producto_dict.get('producto', ''),
+            "marca": producto_dict.get('marca', ''),
+            "medida": producto_dict.get('medida', ''),
+            "precio": producto_dict.get('precio', 0),
+            "tienda": tienda,
+            "ciudad": ciudad,
+            "categoria": producto_dict.get('categoria', ''),
+            "fecha": datetime.now().isoformat()
+        }
+
+        docs.append(doc)
+
+        # Guardar
+        with open(ruta, 'w', encoding='utf-8') as f:
+            json.dump(docs, f, indent=2, ensure_ascii=False)
+
+        return True
+    except Exception as e:
+        logger.error(f"Error guardando en mercado global: {e}", exc_info=True)
+        return False
+
+def buscar_precios(producto_query):
+    """Busca en el mercado global dónde es más barato un producto"""
+    try:
+        producto_norm = producto_query.lower().strip()
+        ruta = "/home/claude/yoly/data/mercado_global/precios.json"
+
+        if not os.path.exists(ruta):
+            return None
+
+        with open(ruta, 'r', encoding='utf-8') as f:
+            docs = json.load(f)
+
+        # Filtrar por producto_norm (búsqueda parcial)
+        matches = [d for d in docs if producto_norm in d.get('producto_norm', '').lower()]
+
+        if not matches:
+            return None
+
+        # Agrupar por tienda
+        by_tienda = {}
+        for m in matches:
+            tienda = m.get('tienda', 'desconocida')
+            if tienda not in by_tienda:
+                by_tienda[tienda] = {'precios': [], 'ciudades': set(), 'items': []}
+            by_tienda[tienda]['precios'].append(m.get('precio', 0))
+            by_tienda[tienda]['ciudades'].add(m.get('ciudad', ''))
+            by_tienda[tienda]['items'].append(m)
+
+        # Calcular estadísticas
+        results = []
+        for tienda, data in by_tienda.items():
+            precio_prom = sum(data['precios']) / len(data['precios'])
+            results.append({
+                'tienda': tienda,
+                'precio_prom': round(precio_prom, 2),
+                'muestras': len(data['precios']),
+                'ciudades': list(data['ciudades'])
+            })
+
+        # Ordenar por precio
+        results.sort(key=lambda x: x['precio_prom'])
+
+        return results
+    except Exception as e:
+        logger.error(f"Error buscando precios: {e}", exc_info=True)
+        return None
+
 def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     """Arma la respuesta de Yoly. `resp` junta los textos (ver Salida)."""
-    global temp_gastos
+    global temp_gastos, temp_productos
     msg_lower = incoming_msg.lower()
 
     try:
@@ -2589,6 +3080,41 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
             del temp_gastos[from_number]
             resp.message("❌ Listo, cancelado. Dime de nuevo cómo es. Ejemplo: 'Envié 500, renta 380, comida 120'")
             return
+
+        # ==================== CONFIRMATION FLOW FOR PRICE LIBRARY: SI/NO ====================
+        # Check if user is confirming products from ticket photo
+        if msg_lower.strip() in confirmacion_palabras and from_number in temp_productos:
+            # User confirmed the products!
+            prods_temp = temp_productos[from_number]
+            phone_clean = normalizar_telefono(from_number)
+
+            # Guardar en biblioteca privada
+            guardados_ok = 0
+            for p in prods_temp.get('productos', []):
+                if guardar_en_biblioteca(phone_clean, p, prods_temp.get('tienda', 'desconocida'), prods_temp.get('ciudad', '')):
+                    guardados_ok += 1
+                # Guardar también en mercado global anónimo
+                guardar_en_mercado_global(p, prods_temp.get('tienda', 'desconocida'), prods_temp.get('ciudad', ''))
+
+            del temp_productos[from_number]
+
+            tienda = prods_temp.get('tienda', 'desconocida')
+            msg_resp = f"✅ Listo, guardé {guardados_ok} productos de *{tienda}* en tu biblioteca.\n\n"
+            msg_resp += "Ahora puedo ayudarte a buscar dónde es más barato. Pregúntame:\n"
+            msg_resp += "  • Dónde es más barato arroz?\n"
+            msg_resp += "  • Precio de aceite?\n"
+            msg_resp += "  • Comparar pan integral\n\n"
+            msg_resp += f"También ves tus precios en: {server_url}/dashboard/{phone_clean}/precios"
+
+            resp.message(msg_resp)
+            return
+
+        elif msg_lower.strip() in rechazo_palabras and from_number in temp_productos:
+            # User rejected the products
+            del temp_productos[from_number]
+            resp.message("❌ Listo, cancelado. Envía otra foto del ticket.")
+            return
+
         # ==================== DETECCIÓN DE PALABRAS CLAVE: PDF, EXCEL, LINK, PANEL, DASHBOARD ====================
 
         palabras_clave_link = ['pdf', 'excel', 'link', 'panel', 'dashboard', 'descargar']
@@ -2633,6 +3159,44 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
                 dashboard_url = f"{server_url}/dashboard/{phone_clean}"
                 resp.message(f"Aquí está: {dashboard_url}\n\nTienes opciones para descargar Excel o PDF una vez ahí.")
                 return
+
+        # ==================== BÚSQUEDA DE PRECIOS EN MERCADO GLOBAL ====================
+
+        if any(keyword in msg_lower for keyword in ['donde es mas barato', 'dónde es más barato', 'precio de', 'costo de', 'comparar']):
+            logger.info(f"Price comparison request from {from_number}")
+
+            # Extraer el producto a buscar
+            producto = incoming_msg.lower()
+            for keyword in ['donde es mas barato', 'dónde es más barato', 'precio de', 'costo de', 'comparar']:
+                if keyword in producto:
+                    producto = producto.replace(keyword, '').strip()
+                    break
+
+            if not producto or len(producto) < 2:
+                resp.message("¿Qué producto quieres comparar? Ejemplo: 'dónde es más barato arroz?'")
+                return
+
+            resultados = buscar_precios(producto)
+
+            if not resultados:
+                resp.message(f"No encontré '{producto}' en mi base de datos. Envía una foto del ticket de compra para que empiece a comparar.")
+                return
+
+            # Construir respuesta
+            response_msg = f"📊 Precios de *{producto}*:\n\n"
+
+            for i, r in enumerate(resultados[:3], 1):  # Top 3 más baratos
+                response_msg += f"{i}. *{r['tienda']}*\n"
+                response_msg += f"   ${r['precio_prom']:.2f} (basado en {r['muestras']} compra{'s' if r['muestras'] != 1 else ''})\n"
+                ciudades = ", ".join(r['ciudades']) if r['ciudades'] else "no especificada"
+                response_msg += f"   📍 {ciudades}\n\n"
+
+            if len(resultados) > 1:
+                ahorro = resultados[-1]['precio_prom'] - resultados[0]['precio_prom']
+                response_msg += f"💰 Ahorro si compras en {resultados[0]['tienda']}: ${ahorro:.2f}"
+
+            resp.message(response_msg)
+            return
 
         # ==================== REGISTRO DE GASTOS CON DESGLOSE ====================
 
