@@ -613,7 +613,7 @@ INSTRUCCIONES CRÍTICAS:
             'estado': 'guardado',
             'descripcion': descripcion,
             'gasto_id': gasto_id,
-            'ultima_pregunta': 'balance'
+            'ultima_pregunta': 'dashboard'
         }
         guardar_memoria(memoria_usuarios)
 
@@ -1790,14 +1790,20 @@ def normalizar_telefono(phone):
     return re.sub(r'[^0-9]', '', phone)
 
 def generar_excel_gastos(phone):
-    """Genera un archivo Excel con los gastos del usuario del mes actual"""
+    """Genera un archivo Excel con los gastos del usuario del mes actual y resumen de deudas"""
     if not HAS_PANDAS:
         # Fallback a openpyxl si pandas no está disponible
         return generar_excel_gastos_openpyxl(phone)
 
     try:
         gastos = cargar_gastos(phone)
-        if not gastos:
+        phone_clean = normalizar_telefono(phone)
+
+        # Verificar si hay datos en memoria (deuda, pagos)
+        datos_memoria = memoria_usuarios.get(phone_clean, {})
+        tiene_deuda_info = datos_memoria.get('tipo') == 'deuda'
+
+        if not gastos and not tiene_deuda_info:
             return None
 
         # Filtrar gastos del mes actual
@@ -1805,23 +1811,79 @@ def generar_excel_gastos(phone):
         mes_actual = hoy.month
         anio_actual = hoy.year
 
-        gastos_mes = [g for g in gastos if 'fecha' in g]
+        gastos_mes = [g for g in gastos if 'fecha' in g] if gastos else []
         gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
                       and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
 
-        if not gastos_mes:
-            return None
-
-        # Crear DataFrame
+        # Crear DataFrame con información de deuda si existe
         df_data = []
+
+        # Agregar resumen de deuda como filas iniciales
+        if tiene_deuda_info:
+            deuda = datos_memoria.get('deuda', 0)
+            pagado = datos_memoria.get('pagado', 0)
+            balance = datos_memoria.get('balance', 0)
+            cliente = datos_memoria.get('cliente', 'Cliente')
+            fecha_final = datos_memoria.get('fecha_final', '')
+
+            df_data.append({
+                'Fecha': fecha_final,
+                'Descripción': f'RESUMEN: {cliente}',
+                'Categoría': 'DEUDA',
+                'Monto': deuda,
+                'Pagos': '',
+                'Balance': balance,
+                'Notas': f'Deuda Original: ${deuda:,.2f}'
+            })
+
+            # Agregar pagos individuales
+            pagos_lista = datos_memoria.get('pagos', [])
+            for idx, pago in enumerate(pagos_lista, 1):
+                df_data.append({
+                    'Fecha': fecha_final,
+                    'Descripción': f'Pago #{idx}',
+                    'Categoría': 'PAGO',
+                    'Monto': float(pago),
+                    'Pagos': float(pago),
+                    'Balance': '',
+                    'Notas': f'Pagado: ${float(pago):,.2f}'
+                })
+
+            df_data.append({
+                'Fecha': fecha_final,
+                'Descripción': f'TOTAL PAGADO',
+                'Categoría': 'RESUMEN',
+                'Monto': '',
+                'Pagos': pagado,
+                'Balance': balance,
+                'Notas': f'Balance Pendiente: ${balance:,.2f}'
+            })
+
+            # Agregar separador
+            df_data.append({
+                'Fecha': '',
+                'Descripción': '---',
+                'Categoría': '',
+                'Monto': '',
+                'Pagos': '',
+                'Balance': '',
+                'Notas': ''
+            })
+
+        # Agregar gastos del mes
         for gasto in gastos_mes:
             df_data.append({
                 'Fecha': gasto.get('fecha', ''),
                 'Descripción': gasto.get('descripcion', ''),
                 'Categoría': gasto.get('categoria', ''),
                 'Monto': gasto.get('monto', 0),
-                'Desglose': json.dumps(gasto.get('desglose_json', {})) if gasto.get('desglose_json') else ''
+                'Pagos': '',
+                'Balance': '',
+                'Notas': ''
             })
+
+        if not df_data:
+            return None
 
         df = pd.DataFrame(df_data)
 
@@ -1888,23 +1950,26 @@ def generar_excel_gastos_openpyxl(phone):
         return None
 
 def generar_pdf_dashboard(phone):
-    """Genera un PDF con los gastos del mes actual"""
+    """Genera un PDF con los gastos del mes actual y resumen de deuda/pagos"""
     try:
         gastos = cargar_gastos(phone)
-        if not gastos:
+        phone_clean = normalizar_telefono(phone)
+
+        # Verificar si hay datos en memoria (deuda, pagos)
+        datos_memoria = memoria_usuarios.get(phone_clean, {})
+        tiene_deuda_info = datos_memoria.get('tipo') == 'deuda'
+
+        if not gastos and not tiene_deuda_info:
             return None
 
-        # Filtrar gastos del mes actual
         hoy = datetime.now()
         mes_actual = hoy.month
         anio_actual = hoy.year
 
-        gastos_mes = [g for g in gastos if 'fecha' in g]
+        # Filtrar gastos del mes actual
+        gastos_mes = [g for g in gastos if 'fecha' in g] if gastos else []
         gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
                       and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
-
-        if not gastos_mes:
-            return None
 
         pdf_path = f"/tmp/gastos_{phone}_{datetime.now().strftime('%Y%m%d')}.pdf"
         tmp_path = ruta_temporal(pdf_path)
@@ -1922,35 +1987,101 @@ def generar_pdf_dashboard(phone):
             spaceAfter=12
         )
 
-        story.append(Paragraph("Estado de Gastos", title_style))
-        story.append(Paragraph(f"Período: {hoy.strftime('%B %Y')}", styles['Normal']))
+        story.append(Paragraph("Reporte Financiero", title_style))
+        story.append(Paragraph(f"Fecha: {hoy.strftime('%d/%m/%Y')}", styles['Normal']))
         story.append(Spacer(1, 0.3*inch))
 
-        # Tabla de gastos
-        table_data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
-        total_mes = 0
+        # Mostrar resumen de deuda si existe
+        if tiene_deuda_info:
+            deuda = datos_memoria.get('deuda', 0)
+            pagado = datos_memoria.get('pagado', 0)
+            balance = datos_memoria.get('balance', 0)
+            cliente = datos_memoria.get('cliente', 'Cliente')
+            fecha_final = datos_memoria.get('fecha_final', '')
 
-        for gasto in sorted(gastos_mes, key=lambda x: x.get('fecha', '')):
-            table_data.append([
-                gasto.get('fecha', ''),
-                gasto.get('descripcion', '')[:30],
-                gasto.get('categoria', ''),
-                f"${gasto.get('monto', 0):.2f}"
-            ])
-            total_mes += gasto.get('monto', 0)
+            story.append(Paragraph("RESUMEN DE DEUDA", ParagraphStyle('Heading2', parent=styles['Heading2'], textColor=colors.HexColor('#dc2626'))))
+            story.append(Spacer(1, 0.1*inch))
 
-        table_data.append(['', '', 'TOTAL', f"${total_mes:.2f}"])
+            # Tabla de resumen
+            summary_data = [
+                ['Cliente', cliente],
+                ['Deuda Original', f"${deuda:,.2f}"],
+                ['Pagado', f"${pagado:,.2f}"],
+                ['Balance Pendiente', f"${balance:,.2f}"],
+                ['Fecha', fecha_final]
+            ]
 
-        table = Table(table_data)
-        table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ]))
+            summary_table = Table(summary_data, colWidths=[3*inch, 2*inch])
+            summary_table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f3f4f6')])
+            ]))
 
-        story.append(table)
+            story.append(summary_table)
+
+            # Mostrar desglose de pagos si existe
+            pagos_lista = datos_memoria.get('pagos', [])
+            if pagos_lista:
+                story.append(Spacer(1, 0.3*inch))
+                story.append(Paragraph("DESGLOSE DE PAGOS", ParagraphStyle('Heading2', parent=styles['Heading2'], textColor=colors.HexColor('#1e40af'))))
+                story.append(Spacer(1, 0.1*inch))
+
+                pagos_data = [['Pago #', 'Monto']]
+                for idx, pago in enumerate(pagos_lista, 1):
+                    pagos_data.append([str(idx), f"${float(pago):,.2f}"])
+
+                pagos_table = Table(pagos_data, colWidths=[1*inch, 1.5*inch])
+                pagos_table.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#059669')),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('GRID', (0, 0), (-1, -1), 1, colors.grey),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0fdf4')])
+                ]))
+                story.append(pagos_table)
+
+            story.append(Spacer(1, 0.3*inch))
+
+        # Tabla de gastos del mes si existen
+        if gastos_mes:
+            story.append(Paragraph("GASTOS DEL MES", ParagraphStyle('Heading2', parent=styles['Heading2'], textColor=colors.HexColor('#1e40af'))))
+            story.append(Spacer(1, 0.1*inch))
+
+            table_data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
+            total_mes = 0
+
+            for gasto in sorted(gastos_mes, key=lambda x: x.get('fecha', '')):
+                table_data.append([
+                    gasto.get('fecha', ''),
+                    gasto.get('descripcion', '')[:30],
+                    gasto.get('categoria', ''),
+                    f"${gasto.get('monto', 0):.2f}"
+                ])
+                total_mes += gasto.get('monto', 0)
+
+            table_data.append(['', '', 'TOTAL', f"${total_mes:.2f}"])
+
+            table = Table(table_data)
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('GRID', (0, 0), (-1, -1), 1, colors.black),
+                ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#f3f4f6')])
+            ]))
+
+            story.append(table)
+
+        # Si no hay datos, mostrar mensaje
+        if not gastos_mes and not tiene_deuda_info:
+            story.append(Paragraph("Sin datos disponibles", styles['Normal']))
+
         doc.build(story)
         publicar_pdf(tmp_path, pdf_path)
 
@@ -3195,11 +3326,30 @@ Link: {server_url}/dashboard/{phone_clean}"""
         confirmacion_palabras = ['si', 'yes', 'ok', 'vale', 'correcto', 'está bien', 'esta bien', 'ok!', 'si!', 'sí']
         rechazo_palabras = ['no', 'nope', 'incorrecto', 'de nuevo', 'de vueltas', 'otra vez']
 
-        # PRIORIDAD 1: Chequear si es respuesta a "¿Quieres el balance?"
+        # CONFIRMACIÓN SI/NO - Chequear si es respuesta a "¿Te mando tabla al dashboard?"
         if msg_lower.strip() in confirmacion_palabras and phone_clean in memoria_usuarios:
             ultima_pregunta = memoria_usuarios[phone_clean].get("ultima_pregunta", "").lower()
-            if "balance" in ultima_pregunta:
-                # Es respuesta a balance - mostrar el balance
+
+            # PRIORIDAD 1: Respuesta a "¿dashboard?"
+            if "dashboard" in ultima_pregunta:
+                dashboard_url = f"{server_url}/dashboard/{phone_clean}"
+                respuesta_dashboard = f"""✅ Perfecto, aquí está tu panel:
+{dashboard_url}
+
+📊 Descargas disponibles:
+- Excel con todos tus pagos
+- PDF con el reporte financiero
+
+Los datos están listos para descargar."""
+                resp.message(respuesta_dashboard)
+                # Limpiar contexto para siguiente pregunta
+                if phone_clean in memoria_usuarios:
+                    memoria_usuarios[phone_clean]["ultima_pregunta"] = ""
+                    guardar_memoria(memoria_usuarios)
+                return
+
+            # PRIORIDAD 2: Respuesta a "¿balance?" (código existente)
+            elif "balance" in ultima_pregunta:
                 datos = memoria_usuarios[phone_clean]
                 if datos.get('tipo') == 'deuda':
                     deuda = datos.get('deuda', 0)
@@ -3213,11 +3363,10 @@ Pagado: ${pagado:,.0f}
 Te falta: ${balance:,.0f}
 
 📊 Documentar aquí: {server_url}/dashboard/{phone_clean}"""
-
                     resp.message(respuesta_balance)
-                    # Limpiar la pregunta para que no se repita
-                    memoria_usuarios[phone_clean]["ultima_pregunta"] = ""
-                    guardar_memoria(memoria_usuarios)
+                    if phone_clean in memoria_usuarios:
+                        memoria_usuarios[phone_clean]["ultima_pregunta"] = ""
+                        guardar_memoria(memoria_usuarios)
                     return
 
         if msg_lower.strip() in confirmacion_palabras and from_number in temp_gastos:
