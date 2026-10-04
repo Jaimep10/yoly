@@ -307,6 +307,7 @@ def procesar_foto_inteligente(media_url, telefono):
     Descarga, convierte a WEBP, guarda en /app/data/{telefono}/facturas/
     y extrae información con IA.
     """
+    gasto = None  # Inicializar variable antes de try/except
     try:
         # Descargar imagen
         imagen_bytes = descargar_media_twilio(media_url)
@@ -318,13 +319,14 @@ def procesar_foto_inteligente(media_url, telefono):
         if not webp_bytes:
             return "❌ No pude procesar la imagen. Intenta con otra."
 
-        # Guardar en carpeta de facturas
+        # Guardar temporalmente en carpeta de facturas (con nombre genérico)
         ruta_datos = obtener_ruta_datos(telefono)
         ruta_facturas = f"{ruta_datos}/facturas"
         os.makedirs(ruta_facturas, exist_ok=True)
         fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-        desc_normalizada = gasto.get('descripcion', 'factura').lower().replace(' ', '').replace('-', '')[:15]
-        ruta_archivo = f"{ruta_facturas}/{fecha_hoy}_{desc_normalizada}.webp"
+        # Guardar con nombre temporal; se renombrará después de parsear
+        timestamp_tmp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ruta_archivo = f"{ruta_facturas}/{fecha_hoy}_{timestamp_tmp}.webp"
         with open(ruta_archivo, "wb") as f:
             f.write(webp_bytes)
 
@@ -383,6 +385,10 @@ Sé específico: si es Home Depot o ferretería -> materiales. Si menciona Ecuad
             print(f"Error parseando JSON de Claude: {e}")
             print(f"Respuesta: {texto_respuesta}")
             return "❌ No pude procesar la factura. Asegúrate que sea una imagen clara."
+
+        # Verificar que gasto se haya parseado correctamente
+        if not gasto:
+            return "No pude leer bien los números, ¿puedes escribirlos así: Renta 500, Comida 480...?"
 
         # Crear estructura de gasto en nuevo formato
         fecha_hoy = datetime.now().strftime("%Y-%m-%d")
