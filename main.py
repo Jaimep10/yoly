@@ -29,6 +29,7 @@ import zipfile
 import html
 from urllib.parse import quote_plus
 import precios
+import reportes
 import io
 try:
     import pandas as pd
@@ -615,11 +616,13 @@ def procesar_audio(media_url, telefono):
         logger.error(f"Error procesando audio: {e}", exc_info=True)
         return None
 
-def procesar_foto_inteligente(media_url, telefono):
+def procesar_foto_inteligente(media_url, telefono, texto_usuario="", info=None):
     """
     Procesa una foto de factura/recibo usando Claude Vision.
     Descarga, convierte a WEBP, guarda en /app/data/{telefono}/facturas/
     y extrae información con IA.
+    texto_usuario: lo que el usuario escribió junto a la foto (ayuda a clasificar transferencias).
+    info: dict opcional donde se anota el tipo de documento leído (info["tipo"]).
     """
     gasto = None  # Inicializar variable antes de try/except
     try:
@@ -692,6 +695,16 @@ Si es una FACTURA o TICKET DE COMPRA con productos (supermercado, farmacia, ferr
   ]
 y en "pagos" pon el TOTAL de la factura como un solo pago.
 
+Si es una TRANSFERENCIA, deposito o comprobante de pago (captura de la app del banco, Zelle, Venmo, recibo de pago a una persona):
+  "tipo": "transferencia",
+  "concepto": "el concepto, motivo, descripcion o memo TAL CUAL aparece (ej: Sueldo mensual)",
+  "beneficiario": "a quien se le envio el dinero",
+  "ordenante": "quien envio el dinero",
+  "direccion": "enviada" si el dueño del celular mando el dinero, "recibida" si lo recibio, null si no se sabe,
+  "banco": "banco o app",
+  "referencia": "numero de comprobante si aparece",
+y en "pagos" pon el monto como un solo pago con la fecha de la transferencia. No inventes el concepto: si no aparece, null.
+
 Reglas:
 - pagos: un objeto por cada pago individual, en el mismo orden de la imagen.
 - fecha: extrae de la libretita "01-3-26" -> "2026-01-03" (formato YYYY-MM-DD). Si no hay fecha, usa null pero NO inventes.
@@ -700,7 +713,7 @@ Reglas:
 - nota: si hay nota como "banco X" guardala en nota.
 - deuda_total: solo si aparece en la imagen.
 - Si es una factura o ticket normal con un solo total, pon ese total como un solo pago.
-- tipo: "libreta_cobros" (cuaderno de pagos/deudas), "factura_compra" (ticket con productos y precios) u "otro".
+- tipo: "libreta_cobros" (cuaderno de pagos/deudas), "factura_compra" (ticket con productos y precios), "transferencia" (comprobante de transferencia o pago a una persona) u "otro".
 - articulos: SOLO en factura_compra, una linea por producto. precio = precio UNITARIO (si dice "2 x 1.75  3.50", precio 1.75 y cantidad 2). producto_norm en minusculas, sin acentos, sin marca ni medida. marca y medida solo si aparecen (si no, ""). Si el precio de un producto no se lee claro, pon precio null.
 - ciudad: solo si aparece impresa en la factura (direccion de la tienda). Si no aparece, null. No la adivines.
 
@@ -741,6 +754,14 @@ No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
         phone_clean = normalizar_telefono(telefono)
 
         es_compra = vision_response.get('tipo') == 'factura_compra'
+        if info is not None:
+            info['tipo'] = vision_response.get('tipo')
+
+        # Transferencia (sueldo, renta, deuda...): se clasifica sola y va a su carpeta
+        if vision_response.get('tipo') == 'transferencia':
+            if pagado <= 0:
+                return "❌ No pude leer el monto de la transferencia. Envía una captura más clara o escribe el monto."
+            return guardar_transferencia(telefono, vision_response, pagos, pagado, ruta_archivo, texto_usuario)
 
         # Registro de pagos de una deuda: se guarda como LISTA de pagos, no como 1 gasto
         if not es_compra and (deuda > 0 or len(pagos) > 1):
@@ -783,9 +804,17 @@ No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
             "cliente": cliente,
             "factura_path": ruta_archivo
         }
+        if es_compra:
+            gasto_nuevo["categoria"] = reportes.CARPETA_COMPRAS
         gastos = cargar_gastos(telefono)
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
+        if es_compra:
+            try:
+                reportes.guardar_en_carpeta(DATA_DIR, telefono, reportes.CARPETA_COMPRAS,
+                                            dict(gasto_nuevo, movimiento="gasto", tienda=vision_response.get('tienda')))
+            except Exception as e:
+                logger.warning(f"No pude guardar la compra en su carpeta: {e}")
 
         respuesta = f"Leí {cliente}: ${pagado:,.0f}.\n\n"
         if es_compra:
@@ -806,6 +835,138 @@ No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
     except Exception as e:
         logger.error(f"Error en procesar_foto_inteligente: {e}", exc_info=True)
         return f"❌ Error procesando factura: {str(e)}"
+
+NOMBRES_CARPETA = {"sueldo": "Sueldos", "renta": "Renta", "deuda": "Deudas", "servicios": "Servicios",
+                   "ingreso": "Ingresos", "compras": "Compras", "por_revisar": "Por revisar"}
+
+
+def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo, texto_usuario=""):
+    """
+    Clasifica una transferencia por su concepto (sueldo, renta, deuda, servicios, ingreso) y la guarda en
+    data/{telefono}/{carpeta}/transacciones.json, y también en gastos.json o ingresos.json para los reportes.
+    Si el concepto no dice qué es, va a "por_revisar" y se le pregunta al usuario (no adivinamos).
+    """
+    concepto = vision_response.get('concepto') or ''
+    direccion = vision_response.get('direccion')
+    clase = reportes.clasificar_transferencia(concepto, direccion, texto_usuario)
+    carpeta, movimiento = clase['carpeta'], clase['movimiento']
+
+    fecha = pagos[0].get('fecha') if pagos else None
+    fecha_leida = fecha_valida(fecha) if fecha else False
+    if not fecha_leida:
+        fecha = datetime.now().strftime("%Y-%m-%d")
+    persona = vision_response.get('beneficiario') if movimiento == 'gasto' else vision_response.get('ordenante')
+    persona = persona or vision_response.get('cliente') or ''
+    descripcion = concepto or vision_response.get('descripcion') or 'Transferencia'
+    if persona and persona.lower() not in descripcion.lower():
+        descripcion = f"{descripcion} - {persona}"
+    revisar = carpeta == reportes.CARPETA_REVISAR or not fecha_leida
+
+    transaccion = {
+        "id": f"transf_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+        "fecha": fecha,
+        "timestamp": datetime.now().isoformat(),
+        "descripcion": descripcion,
+        "concepto": concepto,
+        "persona": persona,
+        "categoria": carpeta,
+        "movimiento": movimiento,
+        "monto": monto,
+        "banco": vision_response.get('banco') or '',
+        "referencia": vision_response.get('referencia') or '',
+        "factura_path": ruta_archivo,
+        "revisar": revisar,
+    }
+    reportes.guardar_en_carpeta(DATA_DIR, telefono, carpeta, transaccion)
+
+    # La misma transacción en la lista que usan los reportes (gastos.json o ingresos.json)
+    if movimiento == 'ingreso':
+        archivo = f"{obtener_ruta_datos(telefono)}/ingresos.json"
+        ingresos = []
+        if os.path.exists(archivo):
+            try:
+                with open(archivo, 'r', encoding='utf-8') as f:
+                    ingresos = json.load(f)
+            except Exception:
+                ingresos = []
+        ingresos.append(transaccion)
+        with open(archivo, 'w', encoding='utf-8') as f:
+            json.dump(ingresos, f, ensure_ascii=False, indent=2)
+    else:
+        gastos = cargar_gastos(telefono)
+        gastos.append(transaccion)
+        guardar_gastos(telefono, gastos)
+
+    flecha = "recibiste de" if movimiento == 'ingreso' else "enviaste a"
+    lineas = [f"🏦 Transferencia: ${monto:,.2f}" + (f" ({flecha} {persona})" if persona else "")]
+    if concepto:
+        lineas.append(f"Concepto: {concepto}")
+    lineas.append(f"Fecha: {datetime.strptime(fecha, '%Y-%m-%d').strftime('%d/%m/%Y')}"
+                  + ("" if fecha_leida else " (no vi la fecha, usé hoy; revísala)"))
+    if carpeta == reportes.CARPETA_REVISAR:
+        lineas.append("")
+        lineas.append("❓ No sé si es sueldo, renta, deuda o servicios, así que la guardé en *Por revisar*.")
+        lineas.append("Respóndeme por ejemplo \"es renta\" o \"es sueldo\" y la muevo.")
+    else:
+        lineas.append(f"{reportes.EMOJI_CARPETA.get(carpeta, '📁')} La guardé en la carpeta *{NOMBRES_CARPETA[carpeta]}*.")
+        if not direccion:
+            lineas.append("(No se ve si la enviaste o la recibiste; la tomé como dinero que enviaste.)")
+        lineas.append("Si no es eso, dime por ejemplo \"es deuda\" y la cambio.")
+    return "\n".join(lineas)
+
+
+def mover_transferencia(telefono, carpeta, server_url):
+    """Respuesta a "es renta" / "ponlo en sueldo": mueve la última transferencia a esa carpeta."""
+    resultado = reportes.mover_transaccion(DATA_DIR, telefono, carpeta)
+    if not resultado:
+        return None
+    t, anterior = resultado
+    phone_clean = normalizar_telefono(telefono)
+    if anterior == carpeta:
+        return f"Esa transferencia (${t.get('monto', 0):,.2f}) ya estaba en *{NOMBRES_CARPETA[carpeta]}* 👍"
+    return (f"Listo ✅ Moví la transferencia de ${t.get('monto', 0):,.2f} ({t.get('descripcion', '')}) "
+            f"de *{NOMBRES_CARPETA.get(anterior, anterior)}* a *{NOMBRES_CARPETA[carpeta]}*.\n\n"
+            f"📁 Tus carpetas: {server_url}/dashboard/{phone_clean}/carpetas")
+
+
+# Palabras que piden un resumen; además el mensaje tiene que traer un período ("del 1 al 20 de junio")
+PALABRAS_RESUMEN = re.compile(r'\b(resumen|informe|reporte|corte|balance|excel|pdf|cuanto (?:gaste|gane|entro|salio|he gastado))\b')
+# "gastos de junio" también, pero solo en mensajes cortos sin montos ("gastos de hoy: comida $20" es registrar)
+PALABRAS_RESUMEN_CORTO = re.compile(r'\b(gaste|gastado|gastos|ingresos|movimientos)\b')
+
+
+def pedido_resumen_periodo(texto):
+    """Periodo pedido en el mensaje o None. "informe de gastos" sin fechas = este mes."""
+    t = reportes.sin_acentos(texto).lower()
+    if 'meta' in t or 'presupuesto' in t:
+        return None
+    corto = len(t.split()) <= 8 and not re.search(r'\$\s*\d|\d+\s*(?:dolares|usd)', t)
+    if not (PALABRAS_RESUMEN.search(t) or (corto and PALABRAS_RESUMEN_CORTO.search(t))):
+        return None
+    periodo = reportes.parsear_periodo(t)
+    if not periodo and re.search(r'\b(informe|resumen|reporte) de (mis )?gastos\b', t):
+        periodo = reportes.parsear_periodo('este mes')
+    return periodo
+
+
+def resumen_periodo_usuario(telefono, inicio, fin):
+    gastos, ingresos = reportes.cargar_movimientos(DATA_DIR, telefono)
+    movs, sin_fecha = reportes.movimientos_periodo(gastos, ingresos, inicio, fin)
+    return reportes.resumir(movs), sin_fecha
+
+
+def responder_resumen_periodo(telefono, periodo, server_url):
+    """Texto de WhatsApp con totales, barras por categoría y links a PDF, Excel y panel del período."""
+    phone_clean = normalizar_telefono(telefono)
+    resumen, sin_fecha = resumen_periodo_usuario(telefono, periodo['inicio'], periodo['fin'])
+    texto = reportes.texto_resumen(resumen, periodo, sin_fecha)
+    if resumen['movimientos']:
+        q = f"desde={periodo['inicio'].isoformat()}&hasta={periodo['fin'].isoformat()}"
+        texto += (f"\n\n📄 PDF con gráfico: {server_url}/download/periodo/{phone_clean}/pdf?{q}"
+                  f"\n📊 Excel: {server_url}/download/periodo/{phone_clean}/excel?{q}"
+                  f"\n🌐 Panel: {server_url}/dashboard/{phone_clean}/periodo?{q}")
+    return texto
+
 
 def reclasificar_gasto(texto, telefono, historial=None):
     """
@@ -2221,6 +2382,8 @@ DASHBOARD_COBRO_HTML = """
             <a href="/download/excel/{{ phone_clean }}" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg text-center">📊 Descargar Excel</a>
             <a href="/download/pdf/{{ phone_clean }}" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg text-center">📄 Descargar PDF</a>
             <a href="/dashboard/{{ phone_clean }}/precios" class="flex-1 md:flex-none bg-amber-500 hover:bg-amber-600 text-white font-bold py-3 px-6 rounded-lg text-center">🛒 Comparar precios</a>
+            <a href="/dashboard/{{ phone_clean }}/periodo" class="flex-1 md:flex-none bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-3 px-6 rounded-lg text-center">📅 Resumen por fechas</a>
+            <a href="/dashboard/{{ phone_clean }}/carpetas" class="flex-1 md:flex-none bg-slate-600 hover:bg-slate-700 text-white font-bold py-3 px-6 rounded-lg text-center">📁 Carpetas</a>
         </div>
 
         <div class="bg-white rounded-lg shadow-lg p-6 mb-8">
@@ -2510,6 +2673,12 @@ def dashboard(phone):
             <a href="/dashboard/{{ phone_clean }}/precios" class="flex-1 md:flex-none bg-amber-500 hover:bg-amber-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
                 🛒 Comparar precios
             </a>
+            <a href="/dashboard/{{ phone_clean }}/periodo" class="flex-1 md:flex-none bg-indigo-500 hover:bg-indigo-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+                📅 Resumen por fechas
+            </a>
+            <a href="/dashboard/{{ phone_clean }}/carpetas" class="flex-1 md:flex-none bg-slate-600 hover:bg-slate-700 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+                📁 Carpetas
+            </a>
             <button onclick="compartir()" class="flex-1 md:flex-none bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105">
                 📤 Compartir
             </button>
@@ -2775,6 +2944,184 @@ Cada factura que mandes a Yoly suma precios. 📸</div>""")
     except Exception as e:
         logger.error(f"Error en dashboard de precios: {e}", exc_info=True)
         return "Error al cargar el comparador de precios", 500
+
+# ==================== RESUMEN POR PERÍODO Y CARPETAS ====================
+
+def periodo_de_request():
+    """?desde=2026-06-01&hasta=2026-06-20; sin fechas = este mes."""
+    try:
+        inicio = datetime.strptime(request.args.get('desde', ''), '%Y-%m-%d').date()
+        fin = datetime.strptime(request.args.get('hasta', ''), '%Y-%m-%d').date()
+        if fin < inicio:
+            inicio, fin = fin, inicio
+        return {"inicio": inicio, "fin": fin, "etiqueta": reportes.etiqueta_periodo(inicio, fin)}
+    except ValueError:
+        return reportes.parsear_periodo('este mes')
+
+
+@app.route("/dashboard/<phone>/periodo", methods=["GET"])
+def dashboard_periodo(phone):
+    """Ingresos, gastos, gráfico por categoría, semanas y movimientos entre dos fechas."""
+    try:
+        phone_clean = normalizar_telefono(phone)
+        periodo = periodo_de_request()
+        resumen, sin_fecha = resumen_periodo_usuario(phone_clean, periodo['inicio'], periodo['fin'])
+        q = f"desde={periodo['inicio'].isoformat()}&hasta={periodo['fin'].isoformat()}"
+        base = f"/dashboard/{quote_plus(phone_clean)}"
+
+        partes = [f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Resumen {_e(periodo['etiqueta'])}</title>
+<style>{DASHBOARD_PRECIOS_CSS}
+.pos {{ color: #059669; }} .neg {{ color: #dc2626; }}
+input[type=date] {{ padding: 6px; border-radius: 6px; border: 1px solid #d1d5db; }}
+button {{ padding: 7px 14px; border-radius: 6px; border: 0; background: #1e40af; color: white; font-weight: bold; }}
+.acciones a {{ margin: 4px 6px 4px 0; }}
+.btn.verde {{ background: #16a34a; }} .btn.rojo {{ background: #dc2626; }}
+</style></head><body><div class="container">
+<p><a class="volver" href="{base}">← Volver al panel</a> · <a class="volver" href="{base}/carpetas">📁 Carpetas</a></p>
+<h1>📅 Resumen del {_e(periodo['etiqueta'])}</h1>
+<form method="get">Desde <input type="date" name="desde" value="{periodo['inicio'].isoformat()}">
+ hasta <input type="date" name="hasta" value="{periodo['fin'].isoformat()}"> <button type="submit">Ver</button></form>
+<div class="stats">
+<div class="stat-card"><h3>Ingresos</h3><div class="value">{reportes.dinero(resumen['total_ingresos'])}</div></div>
+<div class="stat-card"><h3>Gastos</h3><div class="value">{reportes.dinero(resumen['total_gastos'])}</div></div>
+<div class="stat-card"><h3>Balance</h3><div class="value">{reportes.dinero(resumen['balance'])}</div></div>
+</div>
+<div class="acciones"><a class="btn verde" href="/download/periodo/{quote_plus(phone_clean)}/excel?{q}">📊 Excel del período</a>
+<a class="btn rojo" href="/download/periodo/{quote_plus(phone_clean)}/pdf?{q}">📄 PDF del período</a></div>"""]
+
+        if not resumen['movimientos']:
+            partes.append('<p class="vacio">No hay gastos ni ingresos guardados en estas fechas.</p>')
+        else:
+            cats = resumen['gastos_por_categoria']
+            if cats:
+                partes.append("<h2>Gastos por categoría</h2>")
+                maximo = cats[0][1]
+                for cat, monto in cats:
+                    ancho = max(4, int(100 * monto / maximo)) if maximo else 4
+                    pct = 100 * monto / resumen['total_gastos'] if resumen['total_gastos'] else 0
+                    partes.append(f'<div class="barra"><span class="nombre">{_e(cat.replace("_", " "))}</span>'
+                                  f'<div class="fondo"><div class="relleno" style="width:{ancho}%">'
+                                  f'{reportes.dinero(monto)} ({pct:.0f}%)</div></div></div>')
+            partes.append('<h2>Por semana (lunes a domingo)</h2><div class="tabla"><table>'
+                          '<tr><th>Semana</th><th>Ingresos</th><th>Gastos</th><th>Balance</th></tr>')
+            for sem in resumen['semanas']:
+                clase = 'pos' if sem['balance'] >= 0 else 'neg'
+                partes.append(f"<tr><td>{sem['lunes'].strftime('%d/%m')} – {sem['domingo'].strftime('%d/%m/%Y')}</td>"
+                              f"<td>{reportes.dinero(sem['ingresos'])}</td><td>{reportes.dinero(sem['gastos'])}</td>"
+                              f"<td class='{clase}'>{reportes.dinero(sem['balance'])}</td></tr>")
+            partes.append("</table></div>")
+            partes.append(f"<h2>Movimientos ({len(resumen['movimientos'])})</h2><div class='tabla'><table>"
+                          "<tr><th>Fecha</th><th>Tipo</th><th>Categoría</th><th>Descripción</th><th>Monto</th></tr>")
+            for m in resumen['movimientos']:
+                clase = 'pos' if m['tipo'] == 'ingreso' else 'neg'
+                revisar = " ❓" if m.get('revisar') or m['categoria'] == reportes.CARPETA_REVISAR else ""
+                partes.append(f"<tr><td>{m['fecha'].strftime('%d/%m/%Y')}</td><td>{_e(m['tipo'])}</td>"
+                              f"<td>{_e(m['categoria'].replace('_', ' '))}{revisar}</td><td>{_e(m['descripcion'])}</td>"
+                              f"<td class='{clase}'>{reportes.dinero(m['monto'])}</td></tr>")
+            partes.append("</table></div>")
+        if sin_fecha:
+            partes.append(f"<p class='chico'>⚠️ {sin_fecha} registros sin fecha no entran en ningún período.</p>")
+        partes.append("</div></body></html>")
+        return "".join(partes)
+    except Exception as e:
+        logger.error(f"Error en dashboard de período: {e}", exc_info=True)
+        return "Error al cargar el resumen", 500
+
+
+@app.route("/download/periodo/<phone>/excel", methods=["GET"])
+def descargar_excel_periodo(phone):
+    if not HAS_OPENPYXL:
+        return "Excel no disponible (falta openpyxl)", 501
+    try:
+        phone_clean = normalizar_telefono(phone)
+        periodo = periodo_de_request()
+        resumen, _ = resumen_periodo_usuario(phone_clean, periodo['inicio'], periodo['fin'])
+        ruta = f"/tmp/periodo_{phone_clean}_{periodo['inicio']:%Y%m%d}_{periodo['fin']:%Y%m%d}_{threading.get_ident()}.xlsx"
+        reportes.generar_excel(resumen, periodo, ruta)
+        with open(ruta, 'rb') as f:
+            datos = f.read()
+        os.remove(ruta)
+        nombre = f"resumen_{periodo['inicio']:%Y%m%d}_al_{periodo['fin']:%Y%m%d}.xlsx"
+        return Response(datos, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        headers={"Content-Disposition": f"attachment; filename={nombre}"})
+    except Exception as e:
+        logger.error(f"Error en Excel del período: {e}", exc_info=True)
+        return "Error al generar el Excel", 500
+
+
+@app.route("/download/periodo/<phone>/pdf", methods=["GET"])
+def descargar_pdf_periodo(phone):
+    try:
+        phone_clean = normalizar_telefono(phone)
+        periodo = periodo_de_request()
+        resumen, _ = resumen_periodo_usuario(phone_clean, periodo['inicio'], periodo['fin'])
+        ruta = f"/tmp/periodo_{phone_clean}_{periodo['inicio']:%Y%m%d}_{periodo['fin']:%Y%m%d}_{threading.get_ident()}.pdf"
+        reportes.generar_pdf(resumen, periodo, ruta)
+        with open(ruta, 'rb') as f:
+            datos = f.read()
+        os.remove(ruta)
+        nombre = f"resumen_{periodo['inicio']:%Y%m%d}_al_{periodo['fin']:%Y%m%d}.pdf"
+        return Response(datos, mimetype="application/pdf",
+                        headers={"Content-Disposition": f"inline; filename={nombre}"})
+    except Exception as e:
+        logger.error(f"Error en PDF del período: {e}", exc_info=True)
+        return "Error al generar el PDF", 500
+
+
+@app.route("/dashboard/<phone>/carpetas", methods=["GET"])
+def dashboard_carpetas(phone):
+    """Carpetas por tipo (sueldo, renta, deuda, servicios, ingreso, compras, por revisar) con sus transacciones."""
+    try:
+        phone_clean = normalizar_telefono(phone)
+        carpetas = reportes.cargar_carpetas(DATA_DIR, phone_clean)
+        elegida = request.args.get('carpeta')
+        base = f"/dashboard/{quote_plus(phone_clean)}"
+        partes = [f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0"><title>Mis carpetas</title>
+<style>{DASHBOARD_PRECIOS_CSS}
+.carpetas {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin: 20px 0; }}
+.carpeta {{ display: block; text-decoration: none; color: #1f2937; background: #f9fafb; border: 2px solid #e5e7eb; border-radius: 10px; padding: 14px; }}
+.carpeta.activa {{ border-color: #1e40af; background: #eef2ff; }}
+.carpeta .icono {{ font-size: 28px; }} .carpeta .total {{ font-weight: bold; font-size: 18px; }}
+</style></head><body><div class="container">
+<p><a class="volver" href="{base}">← Volver al panel</a> · <a class="volver" href="{base}/periodo">📅 Resumen por fechas</a></p>
+<h1>📁 Mis carpetas</h1>
+<p class="sub">Las transferencias se guardan solas según su concepto. Si una cae en "Por revisar", escríbele a Yoly "es renta", "es sueldo"...</p>"""]
+        if not carpetas:
+            partes.append('<p class="vacio">Todavía no hay transferencias ni compras guardadas. Manda la foto de una transferencia por WhatsApp.</p>')
+        else:
+            partes.append('<div class="carpetas">')
+            for nombre in reportes.TODAS_CARPETAS:
+                if nombre not in carpetas:
+                    continue
+                lista = carpetas[nombre]
+                total = sum(reportes._a_numero(t.get('monto')) for t in lista)
+                activa = " activa" if nombre == elegida else ""
+                partes.append(f'<a class="carpeta{activa}" href="?carpeta={nombre}"><div class="icono">{reportes.EMOJI_CARPETA.get(nombre, "📁")}</div>'
+                              f'<div>{_e(NOMBRES_CARPETA.get(nombre, nombre))}</div><div class="total">{reportes.dinero(total)}</div>'
+                              f'<div class="chico">{len(lista)} movimiento{"s" if len(lista) != 1 else ""}</div></a>')
+            partes.append('</div>')
+            mostrar = [elegida] if elegida in carpetas else [c for c in reportes.TODAS_CARPETAS if c in carpetas]
+            for nombre in mostrar:
+                partes.append(f"<h2>{reportes.EMOJI_CARPETA.get(nombre, '📁')} {_e(NOMBRES_CARPETA.get(nombre, nombre))}</h2>"
+                              "<div class='tabla'><table><tr><th>Fecha</th><th>Descripción</th><th>Tipo</th><th>Monto</th></tr>")
+                for t in reversed(carpetas[nombre]):
+                    fecha = t.get('fecha') or ''
+                    try:
+                        fecha = datetime.strptime(fecha, '%Y-%m-%d').strftime('%d/%m/%Y')
+                    except ValueError:
+                        pass
+                    marca = " ❓" if t.get('revisar') else ""
+                    partes.append(f"<tr><td>{_e(fecha)}{marca}</td><td>{_e(t.get('descripcion', ''))}</td>"
+                                  f"<td>{_e(t.get('movimiento', 'gasto'))}</td><td class='price'>{reportes.dinero(reportes._a_numero(t.get('monto')))}</td></tr>")
+                partes.append("</table></div>")
+        partes.append("</div></body></html>")
+        return "".join(partes)
+    except Exception as e:
+        logger.error(f"Error en dashboard de carpetas: {e}", exc_info=True)
+        return "Error al cargar las carpetas", 500
+
 
 @app.route("/api/gastos/<phone>", methods=["GET"])
 def api_gastos(phone):
@@ -3052,11 +3399,13 @@ def atender_con_imagen(media_url, incoming_msg, from_number, server_url):
 
             # Si no es precio, usar el flujo normal de gastos
             # Procesar la imagen con visión
-            resultado = procesar_foto_inteligente(media_url, from_number)
+            info_foto = {}
+            resultado = procesar_foto_inteligente(media_url, from_number, incoming_msg or "", info_foto)
             salida.message(resultado)
 
             # Si hay texto adicional, validar antes de reclasificar
-            if incoming_msg and incoming_msg.lower().strip():
+            # (en transferencias el texto ya se usó para elegir la carpeta)
+            if incoming_msg and incoming_msg.lower().strip() and info_foto.get('tipo') != 'transferencia':
                 msg_lower = incoming_msg.lower()
 
                 # VALIDACIÓN: Detectar si es una queja/comentario o un envio_ecuador
@@ -3417,6 +3766,24 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     phone_clean = normalizar_telefono(from_number)
 
     try:
+        # ==================== RESUMEN POR PERÍODO ====================
+        # "resumen del 1 al 20 de junio", "gastos de junio", "balance de septiembre", "informe de gastos"
+        # Va antes del balance para que "balance de septiembre" no se quede en la deuda.
+        periodo = pedido_resumen_periodo(incoming_msg)
+        if periodo:
+            logger.info(f"Period report {periodo['inicio']}..{periodo['fin']} for {from_number}")
+            responder(resp, responder_resumen_periodo(from_number, periodo, server_url))
+            return
+
+        # ==================== MOVER TRANSFERENCIA DE CARPETA ====================
+        # "es renta", "ponlo en sueldo", "era deuda" después de mandar una transferencia
+        carpeta_pedida = reportes.pedido_mover(incoming_msg)
+        if carpeta_pedida:
+            texto_mover = mover_transferencia(from_number, carpeta_pedida, server_url)
+            if texto_mover:
+                resp.message(texto_mover)
+                return
+
         # ==================== INTENT DETECTION: BALANCE / DEUDA ====================
         # Palabras clave para detectar consulta de balance
         palabras_balance = ['balance', 'alan', 'debo', 'cuanto debo', 'cuanto falta', 'deuda', 'adeudo', 'que debo']
