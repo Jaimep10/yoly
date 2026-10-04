@@ -8,3 +8,4 @@ groq
 reportlab
 python-dateutil
 gunicorn
+matplotlib
