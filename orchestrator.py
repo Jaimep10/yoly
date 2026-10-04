@@ -6,6 +6,7 @@
 # No toca Flask ni Twilio: main.py descarga las fotos y le da al jefe las "herramientas" para guardar
 # (gastos, carpetas, precios, memoria) por medio de un Contexto.
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
@@ -23,6 +24,34 @@ ERROR_LECTURA = "❌ No pude procesar la factura. Asegúrate que sea una imagen 
 ERROR_MONTO = "❌ No pude leer los números de la factura. Por favor, envía una imagen más clara o escribe el monto manualmente."
 ERROR_TRANSFERENCIA = "❌ No pude leer el monto de la transferencia. Envía una captura más clara o escribe el monto."
 YA_PROCESADA = "👍 Esa foto ya la había procesado, no la guardé otra vez."
+
+# Ninguna foto puede trabar al resto: si Claude no contesta a tiempo, esa foto se salta.
+TIMEOUT_FOTO = 30       # segundos para que el Ojo lea una foto
+TIMEOUT_PORTERO = 20    # segundos para que el Portero diga qué son
+
+
+class Demora(Exception):
+    pass
+
+
+def con_limite(segundos, funcion, *args):
+    """Corre funcion(*args) y espera máximo `segundos`. Si tarda más, lanza Demora (el hilo queda solo)."""
+    resultado = {}
+
+    def correr():
+        try:
+            resultado["valor"] = funcion(*args)
+        except Exception as e:
+            resultado["error"] = e
+
+    hilo = threading.Thread(target=correr, daemon=True)
+    hilo.start()
+    hilo.join(segundos)
+    if hilo.is_alive():
+        raise Demora(f"tardó más de {segundos}s")
+    if "error" in resultado:
+        raise resultado["error"]
+    return resultado.get("valor")
 
 
 @dataclass
@@ -88,7 +117,14 @@ class OrquestadorYoly:
         info = info if info is not None else {}
 
         # 1. Portero: tipo de cada foto y fotos repetidas
-        clasificacion = self.portero.clasificar(imagenes, texto_usuario, ctx.cliente, ctx.modelo, ctx.huellas_vistas())
+        vistas = ctx.huellas_vistas()
+        try:
+            clasificacion = con_limite(TIMEOUT_PORTERO, self.portero.clasificar,
+                                       imagenes, texto_usuario, ctx.cliente, ctx.modelo, vistas)
+        except Exception as e:
+            # Sin Portero igual se sigue: el Ojo decide el tipo de cada foto
+            logger.warning(f"Portero no contestó ({e}); sigo sin su clasificación")
+            clasificacion = self.portero.clasificar(imagenes, texto_usuario, None, ctx.modelo, vistas)
         info['clasificacion'] = clasificacion
         logger.info(f"Portero: {clasificacion['tipo']} ({clasificacion['cantidad']} foto(s), confianza {clasificacion['confianza']})")
         if clasificacion['tipo'] == agent_classifier.DUPLICADO:
@@ -98,15 +134,23 @@ class OrquestadorYoly:
         # 2. Ojo: una lectura por foto nueva
         leidas = []   # (vision, ruta_foto, camino, huella)
         respuestas = []
+        varias = len(imagenes) > 1
         for img_info in clasificacion['imagenes']:
             if img_info['duplicada']:
                 respuestas.append(f"(La foto {img_info['indice'] + 1} es repetida, la salté.)")
                 continue
             imagen = imagenes[img_info['indice']]
             ruta = ctx.guardar_imagen(imagen)
-            vision = self.ojo.extraer(imagen, img_info['tipo'], ctx.cliente, ctx.modelo)
+            numero = img_info['indice'] + 1
+            try:
+                vision = con_limite(TIMEOUT_FOTO, self.ojo.extraer, imagen, img_info['tipo'], ctx.cliente, ctx.modelo)
+            except Exception as e:
+                logger.warning(f"Ojo: foto {numero} de {len(imagenes)} falló: {e}")
+                vision = None
+            logger.info(f"Ojo: foto {numero} de {len(imagenes)} {'leída' if vision else 'sin leer'}")
             if not vision:
-                respuestas.append(ERROR_LECTURA)
+                respuestas.append(f"❌ No pude leer la foto {numero}. Mándala otra vez más clara."
+                                  if varias else ERROR_LECTURA)
                 continue
             info.setdefault('tipo', vision.get('tipo'))
             leidas.append((vision, ruta, ruta_documento(vision, img_info['tipo']), img_info['huella']))

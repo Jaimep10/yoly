@@ -174,14 +174,93 @@ def test_dos_fotos_de_libretita_hacen_un_solo_registro(entorno):
 
 
 def test_webhook_manda_todas_las_fotos(entorno, monkeypatch):
-    recibidas = []
+    recibidas, enviados = [], []
     monkeypatch.setattr(main, "procesar_fotos_whatsapp",
                         lambda urls, tel, texto="", info=None: recibidas.append(urls) or "ok")
+    monkeypatch.setattr(main, "enviar_por_twilio", lambda to, textos: enviados.append(textos))
+    monkeypatch.setattr(main.lotes_fotos, "espera", 0.3)
     data = {"From": TEL, "Body": "", "NumMedia": "2", "MediaUrl0": "https://m/1", "MediaContentType0": "image/jpeg",
             "MediaUrl1": "https://m/2", "MediaContentType1": "image/jpeg"}
     with main.app.test_client() as c:
         r = c.post("/whatsapp", data=data)
-    assert r.status_code == 200 and recibidas == [["https://m/1", "https://m/2"]]
+    assert r.status_code == 200 and main.MENSAJE_FOTOS in r.get_data(as_text=True)
+    assert esperar(lambda: enviados)
+    assert recibidas == [["https://m/1", "https://m/2"]] and enviados == [["ok"]]
+
+
+def esperar(condicion, segundos=5):
+    import time
+    fin = time.monotonic() + segundos
+    while time.monotonic() < fin:
+        if condicion():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_grupo_de_fotos_en_webhooks_separados_es_un_solo_lote(entorno, monkeypatch):
+    """Twilio manda cada foto de un grupo en su propio webhook: se juntan y se procesan una sola vez."""
+    recibidas, enviados = [], []
+    monkeypatch.setattr(main, "procesar_fotos_whatsapp",
+                        lambda urls, tel, texto="", info=None: recibidas.append(list(urls)) or "listo")
+    monkeypatch.setattr(main, "enviar_por_twilio", lambda to, textos: enviados.append(textos))
+    monkeypatch.setattr(main.lotes_fotos, "espera", 0.4)
+    respuestas = []
+    with main.app.test_client() as c:
+        for i in range(7):
+            data = {"From": TEL, "Body": "", "NumMedia": "1", "MediaUrl0": f"https://m/{i}",
+                    "MediaContentType0": "image/jpeg"}
+            respuestas.append(c.post("/whatsapp", data=data).get_data(as_text=True))
+    # Solo el primer webhook dice "recibido"; los demás contestan vacío al instante
+    assert main.MENSAJE_FOTOS in respuestas[0] and all(main.MENSAJE_FOTOS not in r for r in respuestas[1:])
+    assert esperar(lambda: enviados)
+    assert recibidas == [[f"https://m/{i}" for i in range(5)]]
+    assert "leo máximo 5" in enviados[0][0] and "otras 2" in enviados[0][0] and enviados[0][1] == "listo"
+
+
+def test_una_foto_que_no_contesta_no_traba_las_demas(monkeypatch):
+    import time
+    import orchestrator
+    monkeypatch.setattr(orchestrator, "TIMEOUT_FOTO", 0.3)
+    claude = MagicMock()
+    gastos = []
+
+    def crear(**kwargs):
+        texto = kwargs["messages"][0]["content"][-1]["text"]
+        if "portero" in texto:
+            return respuesta_claude({"tipos": ["facturas"] * 3})
+        datos = kwargs["messages"][0]["content"][0]["source"]["data"]
+        if datos == main.base64.standard_b64encode(b"lenta").decode():
+            time.sleep(2)   # Vision colgado con esta foto
+        return respuesta_claude({"cliente": "Tienda", "pagos": [{"fecha": "2026-01-03", "monto": 10}]})
+
+    claude.messages.create.side_effect = crear
+    ctx = main.Contexto(
+        cliente=claude, modelo="m", phone_clean=PHONE, guardar_imagen=lambda img: "/tmp/foto.webp",
+        guardar_cobro=None, cobro_actual=lambda: None,
+        guardar_gasto=lambda v, p, t, r: gastos.append(t) or f"Leí ${t}", guardar_transferencia=None,
+        huellas_vistas=lambda: [], marcar_vistas=lambda h: None, marcar_pregunta_tabla=lambda: None)
+    inicio = time.monotonic()
+    texto = orchestrator.OrquestadorYoly().handle_whatsapp(PHONE, [b"a", b"lenta", b"c"], "", ctx=ctx)
+    assert time.monotonic() - inicio < 1.5
+    assert gastos == [10, 10] and "No pude leer la foto 2" in texto
+
+
+def test_falla_una_descarga_sigue_con_las_otras(entorno, monkeypatch):
+    monkeypatch.setattr(main, "descargar_media_twilio", lambda url: None if url.endswith("/2") else b"x" + url.encode())
+    entorno.messages.create.side_effect = [
+        respuesta_claude({"tipos": ["facturas"]}),
+        respuesta_claude({"cliente": "Tienda", "pagos": [{"fecha": "2026-01-03", "monto": 25}]}),
+    ]
+    texto = main.procesar_fotos_whatsapp(["https://m/1", "https://m/2"], TEL)
+    assert "No pude descargar la foto 2" in texto and "Leí Tienda: $25" in texto
+
+
+def test_numero_twilio_con_prefijo_whatsapp(monkeypatch):
+    monkeypatch.setenv("TWILIO_WHATSAPP_NUMBER", "+15163869020")
+    assert main.numero_whatsapp_twilio() == "whatsapp:+15163869020"
+    monkeypatch.setenv("TWILIO_WHATSAPP_NUMBER", "whatsapp:+15163869020")
+    assert main.numero_whatsapp_twilio() == "whatsapp:+15163869020"
 
 
 def test_descargas_pdf_y_excel_del_cobro(entorno):

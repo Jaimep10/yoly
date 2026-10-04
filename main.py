@@ -32,6 +32,7 @@ import precios
 import reportes
 from agents import reporter as agent_reporter
 from orchestrator import Contexto, OrquestadorYoly  # el jefe de los 4 agentes
+from lote_fotos import LoteFotos, MAX_FOTOS
 import io
 try:
     import pandas as pd
@@ -50,6 +51,29 @@ app = Flask(__name__)
 # Logging configuration
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# También a archivo (/app/logs/yoly.log) para ver dónde se traba un mensaje
+LOG_DIR = os.environ.get('YOLY_LOG_DIR', '/app/logs')
+try:
+    from logging.handlers import RotatingFileHandler
+    os.makedirs(LOG_DIR, exist_ok=True)
+    _archivo_log = RotatingFileHandler(f'{LOG_DIR}/yoly.log', maxBytes=2_000_000, backupCount=3, encoding='utf-8')
+    _archivo_log.setLevel(logging.INFO)
+    _archivo_log.setFormatter(logging.Formatter('%(asctime)s - %(threadName)s - %(levelname)s - %(message)s'))
+    logging.getLogger().addHandler(_archivo_log)
+except Exception as e:
+    print(f"[WARNING] No se pudo abrir el log en {LOG_DIR}: {e}")
+
+# Varias fotos llegan a la vez (cada una en su hilo): las escrituras de JSON no deben pisarse
+candado_archivos = threading.RLock()
+
+def escribir_json(archivo, datos, **opciones):
+    """Escribe a un archivo temporal y lo cambia de golpe: nunca queda un JSON a medio escribir."""
+    temporal = f"{archivo}.{os.getpid()}-{threading.get_ident()}.tmp"
+    with candado_archivos:
+        with open(temporal, 'w', encoding='utf-8') as f:
+            json.dump(datos, f, **opciones)
+        os.replace(temporal, archivo)
 
 # ==================== ENVIRONMENT VALIDATION ====================
 
@@ -209,8 +233,8 @@ def guardar_memoria(memoria):
     memoria_archivo = '/app/data/memoria_global.json'
     try:
         os.makedirs(os.path.dirname(memoria_archivo), exist_ok=True)
-        with open(memoria_archivo, 'w', encoding='utf-8') as f:
-            json.dump(memoria, f, ensure_ascii=False, indent=2)
+        with candado_archivos:
+            escribir_json(memoria_archivo, memoria, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"Error guardando memoria: {e}")
 
@@ -268,8 +292,7 @@ def guardar_gastos(telefono, gastos):
     ruta = obtener_ruta_datos(telefono)
     archivo = f'{ruta}/gastos.json'
     try:
-        with open(archivo, 'w', encoding='utf-8') as f:
-            json.dump(gastos, f, ensure_ascii=False, indent=2)
+        escribir_json(archivo, gastos, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
         print(f"Error guardando gastos: {e}")
@@ -289,8 +312,7 @@ def guardar_cobro(phone_clean, datos):
     try:
         ruta = f'{DATA_DIR}/{phone_clean}'
         os.makedirs(ruta, exist_ok=True)
-        with open(f'{ruta}/cobro_deuda.json', 'w', encoding='utf-8') as f:
-            json.dump(datos, f, ensure_ascii=False, indent=2)
+        escribir_json(f'{ruta}/cobro_deuda.json', datos, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.warning(f"Error guardando cobro_deuda.json: {e}")
 
@@ -546,11 +568,11 @@ def huellas_vistas(telefono):
     return []
 
 def marcar_vistas(telefono, huellas):
-    vistas = huellas_vistas(telefono)
-    vistas.extend(h for h in huellas if h not in vistas)
     try:
-        with open(f"{obtener_ruta_datos(telefono)}/imagenes_vistas.json", 'w', encoding='utf-8') as f:
-            json.dump(vistas[-500:], f)
+        with candado_archivos:
+            vistas = huellas_vistas(telefono)
+            vistas.extend(h for h in huellas if h not in vistas)
+            escribir_json(f"{obtener_ruta_datos(telefono)}/imagenes_vistas.json", vistas[-500:])
     except Exception as e:
         logger.warning(f"No pude guardar las huellas de fotos: {e}")
 
@@ -585,9 +607,10 @@ def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo
         "cliente": cliente,
         "factura_path": ruta_archivo
     }
-    gastos = cargar_gastos(telefono)
-    gastos.append(gasto_nuevo)
-    guardar_gastos(telefono, gastos)
+    with candado_archivos:
+        gastos = cargar_gastos(telefono)
+        gastos.append(gasto_nuevo)
+        guardar_gastos(telefono, gastos)
 
     respuesta = f"Leí {cliente}: ${pagado:,.0f}."
     if es_compra:
@@ -638,16 +661,25 @@ def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None):
     Portero (tipo y repetidas) -> Ojo (Vision) -> Calculadora (sumas en Python) -> Contadora (respuesta).
     """
     try:
-        imagenes = []
-        for media_url in media_urls:
+        imagenes, fallidas = [], []
+        for numero, media_url in enumerate(media_urls, 1):
             imagen_bytes = descargar_media_twilio(media_url)
-            if not imagen_bytes:
-                return "❌ No pude descargar la imagen. Intenta de nuevo."
-            webp_bytes = convertir_a_webp(imagen_bytes)
-            if not webp_bytes:
-                return "❌ No pude procesar la imagen. Intenta con otra."
-            imagenes.append(webp_bytes)
-        return orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info)
+            webp_bytes = convertir_a_webp(imagen_bytes) if imagen_bytes else None
+            if webp_bytes:
+                imagenes.append(webp_bytes)
+            else:
+                logger.warning(f"Foto {numero} de {len(media_urls)} no se pudo bajar/convertir: {media_url}")
+                fallidas.append(numero)
+        logger.info(f"Fotos bajadas: {len(imagenes)} de {len(media_urls)} para {telefono}")
+        if not imagenes:
+            if len(media_urls) > 1:
+                return "❌ No pude descargar las fotos. Intenta de nuevo."
+            return "❌ No pude descargar la imagen. Intenta de nuevo."
+        texto = orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info)
+        if fallidas:
+            nums = ", ".join(str(n) for n in fallidas)
+            texto = f"❌ No pude descargar la foto {nums}. Mándala otra vez.\n\n" + texto
+        return texto
     except Exception as e:
         logger.error(f"Error en procesar_fotos_whatsapp: {e}", exc_info=True)
         return f"❌ Error procesando factura: {str(e)}"
@@ -3060,12 +3092,23 @@ def whatsapp():
     return atender(incoming_msg, from_number, server_url)
 
 
+def numero_whatsapp_twilio():
+    """El número de Yoly con el prefijo whatsapp: (Twilio rechaza el envío sin él)."""
+    numero = (os.environ.get('TWILIO_WHATSAPP_NUMBER') or '').strip()
+    if numero and not numero.startswith('whatsapp:'):
+        numero = f"whatsapp:{numero}"
+    return numero
+
+
 def enviar_por_twilio(to, textos):
     """Manda la respuesta por la API de Twilio (para cuando el webhook ya contestó)."""
+    if twilio_client is None:
+        logger.error(f"No hay cliente de Twilio: no se pudo enviar la respuesta a {to}")
+        return
     for texto in textos:
         for parte in partir_mensaje(texto):
             try:
-                twilio_client.messages.create(from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'), to=to, body=parte)
+                twilio_client.messages.create(from_=numero_whatsapp_twilio(), to=to, body=parte)
             except Exception as e:
                 logger.error(f"No se pudo enviar la respuesta a {to}: {e}", exc_info=True)
                 return
@@ -3108,109 +3151,116 @@ def atender(incoming_msg, from_number, server_url):
     return str(resp)
 
 
+MENSAJE_FOTOS = "📸 Recibido. Estoy leyendo tus fotos, en un momento te respondo."
+
+
 def atender_con_imagen(media_urls, incoming_msg, from_number, server_url):
-    """Procesa una o varias imágenes (factura/recibo/libretita) con los 4 agentes"""
+    """
+    Cada foto llega en su propio webhook (Twilio no junta los grupos). Aquí solo se anota en el lote
+    del usuario y se contesta al instante; el lote se procesa entero en otro hilo (procesar_lote_fotos)
+    y la respuesta sale por la API de Twilio.
+    """
     if isinstance(media_urls, str):
         media_urls = [media_urls]
-    media_url = media_urls[0]
-    salida = Salida()
-    estado = {"listo": False, "tarde": False}
-    candado = threading.Lock()
-
-    def trabajar():
-        try:
-            global temp_productos
-            msg_lower = incoming_msg.lower() if incoming_msg else ""
-
-            # Detectar si es una imagen de precios/comparación
-            es_precio = any(keyword in msg_lower for keyword in ['precio', 'compara', 'donde es mas barato', 'dónde es más barato', 'ticket', 'mercado'])
-
-            if es_precio:
-                # Extraer productos con Vision
-                productos_dict, error = extraer_productos_vision(media_url, from_number)
-
-                if error:
-                    salida.message(error)
-                    return
-
-                if not productos_dict or not productos_dict.get('productos'):
-                    salida.message("No pude leer los precios de la imagen. Asegúrate que sea un ticket o factura clara con precios visibles.")
-                    return
-
-                # Almacenar temporalmente para confirmación
-                temp_productos[from_number] = productos_dict
-
-                # Mostrar resumen
-                tienda = productos_dict.get('tienda', 'desconocida')
-                msg = f"🧾 Encontré en tu ticket de *{tienda}*:\n\n"
-
-                for p in productos_dict['productos'][:5]:  # Mostrar máximo 5
-                    producto = p.get('producto', '')
-                    precio = p.get('precio', 0)
-                    msg += f"  • {producto}: ${precio:.2f}\n"
-
-                if len(productos_dict['productos']) > 5:
-                    msg += f"  ... y {len(productos_dict['productos']) - 5} más\n"
-
-                msg += f"\n¿Lo guardo para comparar precios? Responde *SI* o *NO*"
-                salida.message(msg)
-                return
-
-            # Si no es precio, usar el flujo normal de gastos
-            # Procesar la imagen con visión
-            info_foto = {}
-            resultado = procesar_fotos_whatsapp(media_urls, from_number, incoming_msg or "", info_foto)
-            salida.message(resultado)
-
-            # Si hay texto adicional, validar antes de reclasificar. Solo si la foto se guardó como
-            # UN gasto: en transferencias el texto ya eligió la carpeta, y una libretita no es un gasto.
-            solo_un_gasto = info_foto.get('caminos') == ['facturas']
-            if incoming_msg and incoming_msg.lower().strip() and solo_un_gasto:
-                msg_lower = incoming_msg.lower()
-
-                # VALIDACIÓN: Detectar si es una queja/comentario o un envio_ecuador
-                # Palabras que indican queja/problema, NO reclasificar
-                falso_positivo_keywords = ["link", "cuentas", "longizo", "equivoca", "error", "mal", "no", "problem", "falla", "bug", "ayuda"]
-                es_queja = any(k in msg_lower for k in falso_positivo_keywords)
-
-                # Palabras que realmente indican envio_ecuador
-                envio_ecuador_keywords = ["ecuador", "envio", "giro", "remesa"]
-                es_envio_ecuador = any(k in msg_lower for k in envio_ecuador_keywords)
-
-                # Solo reclasificar si NO es una queja/comentario
-                if not es_queja:
-                    # Esperar un momento para que se guarde el gasto
-                    import time
-                    time.sleep(0.5)
-                    resultado_reclasificacion = reclasificar_gasto(incoming_msg, from_number)
-                    salida.message(resultado_reclasificacion)
-                else:
-                    # Es una queja o comentario, ignorar reclasificación automática
-                    logger.info(f"Detected complaint/comment from {from_number}, skipping reclassification: {msg_lower}")
-        except Exception as e:
-            logger.error(f"Error procesando imagen de {from_number}: {e}", exc_info=True)
-            salida.message("Disculpa, hubo un error procesando tu factura. Intenta de nuevo.")
-        with candado:
-            estado["listo"] = True
-            enviar_despues = estado["tarde"]
-        if enviar_despues:
-            logger.info(f"Respuesta tardía enviada por Twilio a {from_number}")
-            enviar_por_twilio(from_number, salida.textos)
-
-    hilo = threading.Thread(target=trabajar, daemon=True)
-    hilo.start()
-    hilo.join(ESPERA_MAX_SEGUNDOS)
-
+    nuevo = lotes_fotos.agregar(from_number, media_urls, incoming_msg or "")
     resp = MessagingResponse()
-    with candado:
-        if estado["listo"]:
-            for texto in salida.textos:
-                resp.message(texto)
-            return str(resp)
-        estado["tarde"] = True
-    logger.info(f"Respuesta a {from_number} tarda más de {ESPERA_MAX_SEGUNDOS}s: se enviará por Twilio")
-    resp.message(MENSAJE_ESPERA)
+    if nuevo:
+        resp.message(MENSAJE_FOTOS)
     return str(resp)
+
+
+def procesar_lote_fotos(lote):
+    """Procesa un lote cerrado de fotos (máx MAX_FOTOS) y manda la respuesta por Twilio."""
+    from_number, urls = lote["telefono"], lote["urls"]
+    texto = " ".join(lote["textos"])
+    salida = Salida()
+    total = len(urls) + lote["sobrantes"]
+    if lote["sobrantes"]:
+        salida.message(f"⚠️ Me mandaste {total} fotos y leo máximo {MAX_FOTOS} por vez. Leí las primeras "
+                       f"{MAX_FOTOS}; mándame las otras {lote['sobrantes']} en otro mensaje.")
+    try:
+        procesar_imagenes(urls, texto, from_number, salida)
+    except Exception as e:
+        logger.error(f"[LOTE {lote['id']}] Error procesando imagen de {from_number}: {e}", exc_info=True)
+        salida.message("Disculpa, hubo un error procesando tu factura. Intenta de nuevo.")
+    logger.info(f"[LOTE {lote['id']}] listo, enviando {len(salida.textos)} mensaje(s) a {from_number}")
+    enviar_por_twilio(from_number, salida.textos)
+
+
+lotes_fotos = LoteFotos(procesar_lote_fotos)
+
+
+def procesar_imagenes(media_urls, incoming_msg, from_number, salida):
+    """Una o varias imágenes (factura/recibo/libretita/transferencia) con los 4 agentes"""
+    global temp_productos
+    media_url = media_urls[0]
+    msg_lower = incoming_msg.lower() if incoming_msg else ""
+
+    # Detectar si es una imagen de precios/comparación
+    es_precio = any(keyword in msg_lower for keyword in ['precio', 'compara', 'donde es mas barato', 'dónde es más barato', 'ticket', 'mercado'])
+
+    if es_precio:
+        # Extraer productos con Vision
+        productos_dict, error = extraer_productos_vision(media_url, from_number)
+
+        if error:
+            salida.message(error)
+            return
+
+        if not productos_dict or not productos_dict.get('productos'):
+            salida.message("No pude leer los precios de la imagen. Asegúrate que sea un ticket o factura clara con precios visibles.")
+            return
+
+        # Almacenar temporalmente para confirmación
+        temp_productos[from_number] = productos_dict
+
+        # Mostrar resumen
+        tienda = productos_dict.get('tienda', 'desconocida')
+        msg = f"🧾 Encontré en tu ticket de *{tienda}*:\n\n"
+
+        for p in productos_dict['productos'][:5]:  # Mostrar máximo 5
+            producto = p.get('producto', '')
+            precio = p.get('precio', 0)
+            msg += f"  • {producto}: ${precio:.2f}\n"
+
+        if len(productos_dict['productos']) > 5:
+            msg += f"  ... y {len(productos_dict['productos']) - 5} más\n"
+
+        msg += f"\n¿Lo guardo para comparar precios? Responde *SI* o *NO*"
+        salida.message(msg)
+        return
+
+    # Si no es precio, usar el flujo normal de gastos
+    # Procesar la imagen con visión
+    info_foto = {}
+    resultado = procesar_fotos_whatsapp(media_urls, from_number, incoming_msg or "", info_foto)
+    salida.message(resultado)
+
+    # Si hay texto adicional, validar antes de reclasificar. Solo si la foto se guardó como
+    # UN gasto: en transferencias el texto ya eligió la carpeta, y una libretita no es un gasto.
+    solo_un_gasto = info_foto.get('caminos') == ['facturas']
+    if incoming_msg and incoming_msg.lower().strip() and solo_un_gasto:
+        msg_lower = incoming_msg.lower()
+
+        # VALIDACIÓN: Detectar si es una queja/comentario o un envio_ecuador
+        # Palabras que indican queja/problema, NO reclasificar
+        falso_positivo_keywords = ["link", "cuentas", "longizo", "equivoca", "error", "mal", "no", "problem", "falla", "bug", "ayuda"]
+        es_queja = any(k in msg_lower for k in falso_positivo_keywords)
+
+        # Palabras que realmente indican envio_ecuador
+        envio_ecuador_keywords = ["ecuador", "envio", "giro", "remesa"]
+        es_envio_ecuador = any(k in msg_lower for k in envio_ecuador_keywords)
+
+        # Solo reclasificar si NO es una queja/comentario
+        if not es_queja:
+            # Esperar un momento para que se guarde el gasto
+            import time
+            time.sleep(0.5)
+            resultado_reclasificacion = reclasificar_gasto(incoming_msg, from_number)
+            salida.message(resultado_reclasificacion)
+        else:
+            # Es una queja o comentario, ignorar reclasificación automática
+            logger.info(f"Detected complaint/comment from {from_number}, skipping reclassification: {msg_lower}")
 
 
 def atender_con_audio(media_url, incoming_msg, from_number, server_url):
