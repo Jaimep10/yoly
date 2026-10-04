@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 from datetime import datetime, timedelta
-from flask import Flask, request, send_file, jsonify
+from flask import Flask, request, jsonify, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
@@ -79,6 +79,30 @@ def responder(resp, texto):
 # después por la API de Twilio.
 ESPERA_MAX_SEGUNDOS = 10
 MENSAJE_ESPERA = "⏳ Recibí tu mensaje. Lo estoy procesando, en unos segundos te respondo."
+
+def ruta_temporal(pdf_path):
+    """Archivo temporal propio de este hilo, en la misma carpeta que el PDF final."""
+    return f"{pdf_path}.{os.getpid()}-{threading.get_ident()}.tmp"
+
+def publicar_pdf(tmp_path, pdf_path):
+    """Reemplaza el PDF final de una sola vez, y solo si el temporal es un PDF completo.
+    Así una descarga nunca ve un archivo a medias o vacío."""
+    with open(tmp_path, "rb") as f:
+        valido = os.path.getsize(tmp_path) > 0 and f.read(5) == b"%PDF-"
+    if not valido:
+        os.remove(tmp_path)
+        raise ValueError(f"El PDF generado está vacío o dañado: {pdf_path}")
+    os.replace(tmp_path, pdf_path)
+
+def servir_pdf(pdf_path, nombre):
+    """Entrega el PDF con su Content-Length real (sin sendfile). 404 si no existe o está vacío."""
+    if not os.path.exists(pdf_path) or os.path.getsize(pdf_path) == 0:
+        logger.warning(f"PDF no disponible o vacío: {pdf_path}")
+        return f"{nombre} no disponible", 404
+    with open(pdf_path, "rb") as f:
+        datos = f.read()
+    return Response(datos, mimetype="application/pdf",
+                    headers={"Content-Disposition": f"attachment; filename={nombre}"})
 
 class Salida:
     """Junta los textos de la respuesta. Tiene .message() como MessagingResponse,
@@ -321,6 +345,7 @@ def generar_informe_metas():
         return None
 
     pdf_path = '/tmp/informe_metas.pdf'
+    tmp_path = ruta_temporal(pdf_path)
     chart_path = '/tmp/metas_chart.png'
 
     # Preparar datos para gráfico
@@ -344,7 +369,7 @@ def generar_informe_metas():
     plt.close()
 
     # Crear PDF
-    c = canvas.Canvas(pdf_path, pagesize=letter)
+    c = canvas.Canvas(tmp_path, pagesize=letter)
     width, height = letter
 
     # Título
@@ -389,11 +414,13 @@ def generar_informe_metas():
     c.drawImage(chart_path, 30, height - 400, width=530, height=320)
 
     c.save()
+    publicar_pdf(tmp_path, pdf_path)
     return pdf_path
 
 def generar_informe_gastos():
     """Genera un PDF con gráfico de gastos de ejemplo"""
     pdf_path = '/tmp/informe_gastos.pdf'
+    tmp_path = ruta_temporal(pdf_path)
     chart_path = '/tmp/gastos_chart.png'
 
     # Datos de ejemplo
@@ -409,7 +436,7 @@ def generar_informe_gastos():
     plt.close()
 
     # Crear PDF con reportlab
-    c = canvas.Canvas(pdf_path, pagesize=letter)
+    c = canvas.Canvas(tmp_path, pagesize=letter)
     width, height = letter
 
     # Título
@@ -445,6 +472,7 @@ def generar_informe_gastos():
     c.drawImage(chart_path, 50, 50, width=400, height=300)
 
     c.save()
+    publicar_pdf(tmp_path, pdf_path)
     return pdf_path
 
 SEMANAS_POR_MES = 52 / 12
@@ -541,6 +569,7 @@ def generar_presupuesto(datos):
     """Genera un PDF con el presupuesto mensual del usuario y consejos de Claude.
     Devuelve (pdf_path, consejo_ok); consejo_ok es False si Claude no pudo dar consejos."""
     pdf_path = '/tmp/presupuesto_analisis.pdf'
+    tmp_path = ruta_temporal(pdf_path)
     chart_path_pie = '/tmp/presupuesto_pie.png'
     chart_path_bar = '/tmp/presupuesto_bar.png'
 
@@ -587,7 +616,7 @@ def generar_presupuesto(datos):
     plt.close()
 
     # Crear PDF con reportlab
-    doc = SimpleDocTemplate(pdf_path, pagesize=letter)
+    doc = SimpleDocTemplate(tmp_path, pagesize=letter)
     story = []
     styles = getSampleStyleSheet()
 
@@ -739,6 +768,7 @@ def generar_presupuesto(datos):
 
     # Build PDF
     doc.build(story)
+    publicar_pdf(tmp_path, pdf_path)
 
     # Cleanup chart files
     try:
@@ -769,26 +799,20 @@ def health():
 @app.route("/download/informe_gastos.pdf", methods=["GET"])
 def download_informe():
     """Sirve el PDF de informe de gastos"""
-    pdf_path = '/tmp/informe_gastos.pdf'
-    if os.path.exists(pdf_path):
-        return send_file(pdf_path, mimetype='application/pdf', as_attachment=True, download_name='informe_gastos.pdf')
-    return "Informe no encontrado", 404
+    return servir_pdf('/tmp/informe_gastos.pdf', 'informe_gastos.pdf')
 
 @app.route("/download/presupuesto_analisis.pdf", methods=["GET"])
 def download_presupuesto():
     """Sirve el PDF de análisis de presupuesto"""
-    pdf_path = '/tmp/presupuesto_analisis.pdf'
-    if os.path.exists(pdf_path):
-        return send_file(pdf_path, mimetype='application/pdf', as_attachment=True, download_name='presupuesto_analisis.pdf')
-    return "Presupuesto no encontrado", 404
+    return servir_pdf('/tmp/presupuesto_analisis.pdf', 'presupuesto_analisis.pdf')
 
 @app.route("/download/informe_metas.pdf", methods=["GET"])
 def download_informe_metas():
     """Sirve el PDF de informe de metas"""
     pdf_path = generar_informe_metas()
-    if pdf_path and os.path.exists(pdf_path):
-        return send_file(pdf_path, mimetype='application/pdf', as_attachment=True, download_name='informe_metas.pdf')
-    return "Informe de metas no disponible", 404
+    if not pdf_path:
+        return "Informe de metas no disponible", 404
+    return servir_pdf(pdf_path, 'informe_metas.pdf')
 
 @app.route("/whatsapp", methods=["POST", "GET"])
 def whatsapp():
