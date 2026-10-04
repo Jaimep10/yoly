@@ -7,7 +7,7 @@ import io
 import re
 from datetime import datetime, timedelta
 from calendar import monthrange
-from flask import Flask, request, jsonify, Response, render_template_string
+from flask import Flask, request, jsonify, Response, render_template_string, send_file
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
@@ -32,6 +32,12 @@ try:
     HAS_PANDAS = True
 except ImportError:
     HAS_PANDAS = False
+
+try:
+    from openpyxl import Workbook
+    HAS_OPENPYXL = True
+except ImportError:
+    HAS_OPENPYXL = False
 
 app = Flask(__name__)
 
@@ -1761,7 +1767,8 @@ def normalizar_telefono(phone):
 def generar_excel_gastos(phone):
     """Genera un archivo Excel con los gastos del usuario del mes actual"""
     if not HAS_PANDAS:
-        return None
+        # Fallback a openpyxl si pandas no está disponible
+        return generar_excel_gastos_openpyxl(phone)
 
     try:
         gastos = cargar_gastos(phone)
@@ -1800,6 +1807,59 @@ def generar_excel_gastos(phone):
         return excel_path
     except Exception as e:
         logger.error(f"Error generando Excel: {e}", exc_info=True)
+        return generar_excel_gastos_openpyxl(phone)
+
+def generar_excel_gastos_openpyxl(phone):
+    """Genera un archivo Excel usando openpyxl directamente (fallback sin pandas)"""
+    if not HAS_OPENPYXL:
+        return None
+
+    try:
+        gastos = cargar_gastos(phone)
+        if not gastos:
+            return None
+
+        # Filtrar gastos del mes actual
+        hoy = datetime.now()
+        mes_actual = hoy.month
+        anio_actual = hoy.year
+
+        gastos_mes = [g for g in gastos if 'fecha' in g]
+        gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
+                      and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
+
+        if not gastos_mes:
+            return None
+
+        # Crear workbook con openpyxl
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Transacciones"
+
+        # Headers
+        headers = ["Fecha", "Descripción", "Categoría", "Monto"]
+        ws.append(headers)
+
+        # Gastos
+        total_mes = 0
+        for gasto in gastos_mes:
+            fecha = gasto.get("fecha", "")
+            descripcion = gasto.get("descripcion", "")
+            categoria = gasto.get("categoria", "")
+            monto = gasto.get("monto", 0)
+            ws.append([fecha, descripcion, categoria, monto])
+            total_mes += monto
+
+        # Row de total
+        ws.append(["", "", "TOTAL", total_mes])
+
+        # Guardar
+        excel_path = f"/tmp/gastos_{phone}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        wb.save(excel_path)
+
+        return excel_path
+    except Exception as e:
+        logger.error(f"Error generando Excel con openpyxl: {e}", exc_info=True)
         return None
 
 def generar_pdf_dashboard(phone):
@@ -2219,8 +2279,8 @@ def dashboard(phone):
 @app.route("/dashboard/<phone>/excel", methods=["GET"])
 def descargar_excel(phone):
     """Descarga los gastos en Excel"""
-    if not HAS_PANDAS:
-        return "Excel no disponible (pandas no instalado)", 501
+    if not HAS_PANDAS and not HAS_OPENPYXL:
+        return "Excel no disponible (instala pandas u openpyxl)", 501
 
     try:
         # Normalizar teléfono
@@ -3111,7 +3171,7 @@ Deuda original: ${deuda:,.0f}
 Pagado: ${pagado:,.0f}
 Te falta: ${balance:,.0f}
 
-Link carpeta: {server_url}/dashboard/{phone_clean}/carpeta/maria_cristina"""
+📊 Documentar aquí: {server_url}/dashboard/{phone_clean}"""
 
                     resp.message(respuesta_balance)
                     # Limpiar la pregunta para que no se repita

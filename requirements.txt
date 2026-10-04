@@ -9,3 +9,4 @@ reportlab
 python-dateutil
 gunicorn
 matplotlib
+openpyxl
