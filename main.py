@@ -234,9 +234,11 @@ def guardar_contexto_financiero(contexto):
 
 # ==================== SMART FILING SYSTEM WITH CLAUDE VISION ====================
 
+DATA_DIR = '/home/claude/yoly/data'
+
 def obtener_ruta_datos(telefono):
     """Obtiene la ruta de la carpeta de datos del usuario"""
-    ruta = f'/home/claude/yoly/data/{telefono}'
+    ruta = f'{DATA_DIR}/{telefono}'
     os.makedirs(ruta, exist_ok=True)
     return ruta
 
@@ -264,6 +266,127 @@ def guardar_gastos(telefono, gastos):
     except Exception as e:
         print(f"Error guardando gastos: {e}")
         return False
+
+# ==================== COBRO DE DEUDA (lista de pagos) ====================
+
+
+def a_numero(valor):
+    """Convierte '1.200', '$300' o 300 a float; None si no es número"""
+    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
+        return float(valor)
+    if isinstance(valor, str):
+        limpio = re.sub(r'[^0-9.,-]', '', valor).replace(',', '')
+        try:
+            return float(limpio)
+        except ValueError:
+            return None
+    return None
+
+def fecha_valida(fecha):
+    try:
+        datetime.strptime(str(fecha), '%Y-%m-%d')
+        return True
+    except ValueError:
+        return False
+
+def normalizar_pagos(pagos_raw):
+    """Acepta [200, 120] o [{"fecha": "2026-01-03", "monto": 200}] y devuelve [{"fecha", "monto"}]"""
+    pagos = []
+    for p in pagos_raw if isinstance(pagos_raw, list) else []:
+        if isinstance(p, dict):
+            monto = a_numero(p.get('monto'))
+            fecha = p.get('fecha')
+        else:
+            monto, fecha = a_numero(p), None
+        if monto is None or monto <= 0:
+            continue
+        pagos.append({"fecha": fecha if fecha and fecha_valida(fecha) else "", "monto": monto})
+    return pagos
+
+def armar_cobro(datos):
+    """Recalcula en Python pagado, saldo, saldo restante por pago y frecuencia"""
+    pagos = normalizar_pagos(datos.get('pagos', []))
+    deuda = a_numero(datos.get('deuda')) or 0
+    pagado = sum(p['monto'] for p in pagos)
+
+    saldo_restante = deuda
+    filas = []
+    for p in pagos:
+        saldo_restante -= p['monto']
+        filas.append({"fecha": p['fecha'], "monto": p['monto'], "saldo": saldo_restante})
+
+    fechas = sorted(datetime.strptime(p['fecha'], '%Y-%m-%d') for p in pagos if p['fecha'])
+    frecuencia = None
+    if len(fechas) >= 2:
+        frecuencia = round((fechas[-1] - fechas[0]).days / (len(fechas) - 1))
+
+    return {
+        "tipo": "cobro_deuda",
+        "cliente": datos.get('cliente') or 'Cliente',
+        "deuda": deuda,
+        "pagado": pagado,
+        "saldo": deuda - pagado,
+        "pagos": pagos,
+        "filas": filas,
+        "frecuencia_dias": frecuencia,
+        "fecha": datos.get('fecha', ''),
+    }
+
+def guardar_cobro(phone_clean, datos):
+    """Guarda el cobro en memoria_global.json y en data/{telefono}/cobro_deuda.json"""
+    memoria_usuarios[phone_clean] = datos
+    guardar_memoria(memoria_usuarios)
+    try:
+        ruta = f'{DATA_DIR}/{phone_clean}'
+        os.makedirs(ruta, exist_ok=True)
+        with open(f'{ruta}/cobro_deuda.json', 'w', encoding='utf-8') as f:
+            json.dump(datos, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Error guardando cobro_deuda.json: {e}")
+
+def es_registro_pagos(gasto):
+    """Registros viejos donde la foto de pagos se guardó como 1 solo gasto"""
+    return isinstance(gasto.get('pagos'), list) and (len(gasto['pagos']) > 1 or gasto.get('cliente'))
+
+def obtener_cobro(phone):
+    """Busca el cobro de deuda del usuario por sus últimos 10 dígitos (memoria, archivo o registro viejo)"""
+    digitos = normalizar_telefono(phone)
+    ultimos10 = digitos[-10:]
+    if not ultimos10:
+        return None
+
+    candidatos = [digitos] + [k for k in memoria_usuarios if normalizar_telefono(k)[-10:] == ultimos10]
+    for clave in candidatos:
+        datos = memoria_usuarios.get(clave) or {}
+        if datos.get('tipo') in ('cobro_deuda', 'deuda') and datos.get('pagos'):
+            return armar_cobro(datos)
+
+    if os.path.isdir(DATA_DIR):
+        for carpeta in os.listdir(DATA_DIR):
+            if normalizar_telefono(carpeta)[-10:] != ultimos10:
+                continue
+            archivo = f'{DATA_DIR}/{carpeta}/cobro_deuda.json'
+            if os.path.exists(archivo):
+                try:
+                    with open(archivo, 'r', encoding='utf-8') as f:
+                        return armar_cobro(json.load(f))
+                except Exception as e:
+                    logger.warning(f"Error leyendo {archivo}: {e}")
+            for gasto in reversed(cargar_gastos(carpeta)):
+                if es_registro_pagos(gasto):
+                    return armar_cobro({"cliente": gasto.get('cliente'), "deuda": gasto.get('monto'),
+                                        "pagos": gasto.get('pagos'), "fecha": gasto.get('fecha', '')})
+    return None
+
+def cargar_gastos_usuario(phone):
+    """Gastos del usuario buscando la carpeta por últimos 10 dígitos (whatsapp:+593... o 593...)"""
+    ultimos10 = normalizar_telefono(phone)[-10:]
+    gastos = []
+    if ultimos10 and os.path.isdir(DATA_DIR):
+        for carpeta in sorted(os.listdir(DATA_DIR)):
+            if normalizar_telefono(carpeta)[-10:] == ultimos10:
+                gastos.extend(cargar_gastos(carpeta))
+    return [g for g in gastos if not es_registro_pagos(g)]
 
 def descargar_media_twilio(media_url):
     """Descarga media desde Twilio con autenticación básica"""
@@ -513,7 +636,7 @@ def procesar_foto_inteligente(media_url, telefono):
                         "type": "text",
                         "text": """Analiza esta factura/recibo/ticket/comprobante de pagos. Extrae SOLO un JSON válido, sin explicaciones, sin calcular:
 {
-  "pagos": [lista de números pagados, ej: [200, 120, 130]],
+  "pagos": [{"fecha": "YYYY-MM-DD", "monto": número}, ...] en el mismo orden de la imagen,
   "deuda_total": número total adeudado (si aparece),
   "cliente": "nombre de la persona o razón social",
   "fecha": "YYYY-MM-DD si aparece",
@@ -522,8 +645,8 @@ def procesar_foto_inteligente(media_url, telefono):
 }
 
 INSTRUCCIONES CRÍTICAS:
-1. NUNCA calcules sumas. Si ves "200 + 120 + 130", devuelve [200, 120, 130] solamente
-2. "pagos": siempre es un ARRAY de números individuales encontrados
+1. NUNCA calcules sumas. Si ves "200 + 120 + 130", devuelve 3 pagos separados
+2. "pagos": siempre es un ARRAY con un objeto por cada pago individual. "fecha" es la fecha escrita junto a ese pago (formato día/mes de Ecuador); si no hay fecha para ese pago, omite "fecha"
 3. "deuda_total": número total del documento (si aparece en la imagen)
 4. NUNCA inventes números que no estén en la imagen
 5. NO incluyas campos vacíos, ommitelos
@@ -555,75 +678,62 @@ INSTRUCCIONES CRÍTICAS:
             return "❌ No pude leer los números de la factura. Por favor, envía una imagen más clara o escribe el monto manualmente."
 
         # PASO CRÍTICO: Calcular sumas determinísticas en Python, NO confiar en Vision
-        # Vision extrae: pagos (lista), deuda_total (número), cliente (string)
-        pagos_lista = vision_response.get('pagos', [])
-        deuda_total = vision_response.get('deuda_total', 0)
-        cliente = vision_response.get('cliente', 'Cliente')
-        descripcion = vision_response.get('descripcion', 'Gasto')
+        pagos = normalizar_pagos(vision_response.get('pagos', []))
+        deuda = a_numero(vision_response.get('deuda_total')) or 0
+        cliente = vision_response.get('cliente') or 'Cliente'
+        descripcion = vision_response.get('descripcion') or 'Gasto'
+        pagado = sum(p['monto'] for p in pagos)  # Suma real en Python, no Vision
 
-        # CÁLCULO DETERMINÍSTICO CON PYTHON sum()
-        if pagos_lista and isinstance(pagos_lista, list):
-            pagado = sum(float(p) for p in pagos_lista)  # Suma real, no GPT
-        else:
-            # Si no hay lista de pagos, usar deuda_total como monto único
-            pagado = float(deuda_total) if deuda_total else 0
-            pagos_lista = [pagado] if pagado > 0 else []
+        phone_clean = normalizar_telefono(telefono)
 
-        balance = deuda_total - pagado if deuda_total else 0
+        # Registro de pagos de una deuda: se guarda como LISTA de pagos, no como 1 gasto
+        if deuda > 0 or len(pagos) > 1:
+            datos = {
+                "tipo": "cobro_deuda",
+                "cliente": cliente,
+                "deuda": deuda,
+                "pagado": pagado,
+                "saldo": deuda - pagado,
+                "pagos": pagos,
+                "descripcion": descripcion,
+                "fecha": datetime.now().isoformat(),
+                "factura_path": ruta_archivo,
+                "ultima_pregunta": "dashboard",
+            }
+            guardar_cobro(phone_clean, datos)
 
-        # Crear estructura de gasto para guardar
-        fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-        timestamp_iso = datetime.now().isoformat()
+            pagos_str = "+".join(f"{p['monto']:,.0f}" for p in pagos)
+            respuesta = f"Leí {len(pagos)} pagos de {cliente}:\n{pagos_str} = ${pagado:,.0f}"
+            if deuda:
+                respuesta += f"\nDeuda original: ${deuda:,.0f}\nTe falta: ${deuda - pagado:,.0f}"
+            return respuesta + "\n\n¿Te mando tabla al dashboard?"
 
-        # Crear ID único
+        # Factura/recibo normal: un solo gasto
+        if pagado <= 0:
+            return "❌ No pude leer los números de la factura. Por favor, envía una imagen más clara o escribe el monto manualmente."
+
+        fecha_gasto = pagos[0].get('fecha') or vision_response.get('fecha') or datetime.now().strftime("%Y-%m-%d")
+        if not fecha_valida(fecha_gasto):
+            fecha_gasto = datetime.now().strftime("%Y-%m-%d")
         timestamp_formato = datetime.now().strftime("%Y%m%d_%H%M")
         desc_normalizada = descripcion.lower().replace(' ', '').replace('-', '')[:15]
-        gasto_id = f"{timestamp_formato}_{desc_normalizada}_{int(pagado)}"
-
         gasto_nuevo = {
-            "id": gasto_id,
-            "fecha": fecha_hoy,
-            "timestamp": timestamp_iso,
+            "id": f"{timestamp_formato}_{desc_normalizada}_{int(pagado)}",
+            "fecha": fecha_gasto,
+            "timestamp": datetime.now().isoformat(),
             "descripcion": descripcion,
-            "monto": deuda_total,
-            "pagos": pagos_lista,  # Lista de pagos individuales
-            "pagado": pagado,      # Suma calculada en Python
-            "balance": balance,    # Deuda - pagado
+            "categoria": "otro",
+            "monto": pagado,
             "cliente": cliente,
             "factura_path": ruta_archivo
         }
-
         gastos = cargar_gastos(telefono)
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
 
-        # Guardar en memoria datos del pago para poder responder a balance
-        phone_clean = normalizar_telefono(telefono)
-
-        # Guardar siempre en memoria para poder mostrar balance cuando se pregunta
-        memoria_usuarios[phone_clean] = {
-            'tipo': 'deuda',
-            'pagos': pagos_lista,
-            'pagado': pagado,        # Suma Python, no Vision
-            'deuda': deuda_total,
-            'balance': balance,
-            'cliente': cliente,
-            'fecha_inicio': fecha_hoy,
-            'fecha_final': fecha_hoy,
-            'estado': 'guardado',
-            'descripcion': descripcion,
-            'gasto_id': gasto_id,
-            'ultima_pregunta': 'dashboard'
-        }
+        respuesta = f"Leí {cliente}: ${pagado:,.0f}. ¿Te mando tabla al dashboard?"
+        memoria_usuarios.setdefault(phone_clean, {})['ultima_pregunta'] = 'dashboard'
         guardar_memoria(memoria_usuarios)
-
-        # Respuesta al usuario CON NÚMEROS CALCULADOS POR PYTHON
-        if pagos_lista:
-            pagos_str = "+".join(str(int(p)) for p in pagos_lista)
-            respuesta = f"Leí {len(pagos_lista)} pagos de {cliente}:\n{pagos_str} = ${pagado:,.0f}\nDeuda original: ${deuda_total:,.0f}\nTe falta: ${balance:,.0f}\n\n¿Te mando tabla al dashboard?"
-        else:
-            respuesta = f"Leí {cliente}. Total deuda: ${deuda_total:,.0f}. ¿Te mando tabla al dashboard?"
-
         return respuesta
 
     except Exception as e:
@@ -1789,302 +1899,162 @@ def normalizar_telefono(phone):
     # Solo números
     return re.sub(r'[^0-9]', '', phone)
 
+def gastos_del_mes(phone):
+    """Gastos del mes actual del usuario (sin los registros de pagos de deuda)"""
+    hoy = datetime.now()
+    gastos_mes = []
+    for g in cargar_gastos_usuario(phone):
+        if not fecha_valida(g.get('fecha', '')):
+            continue
+        f = datetime.strptime(g['fecha'], '%Y-%m-%d')
+        if f.month == hoy.month and f.year == hoy.year:
+            gastos_mes.append(g)
+    return sorted(gastos_mes, key=lambda x: x.get('fecha', ''))
+
+def titulo_cobro(cobro):
+    return f"Estado de Cuenta {cobro['cliente']} - Deuda ${cobro['deuda']:,.0f} - Saldo ${cobro['saldo']:,.0f}"
+
 def generar_excel_gastos(phone):
-    """Genera un archivo Excel con los gastos del usuario del mes actual y resumen de deudas"""
-    if not HAS_PANDAS:
-        # Fallback a openpyxl si pandas no está disponible
-        return generar_excel_gastos_openpyxl(phone)
-
+    """Excel con openpyxl. Cobro de deuda: hojas Pagos y Resumen. Si no: gastos del mes."""
+    if not HAS_OPENPYXL:
+        return None
     try:
-        gastos = cargar_gastos(phone)
+        from openpyxl.styles import Font, PatternFill
         phone_clean = normalizar_telefono(phone)
+        cobro = obtener_cobro(phone_clean)
+        negrita = Font(bold=True, color="FFFFFF")
+        relleno = PatternFill("solid", fgColor="1E40AF")
+        wb = Workbook()
 
-        # Verificar si hay datos en memoria (deuda, pagos)
-        datos_memoria = memoria_usuarios.get(phone_clean, {})
-        tiene_deuda_info = datos_memoria.get('tipo') == 'deuda'
+        def encabezado(ws, columnas):
+            ws.append(columnas)
+            for celda in ws[ws.max_row]:
+                celda.font = negrita
+                celda.fill = relleno
 
-        if not gastos and not tiene_deuda_info:
-            return None
+        if cobro:
+            ws = wb.active
+            ws.title = "Pagos"
+            encabezado(ws, ["#", "Fecha", "Monto", "Saldo Restante"])
+            for idx, fila in enumerate(cobro['filas'], 1):
+                ws.append([idx, fila['fecha'] or "sin fecha", fila['monto'], fila['saldo']])
+            ws.append(["", "TOTAL PAGADO", cobro['pagado'], cobro['saldo']])
+            ws[ws.max_row][1].font = Font(bold=True)
 
-        # Filtrar gastos del mes actual
-        hoy = datetime.now()
-        mes_actual = hoy.month
-        anio_actual = hoy.year
+            resumen = wb.create_sheet("Resumen")
+            encabezado(resumen, ["Concepto", "Valor"])
+            resumen.append(["Cliente", cobro['cliente']])
+            resumen.append(["Deuda", cobro['deuda']])
+            resumen.append(["Pagado", cobro['pagado']])
+            resumen.append(["Saldo", cobro['saldo']])
+            resumen.append(["Número de pagos", len(cobro['pagos'])])
+            if cobro['frecuencia_dias']:
+                resumen.append(["Frecuencia", f"Paga cada {cobro['frecuencia_dias']} días promedio"])
+            hojas = [ws, resumen]
+        else:
+            gastos_mes = gastos_del_mes(phone_clean)
+            if not gastos_mes:
+                return None
+            ws = wb.active
+            ws.title = "Transacciones"
+            encabezado(ws, ["Fecha", "Descripción", "Categoría", "Monto"])
+            for g in gastos_mes:
+                ws.append([g.get('fecha', ''), g.get('descripcion', ''), g.get('categoria', 'otro'), g.get('monto', 0)])
+            ws.append(["", "", "TOTAL", sum(g.get('monto', 0) for g in gastos_mes)])
+            hojas = [ws]
 
-        gastos_mes = [g for g in gastos if 'fecha' in g] if gastos else []
-        gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
-                      and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
+        for hoja in hojas:
+            for col in hoja.columns:
+                hoja.column_dimensions[col[0].column_letter].width = max(12, max(len(str(c.value or '')) for c in col) + 2)
+            for fila in hoja.iter_rows(min_row=2):
+                for celda in fila:
+                    if isinstance(celda.value, (int, float)) and celda.column_letter != 'A':
+                        celda.number_format = '"$"#,##0.00'
 
-        # Crear DataFrame con información de deuda si existe
-        df_data = []
-
-        # Agregar resumen de deuda como filas iniciales
-        if tiene_deuda_info:
-            deuda = datos_memoria.get('deuda', 0)
-            pagado = datos_memoria.get('pagado', 0)
-            balance = datos_memoria.get('balance', 0)
-            cliente = datos_memoria.get('cliente', 'Cliente')
-            fecha_final = datos_memoria.get('fecha_final', '')
-
-            df_data.append({
-                'Fecha': fecha_final,
-                'Descripción': f'RESUMEN: {cliente}',
-                'Categoría': 'DEUDA',
-                'Monto': deuda,
-                'Pagos': '',
-                'Balance': balance,
-                'Notas': f'Deuda Original: ${deuda:,.2f}'
-            })
-
-            # Agregar pagos individuales
-            pagos_lista = datos_memoria.get('pagos', [])
-            for idx, pago in enumerate(pagos_lista, 1):
-                df_data.append({
-                    'Fecha': fecha_final,
-                    'Descripción': f'Pago #{idx}',
-                    'Categoría': 'PAGO',
-                    'Monto': float(pago),
-                    'Pagos': float(pago),
-                    'Balance': '',
-                    'Notas': f'Pagado: ${float(pago):,.2f}'
-                })
-
-            df_data.append({
-                'Fecha': fecha_final,
-                'Descripción': f'TOTAL PAGADO',
-                'Categoría': 'RESUMEN',
-                'Monto': '',
-                'Pagos': pagado,
-                'Balance': balance,
-                'Notas': f'Balance Pendiente: ${balance:,.2f}'
-            })
-
-            # Agregar separador
-            df_data.append({
-                'Fecha': '',
-                'Descripción': '---',
-                'Categoría': '',
-                'Monto': '',
-                'Pagos': '',
-                'Balance': '',
-                'Notas': ''
-            })
-
-        # Agregar gastos del mes
-        for gasto in gastos_mes:
-            df_data.append({
-                'Fecha': gasto.get('fecha', ''),
-                'Descripción': gasto.get('descripcion', ''),
-                'Categoría': gasto.get('categoria', ''),
-                'Monto': gasto.get('monto', 0),
-                'Pagos': '',
-                'Balance': '',
-                'Notas': ''
-            })
-
-        if not df_data:
-            return None
-
-        df = pd.DataFrame(df_data)
-
-        # Guardar en archivo temporal
-        excel_path = f"/tmp/gastos_{phone}_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        df.to_excel(excel_path, index=False, engine='openpyxl')
-
+        excel_path = f"/tmp/gastos_{phone_clean}_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+        wb.save(excel_path)
         return excel_path
     except Exception as e:
         logger.error(f"Error generando Excel: {e}", exc_info=True)
-        return generar_excel_gastos_openpyxl(phone)
-
-def generar_excel_gastos_openpyxl(phone):
-    """Genera un archivo Excel usando openpyxl directamente (fallback sin pandas)"""
-    if not HAS_OPENPYXL:
         return None
 
-    try:
-        gastos = cargar_gastos(phone)
-        if not gastos:
-            return None
-
-        # Filtrar gastos del mes actual
-        hoy = datetime.now()
-        mes_actual = hoy.month
-        anio_actual = hoy.year
-
-        gastos_mes = [g for g in gastos if 'fecha' in g]
-        gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
-                      and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
-
-        if not gastos_mes:
-            return None
-
-        # Crear workbook con openpyxl
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Transacciones"
-
-        # Headers
-        headers = ["Fecha", "Descripción", "Categoría", "Monto"]
-        ws.append(headers)
-
-        # Gastos
-        total_mes = 0
-        for gasto in gastos_mes:
-            fecha = gasto.get("fecha", "")
-            descripcion = gasto.get("descripcion", "")
-            categoria = gasto.get("categoria", "")
-            monto = gasto.get("monto", 0)
-            ws.append([fecha, descripcion, categoria, monto])
-            total_mes += monto
-
-        # Row de total
-        ws.append(["", "", "TOTAL", total_mes])
-
-        # Guardar
-        excel_path = f"/tmp/gastos_{phone}_{datetime.now().strftime('%Y%m%d')}.xlsx"
-        wb.save(excel_path)
-
-        return excel_path
-    except Exception as e:
-        logger.error(f"Error generando Excel con openpyxl: {e}", exc_info=True)
-        return None
+def estilo_tabla(color_encabezado, color_filas):
+    return TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(color_encabezado)),
+        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor(color_filas)]),
+        ('TOPPADDING', (0, 0), (-1, -1), 6),
+        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+    ])
 
 def generar_pdf_dashboard(phone):
-    """Genera un PDF con los gastos del mes actual y resumen de deuda/pagos"""
+    """PDF con tabla. Cobro de deuda: estado de cuenta con pagos. Si no: gastos del mes."""
     try:
-        gastos = cargar_gastos(phone)
         phone_clean = normalizar_telefono(phone)
-
-        # Verificar si hay datos en memoria (deuda, pagos)
-        datos_memoria = memoria_usuarios.get(phone_clean, {})
-        tiene_deuda_info = datos_memoria.get('tipo') == 'deuda'
-
-        if not gastos and not tiene_deuda_info:
+        cobro = obtener_cobro(phone_clean)
+        gastos_mes = [] if cobro else gastos_del_mes(phone_clean)
+        if not cobro and not gastos_mes:
             return None
 
         hoy = datetime.now()
-        mes_actual = hoy.month
-        anio_actual = hoy.year
-
-        # Filtrar gastos del mes actual
-        gastos_mes = [g for g in gastos if 'fecha' in g] if gastos else []
-        gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
-                      and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
-
-        pdf_path = f"/tmp/gastos_{phone}_{datetime.now().strftime('%Y%m%d')}.pdf"
+        pdf_path = f"/tmp/gastos_{phone_clean}_{hoy.strftime('%Y%m%d')}.pdf"
         tmp_path = ruta_temporal(pdf_path)
-
         doc = SimpleDocTemplate(tmp_path, pagesize=letter)
-        story = []
         styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=15,
+                                     textColor=colors.HexColor('#1e40af'), spaceAfter=6)
+        h2 = ParagraphStyle('H2', parent=styles['Heading2'], textColor=colors.HexColor('#1e40af'))
+        story = []
 
-        # Título
-        title_style = ParagraphStyle(
-            'CustomTitle',
-            parent=styles['Heading1'],
-            fontSize=16,
-            textColor=colors.HexColor('#1e40af'),
-            spaceAfter=12
-        )
+        if cobro:
+            story.append(Paragraph(titulo_cobro(cobro), title_style))
+            story.append(Paragraph(f"Generado: {hoy.strftime('%d/%m/%Y')}", styles['Normal']))
+            story.append(Spacer(1, 0.25*inch))
 
-        story.append(Paragraph("Reporte Financiero", title_style))
-        story.append(Paragraph(f"Fecha: {hoy.strftime('%d/%m/%Y')}", styles['Normal']))
-        story.append(Spacer(1, 0.3*inch))
-
-        # Mostrar resumen de deuda si existe
-        if tiene_deuda_info:
-            deuda = datos_memoria.get('deuda', 0)
-            pagado = datos_memoria.get('pagado', 0)
-            balance = datos_memoria.get('balance', 0)
-            cliente = datos_memoria.get('cliente', 'Cliente')
-            fecha_final = datos_memoria.get('fecha_final', '')
-
-            story.append(Paragraph("RESUMEN DE DEUDA", ParagraphStyle('Heading2', parent=styles['Heading2'], textColor=colors.HexColor('#dc2626'))))
-            story.append(Spacer(1, 0.1*inch))
-
-            # Tabla de resumen
-            summary_data = [
-                ['Cliente', cliente],
-                ['Deuda Original', f"${deuda:,.2f}"],
-                ['Pagado', f"${pagado:,.2f}"],
-                ['Balance Pendiente', f"${balance:,.2f}"],
-                ['Fecha', fecha_final]
-            ]
-
-            summary_table = Table(summary_data, colWidths=[3*inch, 2*inch])
-            summary_table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('GRID', (0, 0), (-1, -1), 1, colors.grey),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f3f4f6')])
-            ]))
-
-            story.append(summary_table)
-
-            # Mostrar desglose de pagos si existe
-            pagos_lista = datos_memoria.get('pagos', [])
-            if pagos_lista:
-                story.append(Spacer(1, 0.3*inch))
-                story.append(Paragraph("DESGLOSE DE PAGOS", ParagraphStyle('Heading2', parent=styles['Heading2'], textColor=colors.HexColor('#1e40af'))))
+            resumen = Table([
+                ['Deuda', 'Pagado', 'Saldo'],
+                [f"${cobro['deuda']:,.2f}", f"${cobro['pagado']:,.2f}", f"${cobro['saldo']:,.2f}"],
+            ], colWidths=[2*inch, 2*inch, 2*inch])
+            estilo = estilo_tabla('#1e40af', '#f3f4f6')
+            estilo.add('FONTSIZE', (0, 1), (-1, 1), 13)
+            estilo.add('FONTNAME', (0, 1), (-1, 1), 'Helvetica-Bold')
+            if cobro['saldo'] > 0:
+                estilo.add('TEXTCOLOR', (2, 1), (2, 1), colors.HexColor('#dc2626'))
+            resumen.setStyle(estilo)
+            story.append(resumen)
+            if cobro['frecuencia_dias']:
                 story.append(Spacer(1, 0.1*inch))
-
-                pagos_data = [['Pago #', 'Monto']]
-                for idx, pago in enumerate(pagos_lista, 1):
-                    pagos_data.append([str(idx), f"${float(pago):,.2f}"])
-
-                pagos_table = Table(pagos_data, colWidths=[1*inch, 1.5*inch])
-                pagos_table.setStyle(TableStyle([
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#059669')),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('GRID', (0, 0), (-1, -1), 1, colors.grey),
-                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor('#f0fdf4')])
-                ]))
-                story.append(pagos_table)
-
+                story.append(Paragraph(f"Paga cada {cobro['frecuencia_dias']} días promedio", styles['Normal']))
             story.append(Spacer(1, 0.3*inch))
 
-        # Tabla de gastos del mes si existen
-        if gastos_mes:
-            story.append(Paragraph("GASTOS DEL MES", ParagraphStyle('Heading2', parent=styles['Heading2'], textColor=colors.HexColor('#1e40af'))))
-            story.append(Spacer(1, 0.1*inch))
-
-            table_data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
-            total_mes = 0
-
-            for gasto in sorted(gastos_mes, key=lambda x: x.get('fecha', '')):
-                table_data.append([
-                    gasto.get('fecha', ''),
-                    gasto.get('descripcion', '')[:30],
-                    gasto.get('categoria', ''),
-                    f"${gasto.get('monto', 0):.2f}"
-                ])
-                total_mes += gasto.get('monto', 0)
-
-            table_data.append(['', '', 'TOTAL', f"${total_mes:.2f}"])
-
-            table = Table(table_data)
-            table.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                ('ROWBACKGROUNDS', (0, 1), (-1, -2), [colors.white, colors.HexColor('#f3f4f6')])
-            ]))
-
-            story.append(table)
-
-        # Si no hay datos, mostrar mensaje
-        if not gastos_mes and not tiene_deuda_info:
-            story.append(Paragraph("Sin datos disponibles", styles['Normal']))
+            story.append(Paragraph(f"Historial de Pagos ({len(cobro['pagos'])})", h2))
+            data = [['#', 'Fecha', 'Pago', 'Saldo Restante']]
+            for idx, fila in enumerate(cobro['filas'], 1):
+                data.append([str(idx), fila['fecha'] or 'sin fecha', f"${fila['monto']:,.2f}", f"${fila['saldo']:,.2f}"])
+            data.append(['', 'TOTAL', f"${cobro['pagado']:,.2f}", f"${cobro['saldo']:,.2f}"])
+            tabla = Table(data, colWidths=[0.6*inch, 1.6*inch, 1.6*inch, 1.8*inch])
+            estilo = estilo_tabla('#059669', '#f0fdf4')
+            estilo.add('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold')
+            estilo.add('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#e5e7eb'))
+            tabla.setStyle(estilo)
+            story.append(tabla)
+        else:
+            story.append(Paragraph("Reporte de Gastos del Mes", title_style))
+            story.append(Paragraph(f"Fecha: {hoy.strftime('%d/%m/%Y')}", styles['Normal']))
+            story.append(Spacer(1, 0.3*inch))
+            data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
+            for g in gastos_mes:
+                data.append([g.get('fecha', ''), g.get('descripcion', '')[:30], g.get('categoria', 'otro'), f"${g.get('monto', 0):,.2f}"])
+            data.append(['', '', 'TOTAL', f"${sum(g.get('monto', 0) for g in gastos_mes):,.2f}"])
+            tabla = Table(data)
+            tabla.setStyle(estilo_tabla('#1e40af', '#f3f4f6'))
+            story.append(tabla)
 
         doc.build(story)
         publicar_pdf(tmp_path, pdf_path)
-
         return pdf_path
     except Exception as e:
         logger.error(f"Error generando PDF dashboard: {e}", exc_info=True)
@@ -2127,6 +2097,128 @@ def download_informe_metas():
         return "Informe de metas no disponible", 404
     return servir_pdf(pdf_path, 'informe_metas.pdf')
 
+DASHBOARD_COBRO_HTML = """
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#3B82F6">
+    <link rel="manifest" href="/manifest.json">
+    <title>Yoly - {{ titulo }}</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+</head>
+<body class="bg-gradient-to-br from-blue-50 via-white to-indigo-50 min-h-screen">
+    <div class="bg-gradient-to-r from-blue-600 to-indigo-600 text-white py-6">
+        <div class="container mx-auto px-4 max-w-5xl">
+            <h1 class="text-2xl md:text-3xl font-bold mb-1">💳 Estado de Cuenta {{ cobro.cliente }}</h1>
+            <p class="text-blue-100">{{ hoy_str }} | •••{{ phone_display }}</p>
+        </div>
+    </div>
+
+    <div class="container mx-auto px-4 py-8 max-w-5xl">
+        <!-- Deuda | Pagado | Te falta -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+            <div class="bg-white rounded-lg shadow-md p-6 border-l-4 border-blue-500">
+                <p class="text-gray-600 text-sm font-medium mb-2">Deuda</p>
+                <div class="text-3xl font-bold text-blue-600">${{ "{:,.0f}".format(cobro.deuda) }}</div>
+            </div>
+            <div class="bg-white rounded-lg shadow-md p-6 border-l-4 border-green-500">
+                <p class="text-gray-600 text-sm font-medium mb-2">Pagado</p>
+                <div class="text-3xl font-bold text-green-600">${{ "{:,.0f}".format(cobro.pagado) }}</div>
+                <p class="text-xs text-gray-500 mt-2">{{ cobro.pagos|length }} pagos</p>
+            </div>
+            <div class="bg-white rounded-lg shadow-md p-6 border-l-4 {{ 'border-red-500' if cobro.saldo > 0 else 'border-green-500' }}">
+                <p class="text-gray-600 text-sm font-medium mb-2">Te falta</p>
+                <div class="text-3xl font-bold {{ 'text-red-600' if cobro.saldo > 0 else 'text-green-600' }}">${{ "{:,.0f}".format(cobro.saldo) }}</div>
+            </div>
+        </div>
+
+        {% if cobro.frecuencia_dias %}
+        <div class="bg-blue-50 border-l-4 border-blue-500 p-4 mb-6 rounded text-blue-800">
+            📅 Paga cada <strong>{{ cobro.frecuencia_dias }} días</strong> promedio
+        </div>
+        {% endif %}
+
+        <div class="flex flex-wrap gap-3 mb-8">
+            <a href="/download/excel/{{ phone_clean }}" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg text-center">📊 Descargar Excel</a>
+            <a href="/download/pdf/{{ phone_clean }}" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg text-center">📄 Descargar PDF</a>
+        </div>
+
+        <div class="bg-white rounded-lg shadow-lg p-6 mb-8">
+            <h2 class="text-xl font-bold text-gray-800 mb-4">Historial de Pagos</h2>
+            <div style="position: relative; height: 280px;"><canvas id="grafico"></canvas></div>
+        </div>
+
+        <div class="bg-white rounded-lg shadow-lg overflow-hidden">
+            <div class="bg-gray-50 px-6 py-4 border-b">
+                <h2 class="text-xl font-bold text-gray-800">Detalle de Pagos</h2>
+            </div>
+            <div class="overflow-x-auto">
+                <table class="w-full border-collapse text-sm">
+                    <thead>
+                        <tr class="bg-gray-100 border-b-2 border-gray-300">
+                            <th class="text-left px-4 py-3 font-semibold text-gray-700">#</th>
+                            <th class="text-left px-4 py-3 font-semibold text-gray-700">Fecha</th>
+                            <th class="text-right px-4 py-3 font-semibold text-gray-700">Pago</th>
+                            <th class="text-right px-4 py-3 font-semibold text-gray-700">Saldo Restante</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <tr class="bg-blue-50 border-b">
+                            <td class="px-4 py-3"></td>
+                            <td class="px-4 py-3 text-gray-700">Deuda inicial</td>
+                            <td class="px-4 py-3"></td>
+                            <td class="px-4 py-3 text-right font-semibold">${{ "{:,.2f}".format(cobro.deuda) }}</td>
+                        </tr>
+                        {% for f in cobro.filas %}
+                        <tr class="{{ 'bg-white' if loop.index is odd else 'bg-gray-50' }} border-b">
+                            <td class="px-4 py-3 text-gray-500">{{ loop.index }}</td>
+                            <td class="px-4 py-3 text-gray-700">{{ f.fecha or 'sin fecha' }}</td>
+                            <td class="px-4 py-3 text-right font-semibold text-green-700">${{ "{:,.2f}".format(f.monto) }}</td>
+                            <td class="px-4 py-3 text-right font-semibold {{ 'text-red-600' if f.saldo > 0 else 'text-green-600' }}">${{ "{:,.2f}".format(f.saldo) }}</td>
+                        </tr>
+                        {% endfor %}
+                        <tr class="bg-gray-200 font-bold">
+                            <td class="px-4 py-3"></td>
+                            <td class="px-4 py-3">TOTAL PAGADO</td>
+                            <td class="px-4 py-3 text-right">${{ "{:,.2f}".format(cobro.pagado) }}</td>
+                            <td class="px-4 py-3 text-right {{ 'text-red-600' if cobro.saldo > 0 else 'text-green-600' }}">${{ "{:,.2f}".format(cobro.saldo) }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        if (window.Chart) {
+            new Chart(document.getElementById('grafico'), {
+                data: {
+                    labels: {{ grafico_labels|tojson }},
+                    datasets: [
+                        {type: 'bar', label: 'Pago', data: {{ grafico_pagos|tojson }}, backgroundColor: '#10b981', yAxisID: 'y'},
+                        {type: 'line', label: 'Saldo restante', data: {{ grafico_saldos|tojson }}, borderColor: '#dc2626', backgroundColor: '#dc2626', tension: 0.2, yAxisID: 'y1'}
+                    ]
+                },
+                options: {
+                    maintainAspectRatio: false,
+                    scales: {
+                        y: {beginAtZero: true, position: 'left', title: {display: true, text: 'Pago $'}},
+                        y1: {beginAtZero: true, position: 'right', grid: {drawOnChartArea: false}, title: {display: true, text: 'Saldo $'}}
+                    }
+                }
+            });
+        }
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js').catch(() => {});
+        }
+    </script>
+</body>
+</html>
+"""
+
 @app.route("/dashboard/<phone>", methods=["GET"])
 def dashboard(phone):
     """Dashboard con vista de gastos y botones de descarga - Tailwind CSS + PWA"""
@@ -2138,30 +2230,21 @@ def dashboard(phone):
 
         logger.info(f"Dashboard request: phone={phone}, phone_clean={phone_clean}, phone_last10={phone_last10}, phone_display={phone_display}")
 
-        # Busca en gastos.json con formato normalizado
-        ruta_datos = f"/home/claude/yoly/data/{phone_clean}"
-        gastos = None
+        # Registro de pagos de una deuda: dashboard de estado de cuenta
+        cobro = obtener_cobro(phone_clean)
+        if cobro:
+            return render_template_string(DASHBOARD_COBRO_HTML,
+                cobro=cobro,
+                titulo=titulo_cobro(cobro),
+                phone_clean=phone_clean,
+                phone_display=phone_display,
+                hoy_str=datetime.now().strftime('%d/%m/%Y'),
+                grafico_labels=[f['fecha'] or f"Pago {i}" for i, f in enumerate(cobro['filas'], 1)],
+                grafico_pagos=[f['monto'] for f in cobro['filas']],
+                grafico_saldos=[f['saldo'] for f in cobro['filas']])
 
-        if os.path.exists(f"{ruta_datos}/gastos.json"):
-            gastos = cargar_gastos(phone_clean)
-
-        # Si no encuentra, intenta buscar por últimos 10 dígitos
-        if not gastos:
-            data_dir = '/home/claude/yoly/data'
-            found = False
-            if os.path.exists(data_dir):
-                for folder in os.listdir(data_dir):
-                    folder_clean = re.sub(r'[^0-9]', '', folder)
-                    folder_last10 = folder_clean[-10:] if len(folder_clean) >= 10 else folder_clean
-                    if folder_last10 == phone_last10:  # últimos 10 dígitos match
-                        gastos = cargar_gastos(folder)
-                        if gastos:
-                            phone_clean = folder_clean
-                            found = True
-                            break
-
-            if not gastos:
-                gastos = []
+        # Busca gastos por últimos 10 dígitos (carpetas whatsapp:+593... o 593...)
+        gastos = cargar_gastos_usuario(phone_clean)
 
         if not gastos:
             return render_template_string("""
@@ -2222,9 +2305,7 @@ def dashboard(phone):
         mes_actual = hoy.month
         anio_actual = hoy.year
 
-        gastos_mes = [g for g in gastos if 'fecha' in g]
-        gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
-                      and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
+        gastos_mes = gastos_del_mes(phone_clean)
 
         # Agrupar por categoría
         por_categoria = {}
@@ -2343,10 +2424,10 @@ def dashboard(phone):
 
         <!-- Action Buttons -->
         <div class="flex flex-wrap gap-3 mb-8 fadeIn" style="animation-delay: 200ms;">
-            <a href="/dashboard/{{ phone_clean }}/excel" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+            <a href="/download/excel/{{ phone_clean }}" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
                 📊 Descargar Excel
             </a>
-            <a href="/dashboard/{{ phone_clean }}/pdf" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+            <a href="/download/pdf/{{ phone_clean }}" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
                 📄 Descargar PDF
             </a>
             <button onclick="compartir()" class="flex-1 md:flex-none bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105">
@@ -2432,39 +2513,37 @@ def dashboard(phone):
         logger.error(f"Error en dashboard: {e}", exc_info=True)
         return f"Error al cargar el dashboard: {str(e)}", 500
 
+@app.route("/download/excel/<phone>", methods=["GET"])
 @app.route("/dashboard/<phone>/excel", methods=["GET"])
 def descargar_excel(phone):
-    """Descarga los gastos en Excel"""
-    if not HAS_PANDAS and not HAS_OPENPYXL:
-        return "Excel no disponible (instala pandas u openpyxl)", 501
-
+    """Descarga Excel (openpyxl): hojas Pagos y Resumen si es cobro de deuda"""
+    if not HAS_OPENPYXL:
+        return "Excel no disponible (falta openpyxl)", 501
     try:
-        # Normalizar teléfono
         phone_clean = normalizar_telefono(phone)
         excel_path = generar_excel_gastos(phone_clean)
         if not excel_path or not os.path.exists(excel_path):
-            return "No hay gastos para descargar", 404
-
+            return "No hay datos para descargar todavía", 404
         with open(excel_path, 'rb') as f:
             datos = f.read()
-
+        nombre = f"estado_cuenta_{phone_clean[-4:]}.xlsx" if obtener_cobro(phone_clean) else f"gastos_{phone_clean[-4:]}.xlsx"
         return Response(datos, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       headers={"Content-Disposition": f"attachment; filename=gastos_{phone_clean}.xlsx"})
+                        headers={"Content-Disposition": f"attachment; filename={nombre}"})
     except Exception as e:
         logger.error(f"Error descargando Excel: {e}", exc_info=True)
         return f"Error al generar Excel: {str(e)}", 500
 
+@app.route("/download/pdf/<phone>", methods=["GET"])
 @app.route("/dashboard/<phone>/pdf", methods=["GET"])
 def descargar_pdf(phone):
-    """Descarga los gastos en PDF"""
+    """Descarga PDF con tabla de pagos (o gastos del mes)"""
     try:
-        # Normalizar teléfono
         phone_clean = normalizar_telefono(phone)
         pdf_path = generar_pdf_dashboard(phone_clean)
         if not pdf_path or not os.path.exists(pdf_path):
-            return "No hay gastos para descargar", 404
-
-        return servir_pdf(pdf_path, f'gastos_{phone_clean}.pdf')
+            return "No hay datos para descargar todavía", 404
+        nombre = f"estado_cuenta_{phone_clean[-4:]}.pdf" if obtener_cobro(phone_clean) else f"gastos_{phone_clean[-4:]}.pdf"
+        return servir_pdf(pdf_path, nombre)
     except Exception as e:
         logger.error(f"Error descargando PDF: {e}", exc_info=True)
         return f"Error al generar PDF: {str(e)}", 500
@@ -3303,18 +3382,13 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
         palabras_balance = ['balance', 'alan', 'debo', 'cuanto debo', 'cuanto falta', 'deuda', 'adeudo', 'que debo']
         tiene_intent_balance = any(palabra in msg_lower for palabra in palabras_balance)
 
-        if tiene_intent_balance and phone_clean in memoria_usuarios:
-            datos = memoria_usuarios[phone_clean]
-            if datos.get('tipo') == 'deuda':
-                deuda = datos.get('deuda', 0)
-                pagado = datos.get('pagado', 0)
-                balance = datos.get('balance', 0)
-                fecha = datos.get('fecha_final', '')
-
-                respuesta_balance = f"""💳 Según lo que registraste:
-Deuda: ${deuda}
-Pagado (hasta {fecha}): ${pagado}
-Te falta: ${balance}
+        if tiene_intent_balance:
+            cobro = obtener_cobro(phone_clean)
+            if cobro:
+                respuesta_balance = f"""💳 Según lo que registraste ({cobro['cliente']}):
+Deuda: ${cobro['deuda']:,.0f}
+Pagado ({len(cobro['pagos'])} pagos): ${cobro['pagado']:,.0f}
+Te falta: ${cobro['saldo']:,.0f}
 
 Link: {server_url}/dashboard/{phone_clean}"""
 
@@ -3350,23 +3424,17 @@ Los datos están listos para descargar."""
 
             # PRIORIDAD 2: Respuesta a "¿balance?" (código existente)
             elif "balance" in ultima_pregunta:
-                datos = memoria_usuarios[phone_clean]
-                if datos.get('tipo') == 'deuda':
-                    deuda = datos.get('deuda', 0)
-                    pagado = datos.get('pagado', 0)
-                    balance = datos.get('balance', 0)
-                    fecha = datos.get('fecha_final', '')
-
+                cobro = obtener_cobro(phone_clean)
+                if cobro:
                     respuesta_balance = f"""Perfecto.
-Deuda original: ${deuda:,.0f}
-Pagado: ${pagado:,.0f}
-Te falta: ${balance:,.0f}
+Deuda original: ${cobro['deuda']:,.0f}
+Pagado: ${cobro['pagado']:,.0f}
+Te falta: ${cobro['saldo']:,.0f}
 
 📊 Documentar aquí: {server_url}/dashboard/{phone_clean}"""
                     resp.message(respuesta_balance)
-                    if phone_clean in memoria_usuarios:
-                        memoria_usuarios[phone_clean]["ultima_pregunta"] = ""
-                        guardar_memoria(memoria_usuarios)
+                    memoria_usuarios[phone_clean]["ultima_pregunta"] = ""
+                    guardar_memoria(memoria_usuarios)
                     return
 
         if msg_lower.strip() in confirmacion_palabras and from_number in temp_gastos:
@@ -3475,7 +3543,7 @@ Te falta: ${balance:,.0f}
                 try:
                     pdf_path = generar_pdf_dashboard(phone_clean)
                     if pdf_path and os.path.exists(pdf_path):
-                        pdf_url = f"{server_url}/dashboard/{phone_clean}/pdf"
+                        pdf_url = f"{server_url}/download/pdf/{phone_clean}"
                         twilio_client.messages.create(
                             from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
                             to=from_number,
@@ -3488,13 +3556,13 @@ Te falta: ${balance:,.0f}
                     logger.error(f"Error generando PDF: {e}")
 
             if 'excel' in msg_lower:
-                if not HAS_PANDAS:
+                if not HAS_OPENPYXL:
                     resp.message("Excel no está disponible en este momento. Usa el PDF en su lugar.")
                     return
                 try:
                     excel_path = generar_excel_gastos(phone_clean)
                     if excel_path and os.path.exists(excel_path):
-                        excel_url = f"{server_url}/dashboard/{phone_clean}/excel"
+                        excel_url = f"{server_url}/download/excel/{phone_clean}"
                         resp.message(f"Tu Excel está listo: {excel_url}")
                         return
                 except Exception as e:
