@@ -30,6 +30,7 @@ print("[STARTUP] Initializing Yoly Bot...")
 required_env_vars = {
     'TWILIO_ACCOUNT_SID': 'Twilio Account SID',
     'TWILIO_AUTH_TOKEN': 'Twilio Auth Token',
+    'TWILIO_WHATSAPP_NUMBER': 'Twilio WhatsApp Number',
     'ANTHROPIC_API_KEY': 'Anthropic API Key'
 }
 
@@ -773,7 +774,7 @@ def whatsapp():
                     logger.info(f"Goals report generated: {pdf_url}")
 
                     twilio_client.messages.create(
-                        from_="whatsapp:+14155552671",
+                        from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
                         to=from_number,
                         body="📊 Aquí está tu informe de metas financieras:",
                         media_url=[pdf_url]
@@ -830,7 +831,7 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
                 logger.info(f"Expense report generated: {pdf_url}")
 
                 twilio_client.messages.create(
-                    from_="whatsapp:+14155552671",
+                    from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
                     to=from_number,
                     body="Aquí está tu informe de gastos:",
                     media_url=[pdf_url]
@@ -858,7 +859,7 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
                 logger.info(f"Budget analysis generated: {pdf_url}")
 
                 twilio_client.messages.create(
-                    from_="whatsapp:+14155552671",
+                    from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
                     to=from_number,
                     body="📊 Aquí está tu análisis de presupuesto mensual con recomendaciones del asesor financiero de IA:",
                     media_url=[pdf_url]
