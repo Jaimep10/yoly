@@ -100,6 +100,8 @@ def responder(resp, texto):
 # Si Yoly tarda más que esto, contesta "ya te respondo" y manda la respuesta
 # después por la API de Twilio.
 ESPERA_MAX_SEGUNDOS = 10
+PREGUNTA_TABLA = "¿Te mando tabla al dashboard?\nResponde con el número:\n1️⃣ Sí\n2️⃣ No"
+
 MENSAJE_ESPERA = "⏳ Recibí tu mensaje. Lo estoy procesando, en unos segundos te respondo."
 
 def ruta_temporal(pdf_path):
@@ -739,7 +741,7 @@ No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
             respuesta = f"Leí {len(pagos)} pagos de {cliente}:\n{pagos_str} = ${pagado:,.0f}"
             if deuda:
                 respuesta += f"\nDeuda original: ${deuda:,.0f}\nTe falta: ${deuda - pagado:,.0f}"
-            return respuesta + "\n\n¿Te mando tabla al dashboard?"
+            return respuesta + "\n\n" + PREGUNTA_TABLA
 
         # Factura/recibo normal: un solo gasto
         if pagado <= 0:
@@ -764,7 +766,7 @@ No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
 
-        respuesta = f"Leí {cliente}: ${pagado:,.0f}. ¿Te mando tabla al dashboard?"
+        respuesta = f"Leí {cliente}: ${pagado:,.0f}.\n\n" + PREGUNTA_TABLA
         memoria_usuarios.setdefault(phone_clean, {})['ultima_pregunta'] = 'dashboard'
         guardar_memoria(memoria_usuarios)
         return respuesta
@@ -3467,6 +3469,15 @@ def mensaje_link_dashboard(server_url, phone_clean):
 
 Los datos están listos para descargar."""
 
+def opcion_numero(msg_lower):
+    """Devuelve 1 o 2 si el usuario contestó con el número de la opción ("1", "1.", "1️⃣", "uno")."""
+    texto = msg_lower.strip().rstrip('.!)').replace('\ufe0f', '').replace('\u20e3', '').strip()
+    if texto in ('1', 'uno', 'opcion 1', 'opción 1'):
+        return 1
+    if texto in ('2', 'dos', 'opcion 2', 'opción 2'):
+        return 2
+    return None
+
 def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     """Arma la respuesta de Yoly. `resp` junta los textos (ver Salida)."""
     global temp_gastos, temp_productos, memoria_usuarios
@@ -3502,6 +3513,17 @@ Link: {server_url}/dashboard/{phone_clean}"""
         # y lo demás caía a Claude que respondía "¿qué necesitas?").
         # Si pide PDF o Excel, lo atiende el bloque de descargas de más abajo.
         hay_confirmacion_pendiente = from_number in temp_gastos or from_number in temp_productos
+
+        # Respuesta con número a "¿Te mando tabla? 1 Sí / 2 No". No depende de la memoria
+        # (que se pierde si Render reinicia): "1" siempre manda el link.
+        opcion = opcion_numero(msg_lower)
+        if opcion and not hay_confirmacion_pendiente:
+            if opcion == 1:
+                resp.message(mensaje_link_dashboard(server_url, phone_clean))
+            else:
+                resp.message("Listo 👍 Cuando quieras la tabla, escríbeme 1 o \"tabla\".")
+            limpiar_ultima_pregunta(phone_clean)
+            return
         pide_archivo = 'pdf' in msg_lower or 'excel' in msg_lower
         afirmativo = es_afirmativo(msg_lower)
         if afirmativo and not hay_confirmacion_pendiente and not pide_archivo:
@@ -3535,7 +3557,7 @@ Te falta: ${cobro['saldo']:,.0f}
         if (msg_lower.strip().rstrip('.!') in rechazo_palabras and not hay_confirmacion_pendiente
                 and "dashboard" in obtener_ultima_pregunta(phone_clean)):
             limpiar_ultima_pregunta(phone_clean)
-            resp.message("Listo 👍 Cuando quieras la tabla, escríbeme \"tabla\" o \"link\".")
+            resp.message("Listo 👍 Cuando quieras la tabla, escríbeme 1 o \"tabla\".")
             return
 
         if msg_lower.strip() in confirmacion_palabras and from_number in temp_gastos:

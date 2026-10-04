@@ -78,3 +78,23 @@ def test_balance_sigue_funcionando(entorno):
 
 def test_pedir_tabla_sin_pregunta(entorno):
     assert "/dashboard/" in enviar("mándame la tabla")
+
+
+@pytest.mark.parametrize("texto", ["1", "1.", "1️⃣", " 1 ", "uno"])
+def test_opcion_1_manda_link_aunque_se_pierda_la_memoria(entorno, texto):
+    # Sin pregunta guardada ni datos (como después de un reinicio de Render)
+    assert f"https://yoly.test/dashboard/{PHONE}" in enviar(texto)
+    entorno.messages.create.assert_not_called()
+
+
+@pytest.mark.parametrize("texto", ["2", "2️⃣", "dos"])
+def test_opcion_2_no_manda_link(entorno, texto):
+    pregunta_tabla_pendiente()
+    respuesta = enviar(texto)
+    assert "/dashboard/" not in respuesta
+    entorno.messages.create.assert_not_called()
+    assert main.obtener_ultima_pregunta(PHONE) == ""
+
+
+def test_pregunta_tiene_opciones():
+    assert "1️⃣ Sí" in main.PREGUNTA_TABLA and "2️⃣ No" in main.PREGUNTA_TABLA
