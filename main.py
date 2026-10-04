@@ -26,6 +26,9 @@ from requests.auth import HTTPBasicAuth
 from PIL import Image as PILImage
 from groq import Groq
 import zipfile
+import html
+from urllib.parse import quote_plus
+import precios
 import io
 try:
     import pandas as pd
@@ -648,7 +651,7 @@ def procesar_foto_inteligente(media_url, telefono):
         # CRÍTICO: Vision SOLO extrae números en JSON, NO suma
         response = client.messages.create(
             model=MODELO_CLAUDE,
-            max_tokens=1500,
+            max_tokens=3000,
             messages=[{
                 "role": "user",
                 "content": [
@@ -673,8 +676,21 @@ Devuelve SOLO JSON valido, sin explicaciones:
     {"fecha": "2026-01-03", "monto": 200, "metodo": "efectivo", "nota": ""},
     {"fecha": "2026-01-15", "monto": 120, "metodo": "transferencia", "nota": ""}
   ],
-  "descripcion": "resumen breve de qué es"
+  "descripcion": "resumen breve de qué es",
+  "tipo": "libreta_cobros",
+  "tienda": null,
+  "ciudad": null,
+  "articulos": []
 }
+
+Si es una FACTURA o TICKET DE COMPRA con productos (supermercado, farmacia, ferretería...):
+  "tipo": "factura_compra",
+  "tienda": "Supermaxi",
+  "ciudad": "Quito",
+  "articulos": [
+    {"producto": "Arroz blanco", "producto_norm": "arroz blanco", "marca": "Balu", "medida": "2kg", "cantidad": 1, "precio": 3.50, "categoria": "granos"}
+  ]
+y en "pagos" pon el TOTAL de la factura como un solo pago.
 
 Reglas:
 - pagos: un objeto por cada pago individual, en el mismo orden de la imagen.
@@ -684,6 +700,9 @@ Reglas:
 - nota: si hay nota como "banco X" guardala en nota.
 - deuda_total: solo si aparece en la imagen.
 - Si es una factura o ticket normal con un solo total, pon ese total como un solo pago.
+- tipo: "libreta_cobros" (cuaderno de pagos/deudas), "factura_compra" (ticket con productos y precios) u "otro".
+- articulos: SOLO en factura_compra, una linea por producto. precio = precio UNITARIO (si dice "2 x 1.75  3.50", precio 1.75 y cantidad 2). producto_norm en minusculas, sin acentos, sin marca ni medida. marca y medida solo si aparecen (si no, ""). Si el precio de un producto no se lee claro, pon precio null.
+- ciudad: solo si aparece impresa en la factura (direccion de la tienda). Si no aparece, null. No la adivines.
 
 No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
                     }
@@ -721,8 +740,10 @@ No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
 
         phone_clean = normalizar_telefono(telefono)
 
+        es_compra = vision_response.get('tipo') == 'factura_compra'
+
         # Registro de pagos de una deuda: se guarda como LISTA de pagos, no como 1 gasto
-        if deuda > 0 or len(pagos) > 1:
+        if not es_compra and (deuda > 0 or len(pagos) > 1):
             datos = {
                 "tipo": "cobro_deuda",
                 "cliente": cliente,
@@ -766,7 +787,18 @@ No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
 
-        respuesta = f"Leí {cliente}: ${pagado:,.0f}.\n\n" + PREGUNTA_TABLA
+        respuesta = f"Leí {cliente}: ${pagado:,.0f}.\n\n"
+        if es_compra:
+            # Factura de compra: sus productos alimentan el comparador de precios de la ciudad
+            try:
+                texto_precios = registrar_precios_factura(
+                    telefono, vision_response.get('tienda') or cliente, vision_response.get('ciudad'),
+                    vision_response.get('articulos'), fecha_gasto)
+                if texto_precios:
+                    respuesta += texto_precios + "\n\n"
+            except Exception as e:
+                logger.error(f"Error guardando precios de la factura: {e}", exc_info=True)
+        respuesta += PREGUNTA_TABLA
         memoria_usuarios.setdefault(phone_clean, {})['ultima_pregunta'] = 'dashboard'
         guardar_memoria(memoria_usuarios)
         return respuesta
@@ -2188,6 +2220,7 @@ DASHBOARD_COBRO_HTML = """
         <div class="flex flex-wrap gap-3 mb-8">
             <a href="/download/excel/{{ phone_clean }}" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg text-center">📊 Descargar Excel</a>
             <a href="/download/pdf/{{ phone_clean }}" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg text-center">📄 Descargar PDF</a>
+            <a href="/dashboard/{{ phone_clean }}/precios" class="flex-1 md:flex-none bg-amber-500 hover:bg-amber-600 text-white font-bold py-3 px-6 rounded-lg text-center">🛒 Comparar precios</a>
         </div>
 
         <div class="bg-white rounded-lg shadow-lg p-6 mb-8">
@@ -2474,6 +2507,9 @@ def dashboard(phone):
             <a href="/download/pdf/{{ phone_clean }}" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
                 📄 Descargar PDF
             </a>
+            <a href="/dashboard/{{ phone_clean }}/precios" class="flex-1 md:flex-none bg-amber-500 hover:bg-amber-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+                🛒 Comparar precios
+            </a>
             <button onclick="compartir()" class="flex-1 md:flex-none bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105">
                 📤 Compartir
             </button>
@@ -2592,237 +2628,153 @@ def descargar_pdf(phone):
         logger.error(f"Error descargando PDF: {e}", exc_info=True)
         return f"Error al generar PDF: {str(e)}", 500
 
+DASHBOARD_PRECIOS_CSS = """
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f5f5f5; margin: 0; padding: 16px; color: #1f2937; }
+.container { max-width: 1000px; margin: 0 auto; background: white; padding: 24px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+h1 { color: #1e40af; margin-top: 0; }
+h2 { margin-top: 32px; color: #111827; }
+.sub { color: #6b7280; margin-top: -8px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin: 20px 0; }
+.stat-card { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 16px; border-radius: 8px; text-align: center; }
+.stat-card h3 { margin: 0 0 8px 0; font-size: 13px; opacity: 0.9; }
+.stat-card .value { font-size: 26px; font-weight: bold; }
+.tabla { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 14px; }
+th { background: #1e40af; color: white; padding: 10px; text-align: left; font-weight: 600; white-space: nowrap; }
+td { padding: 10px; border-bottom: 1px solid #eee; vertical-align: top; }
+.price { font-weight: bold; color: #16a34a; white-space: nowrap; }
+.caro { color: #dc2626; font-weight: bold; white-space: nowrap; }
+.chico { font-size: 12px; color: #6b7280; }
+.btn { display: inline-block; background: #f59e0b; color: white; text-decoration: none; padding: 6px 10px; border-radius: 6px; font-size: 12px; font-weight: bold; white-space: nowrap; }
+.btn:hover { background: #d97706; }
+.barra { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.barra .nombre { width: 140px; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.barra .fondo { flex: 1; background: #eef2ff; border-radius: 4px; }
+.barra .relleno { background: #6366f1; color: white; font-size: 12px; padding: 4px 6px; border-radius: 4px; white-space: nowrap; }
+.barra .relleno.min { background: #16a34a; }
+.vacio { text-align: center; color: #6b7280; padding: 24px; background: #f9fafb; border-radius: 8px; }
+form { margin: 8px 0 0; }
+select { padding: 6px; border-radius: 6px; border: 1px solid #d1d5db; max-width: 100%; }
+a.volver { color: #1e40af; }
+"""
+
+
+def _e(texto):
+    return html.escape(str(texto if texto is not None else ''))
+
+
 @app.route("/dashboard/<phone>/precios", methods=["GET"])
 def dashboard_precios(phone):
-    """Dashboard con biblioteca de precios y comparaciones"""
+    """Biblioteca de precios del usuario + comparativas de su ciudad (datos de todos los usuarios)."""
     try:
         phone_clean = normalizar_telefono(phone)
-        ruta = f"/home/claude/yoly/data/{phone_clean}/biblioteca_precios.json"
+        ruta = f"{DATA_DIR}/{phone_clean}/biblioteca_precios.json"
+        mis_precios = []
+        if os.path.exists(ruta):
+            try:
+                with open(ruta, 'r', encoding='utf-8') as f:
+                    mis_precios = json.load(f)
+            except Exception:
+                mis_precios = []
 
-        if not os.path.exists(ruta):
-            return render_template_string("""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>Mi Biblioteca de Precios</title>
-                <style>
-                    body { font-family: Arial; margin: 20px; background: #f5f5f5; }
-                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
-                    h1 { color: #333; }
-                    .empty { text-align: center; color: #999; padding: 40px; }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>📚 Mi Biblioteca de Precios</h1>
-                    <div class="empty">
-                        <p>No tienes precios guardados aún.</p>
-                        <p>Envía una foto de un ticket o factura para empezar a comparar precios.</p>
-                    </div>
-                </div>
-            </body>
-            </html>
-            """)
+        ciudad = (precios.normalizar_ciudad(request.args.get('ciudad'))[1]
+                  or precios.ciudad_usuario(DATA_DIR, phone_clean))
+        comparativas = precios.comparativas_ciudad(DATA_DIR, ciudad) if ciudad else []
+        ranking = precios.ranking_tiendas(DATA_DIR, ciudad) if ciudad else []
+        muestras_ciudad = precios.cargar_ciudad(DATA_DIR, precios.normalizar_ciudad(ciudad)[0]) if ciudad else []
 
-        try:
-            with open(ruta, 'r', encoding='utf-8') as f:
-                precios = json.load(f)
-        except:
-            precios = []
+        partes = [f"""<!DOCTYPE html>
+<html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comparador de Precios</title><style>{DASHBOARD_PRECIOS_CSS}</style></head>
+<body><div class="container">
+<p><a class="volver" href="/dashboard/{_e(phone_clean)}">← Volver a mi panel</a></p>
+<h1>🛒 Comparador de Precios</h1>"""]
 
-        if not precios:
-            return render_template_string("""
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <meta charset="utf-8">
-                <meta name="viewport" content="width=device-width, initial-scale=1">
-                <title>Mi Biblioteca de Precios</title>
-                <style>
-                    body { font-family: Arial; margin: 20px; background: #f5f5f5; }
-                    .container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; }
-                    h1 { color: #333; }
-                    .empty { text-align: center; color: #999; padding: 40px; }
-                </style>
-            </head>
-            <body>
-                <div class="container">
-                    <h1>📚 Mi Biblioteca de Precios</h1>
-                    <div class="empty">
-                        <p>No tienes precios guardados aún.</p>
-                    </div>
-                </div>
-            </body>
-            </html>
-            """)
+        if not ciudad:
+            partes.append("""<div class="vacio"><p>📍 Aún no sé en qué ciudad compras.</p>
+<p>Escríbele a Yoly por WhatsApp: <strong>mi ciudad es Quito</strong> (con tu ciudad) y aquí verás
+dónde es más barato cada producto en tu ciudad.</p></div>""")
+        else:
+            partes.append(f"""<p class="sub">Precios de facturas reales de usuarios en <strong>{_e(ciudad)}</strong>
+(últimos {precios.DIAS_VIGENCIA} días)</p>
+<div class="stats">
+<div class="stat-card"><h3>Precios en {_e(ciudad)}</h3><div class="value">{len(muestras_ciudad)}</div></div>
+<div class="stat-card"><h3>Tiendas</h3><div class="value">{len({m.get('tienda') for m in muestras_ciudad})}</div></div>
+<div class="stat-card"><h3>Productos comparables</h3><div class="value">{len(comparativas)}</div></div>
+</div>
+<h2>📊 Comparativas en {_e(ciudad)}</h2>""")
+            if not comparativas:
+                partes.append("""<div class="vacio">Todavía no hay un mismo producto en 2 tiendas distintas de tu ciudad.
+Cada factura que mandes a Yoly suma precios. 📸</div>""")
+            else:
+                partes.append("""<div class="tabla"><table><tr><th>Producto</th><th>Más barato</th><th>Más caro</th>
+<th>Diferencia</th><th>Tiendas</th><th></th></tr>""")
+                for comp in comparativas[:60]:
+                    barato, caro = comp['tiendas'][0], comp['tiendas'][-1]
+                    mapa = "https://www.google.com/maps/search/?api=1&query=" + quote_plus(f"{barato['tienda']} {ciudad}")
+                    grafico = (f"/dashboard/{quote_plus(phone_clean)}/precios?producto={quote_plus(comp['clave'])}"
+                               f"&ciudad={quote_plus(ciudad)}#grafico")
+                    partes.append(f"""<tr><td><a href="{_e(grafico)}"><strong>{_e(comp['producto'])}</strong></a>
+<div class="chico">{_e(comp['medida'] or 'sin medida')}</div></td>
+<td><span class="price">${barato['precio']:.2f}</span><div class="chico">{_e(barato['tienda'])}</div></td>
+<td><span class="caro">${caro['precio']:.2f}</span><div class="chico">{_e(caro['tienda'])}</div></td>
+<td class="price">${comp['ahorro']:.2f}</td><td>{len(comp['tiendas'])}</td>
+<td><a class="btn" href="{_e(mapa)}" target="_blank" rel="noopener">💰 Ahorrar aquí</a></td></tr>""")
+                partes.append("</table></div>")
 
-        # Agrupar por producto_norm
-        by_product = {}
-        for p in precios:
-            key = p.get('producto_norm', 'otro')
-            if key not in by_product:
-                by_product[key] = []
-            by_product[key].append(p)
+                # Gráfico: precio promedio del artículo en cada tienda de la ciudad
+                elegido = next((c for c in comparativas if c['clave'] == request.args.get('producto')), comparativas[0])
+                opciones = "".join(
+                    f'<option value="{_e(c["clave"])}"{" selected" if c is elegido else ""}>'
+                    f'{_e(c["producto"])} {_e(c["medida"])}</option>' for c in comparativas[:60])
+                maximo = max(t['precio_prom'] for t in elegido['tiendas']) or 1
+                minimo = min(t['precio_prom'] for t in elegido['tiendas'])
+                partes.append(f"""<h2 id="grafico">📈 Precio promedio de {_e(elegido['producto'])} {_e(elegido['medida'])} en tu ciudad</h2>
+<form method="get">{'<input type="hidden" name="ciudad" value="' + _e(request.args.get('ciudad')) + '">' if request.args.get('ciudad') else ''}<select name="producto" onchange="this.form.submit()">{opciones}</select></form>""")
+                for t in sorted(elegido['tiendas'], key=lambda t: t['precio_prom']):
+                    ancho = max(18, round(t['precio_prom'] / maximo * 100))
+                    clase = "relleno min" if t['precio_prom'] == minimo else "relleno"
+                    partes.append(f"""<div class="barra"><div class="nombre">{_e(t['tienda'])}</div>
+<div class="fondo"><div class="{clase}" style="width:{ancho}%">${t['precio_prom']:.2f}
+<span style="opacity:.8">({t['muestras']})</span></div></div></div>""")
 
-        # Calcular estadísticas
-        stats = {}
-        for key, prods in by_product.items():
-            precios_list = [p.get('precio', 0) for p in prods]
-            stats[key] = {
-                'producto': prods[0].get('producto', key),
-                'minimo': min(precios_list),
-                'maximo': max(precios_list),
-                'promedio': round(sum(precios_list) / len(precios_list), 2),
-                'tiendas': list(set(p.get('tienda', '') for p in prods)),
-                'compras': len(prods),
-                'ultima_fecha': prods[-1].get('fecha', '')
-            }
+            if ranking:
+                partes.append(f"<h2>🏆 Tiendas más baratas en {_e(ciudad)}</h2><div class=\"tabla\"><table>"
+                              "<tr><th>#</th><th>Tienda</th><th>Frente al promedio</th><th>Productos comparados</th></tr>")
+                for i, r in enumerate(ranking, 1):
+                    diferencia = (r['indice'] - 1) * 100
+                    clase = "price" if diferencia < 0 else "caro"
+                    partes.append(f"<tr><td>{i}</td><td>{_e(r['tienda'])}</td>"
+                                  f"<td class=\"{clase}\">{diferencia:+.0f}%</td><td>{r['productos']}</td></tr>")
+                partes.append("</table></div>")
 
-        # HTML del dashboard
-        html_content = f"""
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <meta charset="utf-8">
-            <meta name="viewport" content="width=device-width, initial-scale=1">
-            <title>Mi Biblioteca de Precios</title>
-            <style>
-                body {{
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    background: #f5f5f5;
-                    margin: 0;
-                    padding: 20px;
-                }}
-                .container {{
-                    max-width: 1000px;
-                    margin: 0 auto;
-                    background: white;
-                    padding: 30px;
-                    border-radius: 10px;
-                    box-shadow: 0 2px 10px rgba(0,0,0,0.1);
-                }}
-                h1 {{
-                    color: #1e40af;
-                    margin-top: 0;
-                    display: flex;
-                    align-items: center;
-                    gap: 10px;
-                }}
-                .stats {{
-                    display: grid;
-                    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-                    gap: 15px;
-                    margin-bottom: 30px;
-                }}
-                .stat-card {{
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    color: white;
-                    padding: 20px;
-                    border-radius: 8px;
-                    text-align: center;
-                }}
-                .stat-card h3 {{
-                    margin: 0 0 10px 0;
-                    font-size: 14px;
-                    opacity: 0.9;
-                }}
-                .stat-card .value {{
-                    font-size: 28px;
-                    font-weight: bold;
-                }}
-                table {{
-                    width: 100%;
-                    border-collapse: collapse;
-                }}
-                th {{
-                    background: #1e40af;
-                    color: white;
-                    padding: 12px;
-                    text-align: left;
-                    font-weight: 600;
-                }}
-                td {{
-                    padding: 12px;
-                    border-bottom: 1px solid #eee;
-                }}
-                tr:hover {{
-                    background: #f9f9f9;
-                }}
-                .price {{
-                    font-weight: bold;
-                    color: #16a34a;
-                }}
-                .tiendas {{
-                    font-size: 12px;
-                    color: #666;
-                }}
-            </style>
-        </head>
-        <body>
-            <div class="container">
-                <h1>📚 Mi Biblioteca de Precios</h1>
+        # Biblioteca privada: lo que compró este usuario
+        partes.append("<h2>📚 Mis compras</h2>")
+        if not mis_precios:
+            partes.append('<div class="vacio">Envía a Yoly una foto de tu factura de compra para empezar.</div>')
+        else:
+            por_producto = {}
+            for p in mis_precios:
+                por_producto.setdefault(p.get('producto_norm') or p.get('producto', 'otro'), []).append(p)
+            partes.append("""<div class="tabla"><table><tr><th>Producto</th><th>Precio Min</th><th>Precio Max</th>
+<th>Promedio</th><th>Tiendas</th><th>Compras</th></tr>""")
+            for clave in sorted(por_producto):
+                prods = por_producto[clave]
+                lista = [precios.a_precio(p.get('precio')) or 0 for p in prods]
+                tiendas = sorted({p.get('tienda', '') for p in prods})
+                partes.append(f"""<tr><td><strong>{_e(prods[0].get('producto', clave))}</strong>
+<div class="chico">{_e(prods[-1].get('medida', ''))}</div></td>
+<td class="price">${min(lista):.2f}</td><td class="price">${max(lista):.2f}</td>
+<td class="price">${sum(lista) / len(lista):.2f}</td><td class="chico">{_e(", ".join(tiendas))}</td>
+<td>{len(prods)}</td></tr>""")
+            partes.append("</table></div>")
 
-                <div class="stats">
-                    <div class="stat-card">
-                        <h3>Productos Diferentes</h3>
-                        <div class="value">{len(stats)}</div>
-                    </div>
-                    <div class="stat-card">
-                        <h3>Total de Compras</h3>
-                        <div class="value">{len(precios)}</div>
-                    </div>
-                    <div class="stat-card">
-                        <h3>Tiendas Diferentes</h3>
-                        <div class="value">{len(set(p.get('tienda', '') for p in precios))}</div>
-                    </div>
-                </div>
-
-                <h2>Comparación de Precios</h2>
-                <table>
-                    <tr>
-                        <th>Producto</th>
-                        <th>Precio Min</th>
-                        <th>Precio Max</th>
-                        <th>Promedio</th>
-                        <th>Tiendas</th>
-                        <th>Compras</th>
-                    </tr>
-        """
-
-        for producto_norm in sorted(stats.keys()):
-            s = stats[producto_norm]
-            tiendas_str = ", ".join(s['tiendas'][:2])
-            if len(s['tiendas']) > 2:
-                tiendas_str += f" +{len(s['tiendas'])-2}"
-
-            html_content += f"""
-                    <tr>
-                        <td><strong>{s['producto']}</strong></td>
-                        <td class="price">${s['minimo']:.2f}</td>
-                        <td class="price">${s['maximo']:.2f}</td>
-                        <td class="price">${s['promedio']:.2f}</td>
-                        <td class="tiendas">{tiendas_str}</td>
-                        <td>{s['compras']}</td>
-                    </tr>
-            """
-
-        html_content += """
-                </table>
-                <div style="text-align: center; margin-top: 30px; color: #999; font-size: 12px;">
-                    <p>Última actualización: """ + precios[-1].get('fecha', '')[:10] + """</p>
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-
-        return render_template_string(html_content)
+        partes.append("</div></body></html>")
+        return Response("".join(partes), mimetype="text/html")
 
     except Exception as e:
         logger.error(f"Error en dashboard de precios: {e}", exc_info=True)
-        return f"Error al cargar dashboard: {str(e)}", 500
+        return "Error al cargar el comparador de precios", 500
 
 @app.route("/api/gastos/<phone>", methods=["GET"])
 def api_gastos(phone):
@@ -3285,7 +3237,7 @@ def guardar_en_biblioteca(telefono, producto_dict, tienda, ciudad):
     """Guarda un producto en la biblioteca privada de precios del usuario"""
     try:
         phone_clean = normalizar_telefono(telefono)
-        ruta = f"/home/claude/yoly/data/{phone_clean}/biblioteca_precios.json"
+        ruta = f"{DATA_DIR}/{phone_clean}/biblioteca_precios.json"
 
         # Crear directorio si no existe
         os.makedirs(os.path.dirname(ruta), exist_ok=True)
@@ -3311,6 +3263,7 @@ def guardar_en_biblioteca(telefono, producto_dict, tienda, ciudad):
             "marca": producto_dict.get('marca', ''),
             "medida": producto_dict.get('medida', ''),
             "categoria": producto_dict.get('categoria', ''),
+            "medida_norm": producto_dict.get('medida_norm', ''),
             "fecha": datetime.now().isoformat()
         }
 
@@ -3325,94 +3278,73 @@ def guardar_en_biblioteca(telefono, producto_dict, tienda, ciudad):
         logger.error(f"Error guardando en biblioteca: {e}", exc_info=True)
         return False
 
-def guardar_en_mercado_global(producto_dict, tienda, ciudad):
-    """Guarda un producto en el mercado global anónimo (sin phone)"""
-    try:
-        ruta = "/home/claude/yoly/data/mercado_global/precios.json"
+def registrar_precios_factura(telefono, tienda, ciudad_factura, articulos_raw, fecha_compra=None):
+    """Guarda los productos de una factura de compra en el comparador de su ciudad
+    y devuelve el mensaje de Yoly (dónde estaba más barato). "" si no hay productos."""
+    phone_clean = normalizar_telefono(telefono)
+    articulos_raw = articulos_raw if isinstance(articulos_raw, list) else []
+    articulos = [a for a in (precios.limpiar_articulo(x) for x in articulos_raw) if a]
+    if not articulos:
+        return ""
+    sin_precio = len(articulos_raw) - len(articulos)
+    tienda = str(tienda or '').strip()
+    if precios.sin_acentos(tienda).lower() in ('', 'desconocida', 'desconocido', 'null', 'none'):
+        tienda = 'Desconocida'
 
-        # Crear directorio si no existe
-        os.makedirs(os.path.dirname(ruta), exist_ok=True)
+    # Ciudad: la impresa en la factura; si no aparece, la del usuario
+    ciudad = precios.normalizar_ciudad(ciudad_factura)[1] or precios.ciudad_usuario(DATA_DIR, phone_clean)
+    if not ciudad:
+        for a in articulos:
+            guardar_en_biblioteca(phone_clean, a, tienda, '')
+        precios.guardar_pendientes(DATA_DIR, phone_clean, tienda, articulos, fecha_compra)
+        return (f"🛒 Leí {len(articulos)} productos de *{tienda}*. Para compararlos con otras tiendas "
+                f"necesito tu ciudad: escríbeme *mi ciudad es Quito* (con tu ciudad).")
+    if not precios.ciudad_usuario(DATA_DIR, phone_clean):
+        precios.guardar_ciudad_usuario(DATA_DIR, phone_clean, ciudad)
 
-        # Leer documentos existentes
-        docs = []
-        if os.path.exists(ruta):
-            try:
-                with open(ruta, 'r', encoding='utf-8') as f:
-                    docs = json.load(f)
-            except:
-                docs = []
+    ahorros = precios.comparar_factura(DATA_DIR, ciudad, tienda, articulos)
+    guardados = precios.agregar_muestras(DATA_DIR, ciudad, tienda, articulos, phone_clean, fecha_compra)
+    if guardados:
+        for a in articulos:
+            guardar_en_biblioteca(phone_clean, a, tienda, ciudad)
+    return precios.msg_factura(ciudad, tienda, guardados, ahorros, sin_precio)
 
-        # Crear nuevo documento
-        doc = {
-            "id": len(docs) + 1,
-            "producto_norm": producto_dict.get('producto_norm', ''),
-            "producto": producto_dict.get('producto', ''),
-            "marca": producto_dict.get('marca', ''),
-            "medida": producto_dict.get('medida', ''),
-            "precio": producto_dict.get('precio', 0),
-            "tienda": tienda,
-            "ciudad": ciudad,
-            "categoria": producto_dict.get('categoria', ''),
-            "fecha": datetime.now().isoformat()
-        }
 
-        docs.append(doc)
+def responder_comparador(consulta, telefono, server_url):
+    """Comandos del comparador: fijar ciudad, buscar producto, comparar ciudades, ranking de tiendas."""
+    phone_clean = normalizar_telefono(telefono)
+    ciudad_mia = precios.ciudad_usuario(DATA_DIR, phone_clean)
+    link = f"\n\n📊 {server_url}/dashboard/{phone_clean}/precios"
 
-        # Guardar
-        with open(ruta, 'w', encoding='utf-8') as f:
-            json.dump(docs, f, indent=2, ensure_ascii=False)
+    if consulta['tipo'] == 'ciudad':
+        nombre = precios.guardar_ciudad_usuario(DATA_DIR, phone_clean, consulta['ciudad'])
+        if not nombre:
+            return "No entendí la ciudad 🤔 Escríbeme por ejemplo: *mi ciudad es Quito*"
+        texto = f"📍 Listo, tu ciudad es *{nombre}*. Comparo tus facturas con otras tiendas de {nombre}."
+        for pendiente in precios.tomar_pendientes(DATA_DIR, phone_clean):
+            ahorros = precios.comparar_factura(DATA_DIR, nombre, pendiente['tienda'], pendiente['articulos'])
+            guardados = precios.agregar_muestras(DATA_DIR, nombre, pendiente['tienda'], pendiente['articulos'],
+                                                 phone_clean, pendiente.get('fecha'))
+            texto += "\n\n" + precios.msg_factura(nombre, pendiente['tienda'], guardados, ahorros)
+        return texto
 
-        return True
-    except Exception as e:
-        logger.error(f"Error guardando en mercado global: {e}", exc_info=True)
-        return False
+    ciudad = precios.normalizar_ciudad(consulta.get('ciudad'))[1] or ciudad_mia
 
-def buscar_precios(producto_query):
-    """Busca en el mercado global dónde es más barato un producto"""
-    try:
-        producto_norm = producto_query.lower().strip()
-        ruta = "/home/claude/yoly/data/mercado_global/precios.json"
+    if consulta['tipo'] == 'ranking':
+        if not ciudad:
+            return "¿De qué ciudad? Escríbeme *mi ciudad es Quito* (con tu ciudad) o *tiendas baratas en Quito*."
+        return precios.msg_ranking(ciudad, precios.ranking_tiendas(DATA_DIR, ciudad)) + link
 
-        if not os.path.exists(ruta):
-            return None
-
-        with open(ruta, 'r', encoding='utf-8') as f:
-            docs = json.load(f)
-
-        # Filtrar por producto_norm (búsqueda parcial)
-        matches = [d for d in docs if producto_norm in d.get('producto_norm', '').lower()]
-
-        if not matches:
-            return None
-
-        # Agrupar por tienda
-        by_tienda = {}
-        for m in matches:
-            tienda = m.get('tienda', 'desconocida')
-            if tienda not in by_tienda:
-                by_tienda[tienda] = {'precios': [], 'ciudades': set(), 'items': []}
-            by_tienda[tienda]['precios'].append(m.get('precio', 0))
-            by_tienda[tienda]['ciudades'].add(m.get('ciudad', ''))
-            by_tienda[tienda]['items'].append(m)
-
-        # Calcular estadísticas
-        results = []
-        for tienda, data in by_tienda.items():
-            precio_prom = sum(data['precios']) / len(data['precios'])
-            results.append({
-                'tienda': tienda,
-                'precio_prom': round(precio_prom, 2),
-                'muestras': len(data['precios']),
-                'ciudades': list(data['ciudades'])
-            })
-
-        # Ordenar por precio
-        results.sort(key=lambda x: x['precio_prom'])
-
-        return results
-    except Exception as e:
-        logger.error(f"Error buscando precios: {e}", exc_info=True)
-        return None
+    producto = consulta.get('producto', '')
+    if len(producto) < 2:
+        return "¿Qué producto quieres comparar? Ejemplo: *¿dónde es más barato el arroz 2kg?*"
+    if consulta.get('todas'):
+        return precios.msg_entre_ciudades(producto, precios.buscar_entre_ciudades(DATA_DIR, producto))
+    if not ciudad:
+        texto = precios.msg_entre_ciudades(producto, precios.buscar_entre_ciudades(DATA_DIR, producto))
+        return texto + "\n\n📍 Para comparar solo en tu ciudad escríbeme *mi ciudad es Quito* (con tu ciudad)."
+    filas = precios.buscar_en_ciudad(DATA_DIR, ciudad, producto)
+    return precios.msg_buscar(producto, ciudad, filas) + (link if filas else "")
 
 # ==================== CONTEXTO: RESPUESTA A "¿TE MANDO TABLA AL DASHBOARD?" ====================
 
@@ -3626,25 +3558,11 @@ Te falta: ${cobro['saldo']:,.0f}
             prods_temp = temp_productos[from_number]
             phone_clean = normalizar_telefono(from_number)
 
-            # Guardar en biblioteca privada
-            guardados_ok = 0
-            for p in prods_temp.get('productos', []):
-                if guardar_en_biblioteca(phone_clean, p, prods_temp.get('tienda', 'desconocida'), prods_temp.get('ciudad', '')):
-                    guardados_ok += 1
-                # Guardar también en mercado global anónimo
-                guardar_en_mercado_global(p, prods_temp.get('tienda', 'desconocida'), prods_temp.get('ciudad', ''))
-
             del temp_productos[from_number]
-
-            tienda = prods_temp.get('tienda', 'desconocida')
-            msg_resp = f"✅ Listo, guardé {guardados_ok} productos de *{tienda}* en tu biblioteca.\n\n"
-            msg_resp += "Ahora puedo ayudarte a buscar dónde es más barato. Pregúntame:\n"
-            msg_resp += "  • Dónde es más barato arroz?\n"
-            msg_resp += "  • Precio de aceite?\n"
-            msg_resp += "  • Comparar pan integral\n\n"
-            msg_resp += f"También ves tus precios en: {server_url}/dashboard/{phone_clean}/precios"
-
-            resp.message(msg_resp)
+            texto = registrar_precios_factura(from_number, prods_temp.get('tienda'), prods_temp.get('ciudad'),
+                                              prods_temp.get('productos', []))
+            resp.message((texto or "No encontré productos con precio claro en ese ticket.") +
+                         f"\n\n📊 Tus precios: {server_url}/dashboard/{phone_clean}/precios")
             return
 
         elif msg_lower.strip() in rechazo_palabras and from_number in temp_productos:
@@ -3703,42 +3621,13 @@ Te falta: ${cobro['saldo']:,.0f}
                 resp.message(f"Aquí está: {dashboard_url}\n\nTienes opciones para descargar Excel o PDF una vez ahí.")
                 return
 
-        # ==================== BÚSQUEDA DE PRECIOS EN MERCADO GLOBAL ====================
-
-        if any(keyword in msg_lower for keyword in ['donde es mas barato', 'dónde es más barato', 'precio de', 'costo de', 'comparar']):
-            logger.info(f"Price comparison request from {from_number}")
-
-            # Extraer el producto a buscar
-            producto = incoming_msg.lower()
-            for keyword in ['donde es mas barato', 'dónde es más barato', 'precio de', 'costo de', 'comparar']:
-                if keyword in producto:
-                    producto = producto.replace(keyword, '').strip()
-                    break
-
-            if not producto or len(producto) < 2:
-                resp.message("¿Qué producto quieres comparar? Ejemplo: 'dónde es más barato arroz?'")
-                return
-
-            resultados = buscar_precios(producto)
-
-            if not resultados:
-                resp.message(f"No encontré '{producto}' en mi base de datos. Envía una foto del ticket de compra para que empiece a comparar.")
-                return
-
-            # Construir respuesta
-            response_msg = f"📊 Precios de *{producto}*:\n\n"
-
-            for i, r in enumerate(resultados[:3], 1):  # Top 3 más baratos
-                response_msg += f"{i}. *{r['tienda']}*\n"
-                response_msg += f"   ${r['precio_prom']:.2f} (basado en {r['muestras']} compra{'s' if r['muestras'] != 1 else ''})\n"
-                ciudades = ", ".join(r['ciudades']) if r['ciudades'] else "no especificada"
-                response_msg += f"   📍 {ciudades}\n\n"
-
-            if len(resultados) > 1:
-                ahorro = resultados[-1]['precio_prom'] - resultados[0]['precio_prom']
-                response_msg += f"💰 Ahorro si compras en {resultados[0]['tienda']}: ${ahorro:.2f}"
-
-            resp.message(response_msg)
+        # ==================== COMPARADOR DE PRECIOS POR CIUDAD ====================
+        # "mi ciudad es Quito", "¿dónde es más barato el arroz?", "precio de aceite en todas las ciudades",
+        # "tiendas baratas en Quito". Solo compara precios de la misma ciudad.
+        consulta_precios = precios.parsear_consulta(DATA_DIR, incoming_msg)
+        if consulta_precios:
+            logger.info(f"Price comparison request from {from_number}: {consulta_precios}")
+            resp.message(responder_comparador(consulta_precios, from_number, server_url))
             return
 
         # ==================== REGISTRO DE GASTOS CON DESGLOSE ====================
