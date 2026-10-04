@@ -1850,7 +1850,7 @@ def download_informe_metas():
 
 @app.route("/dashboard/<phone>", methods=["GET"])
 def dashboard(phone):
-    """Dashboard con vista de gastos y botones de descarga"""
+    """Dashboard con vista de gastos y botones de descarga - Tailwind CSS + PWA"""
     try:
         gastos = cargar_gastos(phone)
 
@@ -1861,22 +1861,47 @@ def dashboard(phone):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - Yoly</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <meta name="theme-color" content="#3B82F6">
+    <meta name="description" content="Panel de finanzas Yoly - Control de envios USA a Ecuador">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/png" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%233B82F6' width='192' height='192'/%3E%3Ctext x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-size='120' fill='white' font-family='Arial,sans-serif' font-weight='bold'%3EY%3C/text%3E%3C/svg%3E">
+    <title>Yoly - Panel de Finanzas</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { background-color: #f8f9fa; }
-        .container { max-width: 1200px; margin-top: 40px; }
-        .card { border: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        .fadeIn { animation: fadeIn 0.6s ease-out; }
     </style>
 </head>
-<body>
-    <div class="container">
-        <div class="card p-4 text-center">
-            <h2 class="mb-3">Tu Panel de Gastos</h2>
-            <p class="text-muted">No tienes gastos registrados aún.</p>
-            <p>Envía un mensaje a Yoly para comenzar a registrar tus gastos.</p>
+<body class="bg-gradient-to-br from-blue-50 to-indigo-50 min-h-screen">
+    <div class="container mx-auto px-4 py-8 max-w-2xl fadeIn">
+        <div class="bg-white rounded-2xl shadow-xl p-8 text-center">
+            <div class="text-5xl mb-4">📭</div>
+            <h1 class="text-3xl font-bold text-gray-800 mb-2">Aún no hay gastos</h1>
+            <p class="text-gray-600 text-lg mb-6">Hola {phone}! Comienza a registrar tus gastos para ver tu panel aquí.</p>
+
+            <div class="bg-blue-50 border-l-4 border-blue-500 p-4 mb-6 rounded">
+                <p class="text-blue-800">
+                    <strong>Tip:</strong> Envía un audio a Yoly con tus gastos del día:
+                    <br/><em>"Envié 500, 380 de renta y 120 de comida"</em>
+                </p>
+            </div>
+
+            <a href="https://wa.me/593" class="inline-block bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-8 rounded-lg transition transform hover:scale-105">
+                💬 Chatear con Yoly vía WhatsApp
+            </a>
+
+            <p class="text-gray-500 text-sm mt-8">Yoly te ayuda a controlar envios de USA a Ecuador sin Excel</p>
         </div>
     </div>
+
+    <script>
+        if ('serviceWorker' in navigator) {
+            navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW registration failed'));
+        }
+        if (localStorage) {
+            localStorage.setItem('yoly_phone', '{phone}');
+        }
+    </script>
 </body>
 </html>
             """)
@@ -1902,27 +1927,28 @@ def dashboard(phone):
 
         total_mes = sum(g.get('monto', 0) for g in gastos_mes)
 
-        # Crear tabla HTML
+        # Crear tabla HTML con Tailwind
         tabla_html = """
-        <table class="table table-striped">
-            <thead class="table-primary">
-                <tr>
-                    <th>Fecha</th>
-                    <th>Descripción</th>
-                    <th>Categoría</th>
-                    <th>Monto</th>
+        <table class="w-full border-collapse">
+            <thead>
+                <tr class="bg-gray-100 border-b-2 border-gray-300">
+                    <th class="text-left px-4 py-3 font-semibold text-gray-700">Fecha</th>
+                    <th class="text-left px-4 py-3 font-semibold text-gray-700">Descripción</th>
+                    <th class="text-left px-4 py-3 font-semibold text-gray-700">Categoría</th>
+                    <th class="text-right px-4 py-3 font-semibold text-gray-700">Monto</th>
                 </tr>
             </thead>
             <tbody>
         """
 
-        for gasto in sorted(gastos_mes, key=lambda x: x.get('fecha', ''), reverse=True):
+        for idx, gasto in enumerate(sorted(gastos_mes, key=lambda x: x.get('fecha', ''), reverse=True)):
+            bg_class = "bg-white" if idx % 2 == 0 else "bg-gray-50"
             tabla_html += f"""
-                <tr>
-                    <td>{gasto.get('fecha', '')}</td>
-                    <td>{gasto.get('descripcion', '')[:40]}</td>
-                    <td><span class="badge bg-info">{gasto.get('categoria', 'otro')}</span></td>
-                    <td>${gasto.get('monto', 0):.2f}</td>
+                <tr class="{bg_class} border-b hover:bg-blue-50 transition">
+                    <td class="px-4 py-3 text-gray-700">{gasto.get('fecha', '')}</td>
+                    <td class="px-4 py-3 text-gray-700">{gasto.get('descripcion', '')[:40]}</td>
+                    <td class="px-4 py-3"><span class="inline-block bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm font-medium">{gasto.get('categoria', 'otro')}</span></td>
+                    <td class="px-4 py-3 text-right font-semibold text-gray-900">${gasto.get('monto', 0):.2f}</td>
                 </tr>
             """
 
@@ -1931,20 +1957,22 @@ def dashboard(phone):
         </table>
         """
 
-        # Crear carpetas HTML
+        # Crear carpetas HTML con Tailwind
         carpetas_html = ""
+        categoria_icons = {
+            'renta': '🏠', 'comida': '🍽️', 'transporte': '🚗', 'servicios': '💡',
+            'internet': '📡', 'telefono': '📱', 'utilidades': '💰', 'estefanito': '👶',
+            'materiales': '🔨', 'envio_ecuador': '📦', 'otro': '📋'
+        }
+
         for categoria, data in sorted(por_categoria.items(), key=lambda x: x[1]['monto'], reverse=True):
+            icon = categoria_icons.get(categoria, '📋')
             carpetas_html += f"""
-            <div class="col-md-4 mb-3">
-                <div class="card h-100">
-                    <div class="card-body">
-                        <h5 class="card-title">{categoria.title()}</h5>
-                        <p class="card-text">
-                            <strong>${data['monto']:.2f}</strong><br>
-                            <small>{data['count']} transacciones</small>
-                        </p>
-                    </div>
-                </div>
+            <div class="bg-white rounded-lg shadow hover:shadow-lg transition transform hover:scale-105 p-5 cursor-pointer">
+                <div class="text-3xl mb-2">{icon}</div>
+                <h3 class="font-bold text-gray-800 text-lg">{categoria.title()}</h3>
+                <p class="text-2xl font-bold text-blue-600 mt-2">${data['monto']:.2f}</p>
+                <p class="text-sm text-gray-500 mt-1">{data['count']} transacción{"es" if data['count'] != 1 else ""}</p>
             </div>
             """
 
@@ -1954,93 +1982,115 @@ def dashboard(phone):
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dashboard - Yoly</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+    <meta name="theme-color" content="#3B82F6">
+    <meta name="description" content="Panel de finanzas Yoly - Control de envios USA a Ecuador">
+    <link rel="manifest" href="/manifest.json">
+    <link rel="icon" type="image/png" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%233B82F6' width='192' height='192'/%3E%3Ctext x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-size='120' fill='white' font-family='Arial,sans-serif' font-weight='bold'%3EY%3C/text%3E%3C/svg%3E">
+    <title>Yoly - Panel de Finanzas</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body {{ background-color: #f8f9fa; }}
-        .dashboard-header {{ background: linear-gradient(135deg, #1e40af 0%, #0f172a 100%); color: white; padding: 40px 0; margin-bottom: 40px; }}
-        .dashboard-header h1 {{ font-size: 2.5rem; font-weight: bold; margin-bottom: 10px; }}
-        .stats-card {{ background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
-        .stats-value {{ font-size: 2rem; font-weight: bold; color: #1e40af; }}
-        .btn-group-responsive {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0; }}
-        .btn-group-responsive .btn {{ flex: 1; min-width: 150px; }}
-        @media (max-width: 768px) {{
-            .btn-group-responsive .btn {{ flex: 0 1 calc(50% - 5px); }}
-        }}
+        @keyframes slideDown {{ from {{ opacity: 0; transform: translateY(-20px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(20px); }} to {{ opacity: 1; transform: translateY(0); }} }}
+        .slideDown {{ animation: slideDown 0.4s ease-out; }}
+        .fadeIn {{ animation: fadeIn 0.6s ease-out forwards; }}
+        .card-item {{ animation-delay: calc(var(--index) * 100ms); }}
+        table {{ font-size: 0.875rem; }}
     </style>
 </head>
-<body>
-    <div class="dashboard-header">
-        <div class="container">
-            <h1>Panel de Gastos</h1>
-            <p class="lead mb-0">{hoy.strftime('%B %Y')}</p>
+<body class="bg-gradient-to-br from-blue-50 via-white to-indigo-50 min-h-screen">
+    <!-- Header -->
+    <div class="bg-gradient-to-r from-blue-600 to-indigo-600 text-white py-6 slideDown">
+        <div class="container mx-auto px-4 max-w-6xl">
+            <h1 class="text-3xl font-bold mb-1">💰 Yoly - Panel de Finanzas</h1>
+            <p class="text-blue-100">{hoy.strftime('%B %Y')} | {phone}</p>
         </div>
     </div>
 
-    <div class="container">
-        <!-- Estadísticas -->
-        <div class="row mb-4">
-            <div class="col-md-4">
-                <div class="stats-card">
-                    <p class="text-muted mb-1">Total del Mes</p>
-                    <div class="stats-value">${total_mes:.2f}</div>
-                    <small class="text-muted">{len(gastos_mes)} transacciones</small>
-                </div>
+    <div class="container mx-auto px-4 py-8 max-w-6xl">
+        <!-- Stats Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8 fadeIn">
+            <div class="bg-white rounded-lg shadow-md p-6 border-l-4 border-blue-500">
+                <p class="text-gray-600 text-sm font-medium mb-2">Total del Mes</p>
+                <div class="text-3xl font-bold text-blue-600">${total_mes:.2f}</div>
+                <p class="text-xs text-gray-500 mt-2">{len(gastos_mes)} transacciones</p>
             </div>
-            <div class="col-md-4">
-                <div class="stats-card">
-                    <p class="text-muted mb-1">Promedio por Transacción</p>
-                    <div class="stats-value">${total_mes/len(gastos_mes):.2f if gastos_mes else 0:.2f}</div>
-                </div>
+            <div class="bg-white rounded-lg shadow-md p-6 border-l-4 border-green-500">
+                <p class="text-gray-600 text-sm font-medium mb-2">Promedio por Transacción</p>
+                <div class="text-3xl font-bold text-green-600">${total_mes/len(gastos_mes):.2f if gastos_mes else 0:.2f}</div>
             </div>
-            <div class="col-md-4">
-                <div class="stats-card">
-                    <p class="text-muted mb-1">Categorías</p>
-                    <div class="stats-value">{len(por_categoria)}</div>
-                </div>
+            <div class="bg-white rounded-lg shadow-md p-6 border-l-4 border-purple-500">
+                <p class="text-gray-600 text-sm font-medium mb-2">Categorías</p>
+                <div class="text-3xl font-bold text-purple-600">{len(por_categoria)}</div>
             </div>
         </div>
 
-        <!-- Botones de Descarga -->
-        <div class="btn-group-responsive">
-            <a href="/dashboard/{phone}/excel" class="btn btn-success btn-lg">
-                <span>📊 Descargar Excel</span>
+        <!-- Action Buttons -->
+        <div class="flex flex-wrap gap-3 mb-8 fadeIn" style="animation-delay: 200ms;">
+            <a href="/dashboard/{phone}/excel" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+                📊 Descargar Excel
             </a>
-            <a href="/dashboard/{phone}/pdf" class="btn btn-danger btn-lg">
-                <span>📄 Descargar PDF</span>
+            <a href="/dashboard/{phone}/pdf" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+                📄 Descargar PDF
             </a>
+            <button onclick="compartir()" class="flex-1 md:flex-none bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105">
+                📤 Compartir
+            </button>
         </div>
 
-        <!-- Carpetas por Categoría -->
-        <h3 class="mb-4 mt-4">Gastos por Categoría</h3>
-        <div class="row mb-5">
-            {carpetas_html}
+        <!-- Categories Grid -->
+        <div class="mb-8">
+            <h2 class="text-2xl font-bold text-gray-800 mb-4">Gastos por Categoría</h2>
+            <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 fadeIn" style="animation-delay: 300ms;">
+                {carpetas_html}
+            </div>
         </div>
 
-        <!-- Tabla de Gastos -->
-        <h3 class="mb-3">Detalle de Transacciones</h3>
-        <div class="card">
-            <div class="card-body">
+        <!-- Transactions Table -->
+        <div class="bg-white rounded-lg shadow-lg overflow-hidden fadeIn" style="animation-delay: 400ms;">
+            <div class="bg-gray-50 px-6 py-4 border-b">
+                <h2 class="text-xl font-bold text-gray-800">Detalle de Transacciones</h2>
+            </div>
+            <div class="overflow-x-auto">
                 {tabla_html}
             </div>
         </div>
+
+        <!-- Footer -->
+        <div class="text-center mt-12 text-gray-600 text-sm">
+            <p>Yoly te ayuda a controlar envios de USA a Ecuador sin Excel ✨</p>
+            <p class="mt-1">Creado por Jaime | <a href="https://wa.me/593" class="text-blue-600 hover:underline">Contactar</a></p>
+        </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
-    <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
-    <script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
     <script>
-        document.addEventListener('DOMContentLoaded', function() {{
-            if (document.querySelector('table')) {{
-                new DataTable('table', {{
-                    "language": {{
-                        "url": "//cdn.datatables.net/plug-ins/1.13.7/i18n/es-ES.json"
-                    }}
-                }});
+        // PWA Registration
+        if ('serviceWorker' in navigator) {{
+            navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW registration failed'));
+        }}
+
+        // localStorage
+        if (localStorage) {{
+            localStorage.setItem('yoly_phone', '{phone}');
+            localStorage.setItem('yoly_dashboard_visited', new Date().toISOString());
+        }}
+
+        // Share functionality
+        function compartir() {{
+            const text = 'Mi panel de finanzas en Yoly: {phone}';
+            if (navigator.share) {{
+                navigator.share({{
+                    title: 'Yoly - Panel de Finanzas',
+                    text: text
+                }}).catch(err => alert('Error al compartir'));
+            }} else {{
+                alert('Link del panel: ' + window.location.href);
             }}
-        }});
+        }}
+
+        // Detect PWA
+        if (window.matchMedia('(display-mode: standalone)').matches) {{
+            console.log('Yoly PWA activa');
+        }}
     </script>
 </body>
 </html>
@@ -2083,6 +2133,125 @@ def descargar_pdf(phone):
     except Exception as e:
         logger.error(f"Error descargando PDF: {e}", exc_info=True)
         return f"Error al generar PDF: {str(e)}", 500
+
+@app.route("/api/gastos/<phone>", methods=["GET"])
+def api_gastos(phone):
+    """API endpoint para obtener gastos en JSON"""
+    try:
+        gastos = cargar_gastos(phone)
+        if not gastos:
+            return jsonify([]), 200
+
+        # Filtrar gastos del mes actual si se solicita
+        filtro = request.args.get('filtro', 'todos')
+        if filtro == 'mes':
+            hoy = datetime.now()
+            mes_actual = hoy.month
+            anio_actual = hoy.year
+            gastos = [g for g in gastos if 'fecha' in g and
+                     datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual and
+                     datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
+
+        return jsonify(gastos), 200
+    except Exception as e:
+        logger.error(f"Error en API gastos: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/manifest.json", methods=["GET"])
+def manifest():
+    """PWA Manifest para instalación como app"""
+    manifest_data = {
+        "name": "Yoly Finanzas",
+        "short_name": "Yoly",
+        "description": "Control de gastos y finanzas USA-Ecuador",
+        "start_url": "/",
+        "scope": "/",
+        "display": "standalone",
+        "theme_color": "#3B82F6",
+        "background_color": "#ffffff",
+        "orientation": "portrait-primary",
+        "icons": [
+            {
+                "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%233B82F6' width='192' height='192'/%3E%3Ctext x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-size='120' fill='white' font-family='Arial,sans-serif' font-weight='bold'%3EY%3C/text%3E%3C/svg%3E",
+                "sizes": "192x192",
+                "type": "image/svg+xml",
+                "purpose": "any"
+            }
+        ],
+        "screenshots": [
+            {
+                "src": "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 540 720'%3E%3Crect fill='%233B82F6' width='540' height='720'/%3E%3Ctext x='50%' y='50%' dominant-baseline='middle' text-anchor='middle' font-size='60' fill='white' font-family='Arial,sans-serif'%3EYoly%3C/text%3E%3C/svg%3E",
+                "sizes": "540x720",
+                "type": "image/svg+xml",
+                "form_factor": "narrow"
+            }
+        ],
+        "categories": ["finance", "productivity"]
+    }
+    return jsonify(manifest_data), 200, {"Content-Type": "application/manifest+json"}
+
+@app.route("/sw.js", methods=["GET"])
+def service_worker():
+    """Service Worker para PWA - caching y offline support"""
+    sw_code = """
+const CACHE_NAME = 'yoly-v1';
+const urlsToCache = [
+  '/',
+  '/manifest.json'
+];
+
+self.addEventListener('install', event => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then(cache => {
+      return cache.addAll(urlsToCache);
+    })
+  );
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    caches.keys().then(cacheNames => {
+      return Promise.all(
+        cacheNames.map(cacheName => {
+          if (cacheName !== CACHE_NAME) {
+            return caches.delete(cacheName);
+          }
+        })
+      );
+    })
+  );
+});
+
+self.addEventListener('fetch', event => {
+  if (event.request.method !== 'GET') {
+    return;
+  }
+
+  event.respondWith(
+    caches.match(event.request).then(response => {
+      if (response) {
+        return response;
+      }
+
+      return fetch(event.request).then(response => {
+        if (!response || response.status !== 200 || response.type !== 'basic') {
+          return response;
+        }
+
+        const responseToCache = response.clone();
+        caches.open(CACHE_NAME).then(cache => {
+          cache.put(event.request, responseToCache);
+        });
+
+        return response;
+      }).catch(() => {
+        return caches.match('/');
+      });
+    })
+  );
+});
+"""
+    return sw_code, 200, {"Content-Type": "application/javascript"}
 
 @app.route("/whatsapp", methods=["POST", "GET"])
 def whatsapp():
