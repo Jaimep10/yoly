@@ -7,7 +7,7 @@ import io
 import re
 from datetime import datetime, timedelta
 from calendar import monthrange
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, render_template_string
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
 from twilio.request_validator import RequestValidator
@@ -27,6 +27,11 @@ from PIL import Image as PILImage
 from groq import Groq
 import zipfile
 import io
+try:
+    import pandas as pd
+    HAS_PANDAS = True
+except ImportError:
+    HAS_PANDAS = False
 
 app = Flask(__name__)
 
@@ -1688,6 +1693,126 @@ def generar_presupuesto(datos):
 
     return pdf_path, consejo_ok
 
+# ==================== DASHBOARD FUNCTIONS ====================
+
+def generar_excel_gastos(phone):
+    """Genera un archivo Excel con los gastos del usuario del mes actual"""
+    if not HAS_PANDAS:
+        return None
+
+    try:
+        gastos = cargar_gastos(phone)
+        if not gastos:
+            return None
+
+        # Filtrar gastos del mes actual
+        hoy = datetime.now()
+        mes_actual = hoy.month
+        anio_actual = hoy.year
+
+        gastos_mes = [g for g in gastos if 'fecha' in g]
+        gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
+                      and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
+
+        if not gastos_mes:
+            return None
+
+        # Crear DataFrame
+        df_data = []
+        for gasto in gastos_mes:
+            df_data.append({
+                'Fecha': gasto.get('fecha', ''),
+                'Descripción': gasto.get('descripcion', ''),
+                'Categoría': gasto.get('categoria', ''),
+                'Monto': gasto.get('monto', 0),
+                'Desglose': json.dumps(gasto.get('desglose_json', {})) if gasto.get('desglose_json') else ''
+            })
+
+        df = pd.DataFrame(df_data)
+
+        # Guardar en archivo temporal
+        excel_path = f"/tmp/gastos_{phone}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+        df.to_excel(excel_path, index=False, engine='openpyxl')
+
+        return excel_path
+    except Exception as e:
+        logger.error(f"Error generando Excel: {e}", exc_info=True)
+        return None
+
+def generar_pdf_dashboard(phone):
+    """Genera un PDF con los gastos del mes actual"""
+    try:
+        gastos = cargar_gastos(phone)
+        if not gastos:
+            return None
+
+        # Filtrar gastos del mes actual
+        hoy = datetime.now()
+        mes_actual = hoy.month
+        anio_actual = hoy.year
+
+        gastos_mes = [g for g in gastos if 'fecha' in g]
+        gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
+                      and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
+
+        if not gastos_mes:
+            return None
+
+        pdf_path = f"/tmp/gastos_{phone}_{datetime.now().strftime('%Y%m%d')}.pdf"
+        tmp_path = ruta_temporal(pdf_path)
+
+        doc = SimpleDocTemplate(tmp_path, pagesize=letter)
+        story = []
+        styles = getSampleStyleSheet()
+
+        # Título
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=16,
+            textColor=colors.HexColor('#1e40af'),
+            spaceAfter=12
+        )
+
+        story.append(Paragraph("Estado de Gastos", title_style))
+        story.append(Paragraph(f"Período: {hoy.strftime('%B %Y')}", styles['Normal']))
+        story.append(Spacer(1, 0.3*inch))
+
+        # Tabla de gastos
+        table_data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
+        total_mes = 0
+
+        for gasto in sorted(gastos_mes, key=lambda x: x.get('fecha', '')):
+            table_data.append([
+                gasto.get('fecha', ''),
+                gasto.get('descripcion', '')[:30],
+                gasto.get('categoria', ''),
+                f"${gasto.get('monto', 0):.2f}"
+            ])
+            total_mes += gasto.get('monto', 0)
+
+        table_data.append(['', '', 'TOTAL', f"${total_mes:.2f}"])
+
+        table = Table(table_data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+
+        story.append(table)
+        doc.build(story)
+        publicar_pdf(tmp_path, pdf_path)
+
+        return pdf_path
+    except Exception as e:
+        logger.error(f"Error generando PDF dashboard: {e}", exc_info=True)
+        return None
+
+# ==================== ROUTES ====================
+
 @app.route("/", methods=["GET"])
 def home():
     logger.info("GET / - Home endpoint called")
@@ -1722,6 +1847,242 @@ def download_informe_metas():
     if not pdf_path:
         return "Informe de metas no disponible", 404
     return servir_pdf(pdf_path, 'informe_metas.pdf')
+
+@app.route("/dashboard/<phone>", methods=["GET"])
+def dashboard(phone):
+    """Dashboard con vista de gastos y botones de descarga"""
+    try:
+        gastos = cargar_gastos(phone)
+
+        if not gastos:
+            return render_template_string("""
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - Yoly</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body { background-color: #f8f9fa; }
+        .container { max-width: 1200px; margin-top: 40px; }
+        .card { border: none; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="card p-4 text-center">
+            <h2 class="mb-3">Tu Panel de Gastos</h2>
+            <p class="text-muted">No tienes gastos registrados aún.</p>
+            <p>Envía un mensaje a Yoly para comenzar a registrar tus gastos.</p>
+        </div>
+    </div>
+</body>
+</html>
+            """)
+
+        # Filtrar gastos del mes actual
+        hoy = datetime.now()
+        mes_actual = hoy.month
+        anio_actual = hoy.year
+
+        gastos_mes = [g for g in gastos if 'fecha' in g]
+        gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
+                      and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
+
+        # Agrupar por categoría
+        por_categoria = {}
+        for gasto in gastos_mes:
+            cat = gasto.get('categoria', 'otro')
+            monto = gasto.get('monto', 0)
+            if cat not in por_categoria:
+                por_categoria[cat] = {'monto': 0, 'count': 0}
+            por_categoria[cat]['monto'] += monto
+            por_categoria[cat]['count'] += 1
+
+        total_mes = sum(g.get('monto', 0) for g in gastos_mes)
+
+        # Crear tabla HTML
+        tabla_html = """
+        <table class="table table-striped">
+            <thead class="table-primary">
+                <tr>
+                    <th>Fecha</th>
+                    <th>Descripción</th>
+                    <th>Categoría</th>
+                    <th>Monto</th>
+                </tr>
+            </thead>
+            <tbody>
+        """
+
+        for gasto in sorted(gastos_mes, key=lambda x: x.get('fecha', ''), reverse=True):
+            tabla_html += f"""
+                <tr>
+                    <td>{gasto.get('fecha', '')}</td>
+                    <td>{gasto.get('descripcion', '')[:40]}</td>
+                    <td><span class="badge bg-info">{gasto.get('categoria', 'otro')}</span></td>
+                    <td>${gasto.get('monto', 0):.2f}</td>
+                </tr>
+            """
+
+        tabla_html += """
+            </tbody>
+        </table>
+        """
+
+        # Crear carpetas HTML
+        carpetas_html = ""
+        for categoria, data in sorted(por_categoria.items(), key=lambda x: x[1]['monto'], reverse=True):
+            carpetas_html += f"""
+            <div class="col-md-4 mb-3">
+                <div class="card h-100">
+                    <div class="card-body">
+                        <h5 class="card-title">{categoria.title()}</h5>
+                        <p class="card-text">
+                            <strong>${data['monto']:.2f}</strong><br>
+                            <small>{data['count']} transacciones</small>
+                        </p>
+                    </div>
+                </div>
+            </div>
+            """
+
+        html = f"""
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Dashboard - Yoly</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link href="https://cdn.datatables.net/1.13.7/css/dataTables.bootstrap5.min.css" rel="stylesheet">
+    <style>
+        body {{ background-color: #f8f9fa; }}
+        .dashboard-header {{ background: linear-gradient(135deg, #1e40af 0%, #0f172a 100%); color: white; padding: 40px 0; margin-bottom: 40px; }}
+        .dashboard-header h1 {{ font-size: 2.5rem; font-weight: bold; margin-bottom: 10px; }}
+        .stats-card {{ background: white; border-radius: 8px; padding: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }}
+        .stats-value {{ font-size: 2rem; font-weight: bold; color: #1e40af; }}
+        .btn-group-responsive {{ display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0; }}
+        .btn-group-responsive .btn {{ flex: 1; min-width: 150px; }}
+        @media (max-width: 768px) {{
+            .btn-group-responsive .btn {{ flex: 0 1 calc(50% - 5px); }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="dashboard-header">
+        <div class="container">
+            <h1>Panel de Gastos</h1>
+            <p class="lead mb-0">{hoy.strftime('%B %Y')}</p>
+        </div>
+    </div>
+
+    <div class="container">
+        <!-- Estadísticas -->
+        <div class="row mb-4">
+            <div class="col-md-4">
+                <div class="stats-card">
+                    <p class="text-muted mb-1">Total del Mes</p>
+                    <div class="stats-value">${total_mes:.2f}</div>
+                    <small class="text-muted">{len(gastos_mes)} transacciones</small>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="stats-card">
+                    <p class="text-muted mb-1">Promedio por Transacción</p>
+                    <div class="stats-value">${total_mes/len(gastos_mes):.2f if gastos_mes else 0:.2f}</div>
+                </div>
+            </div>
+            <div class="col-md-4">
+                <div class="stats-card">
+                    <p class="text-muted mb-1">Categorías</p>
+                    <div class="stats-value">{len(por_categoria)}</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Botones de Descarga -->
+        <div class="btn-group-responsive">
+            <a href="/dashboard/{phone}/excel" class="btn btn-success btn-lg">
+                <span>📊 Descargar Excel</span>
+            </a>
+            <a href="/dashboard/{phone}/pdf" class="btn btn-danger btn-lg">
+                <span>📄 Descargar PDF</span>
+            </a>
+        </div>
+
+        <!-- Carpetas por Categoría -->
+        <h3 class="mb-4 mt-4">Gastos por Categoría</h3>
+        <div class="row mb-5">
+            {carpetas_html}
+        </div>
+
+        <!-- Tabla de Gastos -->
+        <h3 class="mb-3">Detalle de Transacciones</h3>
+        <div class="card">
+            <div class="card-body">
+                {tabla_html}
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script src="https://code.jquery.com/jquery-3.7.0.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.7/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.13.7/js/dataTables.bootstrap5.min.js"></script>
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {{
+            if (document.querySelector('table')) {{
+                new DataTable('table', {{
+                    "language": {{
+                        "url": "//cdn.datatables.net/plug-ins/1.13.7/i18n/es-ES.json"
+                    }}
+                }});
+            }}
+        }});
+    </script>
+</body>
+</html>
+        """
+
+        return html
+    except Exception as e:
+        logger.error(f"Error en dashboard: {e}", exc_info=True)
+        return f"Error al cargar el dashboard: {str(e)}", 500
+
+@app.route("/dashboard/<phone>/excel", methods=["GET"])
+def descargar_excel(phone):
+    """Descarga los gastos en Excel"""
+    if not HAS_PANDAS:
+        return "Excel no disponible (pandas no instalado)", 501
+
+    try:
+        excel_path = generar_excel_gastos(phone)
+        if not excel_path or not os.path.exists(excel_path):
+            return "No hay gastos para descargar", 404
+
+        with open(excel_path, 'rb') as f:
+            datos = f.read()
+
+        return Response(datos, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                       headers={"Content-Disposition": f"attachment; filename=gastos_{phone}.xlsx"})
+    except Exception as e:
+        logger.error(f"Error descargando Excel: {e}", exc_info=True)
+        return f"Error al generar Excel: {str(e)}", 500
+
+@app.route("/dashboard/<phone>/pdf", methods=["GET"])
+def descargar_pdf(phone):
+    """Descarga los gastos en PDF"""
+    try:
+        pdf_path = generar_pdf_dashboard(phone)
+        if not pdf_path or not os.path.exists(pdf_path):
+            return "No hay gastos para descargar", 404
+
+        return servir_pdf(pdf_path, f'gastos_{phone}.pdf')
+    except Exception as e:
+        logger.error(f"Error descargando PDF: {e}", exc_info=True)
+        return f"Error al generar PDF: {str(e)}", 500
 
 @app.route("/whatsapp", methods=["POST", "GET"])
 def whatsapp():
@@ -1928,6 +2289,49 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     msg_lower = incoming_msg.lower()
 
     try:
+        # ==================== DETECCIÓN DE PALABRAS CLAVE: PDF, EXCEL, LINK, PANEL, DASHBOARD ====================
+
+        palabras_clave_link = ['pdf', 'excel', 'link', 'panel', 'dashboard', 'descargar']
+
+        if any(keyword in msg_lower for keyword in palabras_clave_link):
+            logger.info(f"Keyword detection for dashboard/downloads: {from_number}")
+
+            # Generar respuesta rápida
+            if 'pdf' in msg_lower:
+                try:
+                    pdf_path = generar_pdf_dashboard(from_number)
+                    if pdf_path and os.path.exists(pdf_path):
+                        pdf_url = f"{server_url}/dashboard/{from_number}/pdf"
+                        twilio_client.messages.create(
+                            from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
+                            to=from_number,
+                            body="📄 Aquí está tu PDF del mes:",
+                            media_url=[pdf_url]
+                        )
+                        resp.message("PDF descargado ✓")
+                        return
+                except Exception as e:
+                    logger.error(f"Error generando PDF: {e}")
+
+            if 'excel' in msg_lower:
+                if not HAS_PANDAS:
+                    resp.message("Excel no está disponible en este momento. Usa el PDF en su lugar.")
+                    return
+                try:
+                    excel_path = generar_excel_gastos(from_number)
+                    if excel_path and os.path.exists(excel_path):
+                        excel_url = f"{server_url}/dashboard/{from_number}/excel"
+                        resp.message(f"Tu Excel está listo: {excel_url}")
+                        return
+                except Exception as e:
+                    logger.error(f"Error generando Excel: {e}")
+
+            # Si pide link, dashboard, panel o descargar
+            if any(keyword in msg_lower for keyword in ['link', 'panel', 'dashboard']):
+                dashboard_url = f"{server_url}/dashboard/{from_number}"
+                resp.message(f"Aquí está: {dashboard_url}\n\nTuenes opciones para descargar Excel o PDF una vez ahí.")
+                return
+
         # ==================== REGISTRO DE GASTOS CON DESGLOSE ====================
 
         if any(keyword in msg_lower for keyword in ['envié', 'mandé', 'total']) and any(keyword in msg_lower for keyword in ['renta', 'comida', 'estefanito', 'transporte', 'pago']):
@@ -1985,6 +2389,30 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
                 gastos.append(gasto_nuevo)
                 guardar_gastos(from_number, gastos)
                 logger.info(f"Expense breakdown saved for {from_number}: ${total}")
+
+                # ==================== AUTO-RESPUESTA POST-GASTO ====================
+                # Construir resumen detallado del desglose para la auto-respuesta
+                auto_respuesta = "¡Listo! ✅\n📤 Total: $" + f"{total:.2f}\n"
+                for categoria, monto in desglose.items():
+                    auto_respuesta += f"  • {categoria.title()}: ${monto:.2f}\n"
+
+                if reserva > 0:
+                    auto_respuesta += f"  • Reserva por si acaso: ${reserva:.2f}\n"
+                elif reserva < 0:
+                    auto_respuesta += f"  • Sobregiro: ${abs(reserva):.2f} ⚠️\n"
+                else:
+                    auto_respuesta += f"  • Reserva por si acaso: $0\n"
+
+                # Alerta si hay sobregiro
+                if alerta:
+                    auto_respuesta += f"\n{alerta}\n"
+
+                # Enviar link del dashboard
+                dashboard_url = f"{server_url}/dashboard/{from_number}"
+                auto_respuesta += f"\nAquí tienes tu panel para ver todo: {dashboard_url}\n\n"
+                auto_respuesta += "¿Quieres que también te genere el PDF del mes o con esto es suficiente?"
+
+                resp.message(auto_respuesta)
             except Exception as e:
                 logger.error(f"Error saving expense breakdown: {e}", exc_info=True)
 
