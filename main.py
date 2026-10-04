@@ -30,6 +30,8 @@ import html
 from urllib.parse import quote_plus
 import precios
 import reportes
+import agent_reporter
+import app as orquestador  # 4 agentes: Portero, Ojo, Calculadora, Contadora
 import io
 try:
     import pandas as pd
@@ -104,7 +106,7 @@ def responder(resp, texto):
 # Si Yoly tarda más que esto, contesta "ya te respondo" y manda la respuesta
 # después por la API de Twilio.
 ESPERA_MAX_SEGUNDOS = 10
-PREGUNTA_TABLA = "¿Te mando tabla al dashboard?\nResponde con el número:\n1️⃣ Sí\n2️⃣ No"
+PREGUNTA_TABLA = agent_reporter.PREGUNTA_TABLA
 
 MENSAJE_ESPERA = "⏳ Recibí tu mensaje. Lo estoy procesando, en unos segundos te respondo."
 
@@ -276,93 +278,9 @@ def guardar_gastos(telefono, gastos):
 # ==================== COBRO DE DEUDA (lista de pagos) ====================
 
 
-def a_numero(valor):
-    """Convierte '1.200', '$300' o 300 a float; None si no es número"""
-    if isinstance(valor, (int, float)) and not isinstance(valor, bool):
-        return float(valor)
-    if isinstance(valor, str):
-        limpio = re.sub(r'[^0-9.,-]', '', valor).replace(',', '')
-        try:
-            return float(limpio)
-        except ValueError:
-            return None
-    return None
-
-def fecha_valida(fecha):
-    try:
-        datetime.strptime(str(fecha), '%Y-%m-%d')
-        return True
-    except ValueError:
-        return False
-
-METODOS_PAGO = [
-    ('transferencia', ['transferencia', 'transf', 'trans', 't']),
-    ('efectivo', ['efectivo', 'efec', 'efect', 'e']),
-    ('cheque', ['cheque', 'chq', 'ch']),
-    ('deposito', ['deposito', 'depósito', 'dep']),
-    ('zelle', ['zelle']),
-]
-
-def normalizar_metodo(metodo):
-    """'T', 'transf', 'Efec' -> 'transferencia', 'efectivo'; vacío -> 'no especificado'"""
-    texto = str(metodo or '').strip().lower().rstrip('.')
-    for nombre, claves in METODOS_PAGO:
-        if texto in claves or any(texto.startswith(c) for c in claves if len(c) > 2):
-            return nombre
-    return texto if texto and texto not in ('null', 'none', 'n/a') else 'no especificado'
-
-def normalizar_pagos(pagos_raw):
-    """Acepta [200, 120] o [{"fecha", "monto", "metodo", "nota"}] y devuelve [{"fecha", "monto", "metodo", "nota"}]"""
-    pagos = []
-    for p in pagos_raw if isinstance(pagos_raw, list) else []:
-        if isinstance(p, dict):
-            monto = a_numero(p.get('monto'))
-            fecha, metodo, nota = p.get('fecha'), p.get('metodo'), p.get('nota')
-        else:
-            monto, fecha, metodo, nota = a_numero(p), None, None, None
-        if monto is None or monto <= 0:
-            continue
-        pagos.append({
-            "fecha": fecha if fecha and fecha_valida(fecha) else "",
-            "monto": monto,
-            "metodo": normalizar_metodo(metodo),
-            "nota": str(nota or '').strip(),
-        })
-    return pagos
-
-def fecha_corta(fecha):
-    """'2026-01-03' -> '03-01-26'"""
-    return datetime.strptime(fecha, '%Y-%m-%d').strftime('%d-%m-%y') if fecha else 'sin fecha'
-
-def armar_cobro(datos):
-    """Recalcula en Python pagado, saldo, saldo restante por pago y frecuencia"""
-    pagos = normalizar_pagos(datos.get('pagos', []))
-    deuda = a_numero(datos.get('deuda')) or 0
-    pagado = sum(p['monto'] for p in pagos)
-
-    saldo_restante = deuda
-    filas = []
-    for p in pagos:
-        saldo_restante -= p['monto']
-        filas.append({"fecha": p['fecha'], "fecha_corta": fecha_corta(p['fecha']), "monto": p['monto'],
-                      "metodo": p['metodo'], "nota": p['nota'], "saldo": saldo_restante})
-
-    fechas = sorted(datetime.strptime(p['fecha'], '%Y-%m-%d') for p in pagos if p['fecha'])
-    frecuencia = None
-    if len(fechas) >= 2:
-        frecuencia = round((fechas[-1] - fechas[0]).days / (len(fechas) - 1))
-
-    return {
-        "tipo": "cobro_deuda",
-        "cliente": datos.get('cliente') or 'Cliente',
-        "deuda": deuda,
-        "pagado": pagado,
-        "saldo": deuda - pagado,
-        "pagos": pagos,
-        "filas": filas,
-        "frecuencia_dias": frecuencia,
-        "fecha": datos.get('fecha', ''),
-    }
+# Cuentas en Python puro: viven en la Calculadora (agent_calculator)
+from agent_calculator import (a_numero, fecha_valida, METODOS_PAGO, normalizar_metodo,
+                              normalizar_pagos, fecha_corta, armar_cobro)
 
 def guardar_cobro(phone_clean, datos):
     """Guarda el cobro en memoria_global.json y en data/{telefono}/cobro_deuda.json"""
@@ -616,225 +534,129 @@ def procesar_audio(media_url, telefono):
         logger.error(f"Error procesando audio: {e}", exc_info=True)
         return None
 
+def huellas_vistas(telefono):
+    """Huellas de las fotos que ya se procesaron (para que el Portero detecte repetidas)."""
+    archivo = f"{obtener_ruta_datos(telefono)}/imagenes_vistas.json"
+    if os.path.exists(archivo):
+        try:
+            with open(archivo, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception:
+            return []
+    return []
+
+def marcar_vistas(telefono, huellas):
+    vistas = huellas_vistas(telefono)
+    vistas.extend(h for h in huellas if h not in vistas)
+    try:
+        with open(f"{obtener_ruta_datos(telefono)}/imagenes_vistas.json", 'w', encoding='utf-8') as f:
+            json.dump(vistas[-500:], f)
+    except Exception as e:
+        logger.warning(f"No pude guardar las huellas de fotos: {e}")
+
+def guardar_imagen_factura(telefono, webp_bytes):
+    """Guarda la foto en data/{telefono}/facturas/ y devuelve la ruta"""
+    ruta_facturas = f"{obtener_ruta_datos(telefono)}/facturas"
+    os.makedirs(ruta_facturas, exist_ok=True)
+    ahora = datetime.now()
+    ruta_archivo = f"{ruta_facturas}/{ahora.strftime('%Y-%m-%d')}_{ahora.strftime('%Y%m%d_%H%M%S_%f')}.webp"
+    with open(ruta_archivo, "wb") as f:
+        f.write(webp_bytes)
+    return ruta_archivo
+
+def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo):
+    """Factura/recibo normal: un solo gasto. Si es factura de compra, también alimenta el comparador."""
+    cliente = vision_response.get('cliente') or 'Cliente'
+    descripcion = vision_response.get('descripcion') or 'Gasto'
+    es_compra = vision_response.get('tipo') == 'factura_compra'
+
+    fecha_gasto = pagos[0].get('fecha') or vision_response.get('fecha') or datetime.now().strftime("%Y-%m-%d")
+    if not fecha_valida(fecha_gasto):
+        fecha_gasto = datetime.now().strftime("%Y-%m-%d")
+    timestamp_formato = datetime.now().strftime("%Y%m%d_%H%M")
+    desc_normalizada = descripcion.lower().replace(' ', '').replace('-', '')[:15]
+    gasto_nuevo = {
+        "id": f"{timestamp_formato}_{desc_normalizada}_{int(pagado)}",
+        "fecha": fecha_gasto,
+        "timestamp": datetime.now().isoformat(),
+        "descripcion": descripcion,
+        "categoria": reportes.CARPETA_COMPRAS if es_compra else "otro",
+        "monto": pagado,
+        "cliente": cliente,
+        "factura_path": ruta_archivo
+    }
+    gastos = cargar_gastos(telefono)
+    gastos.append(gasto_nuevo)
+    guardar_gastos(telefono, gastos)
+
+    respuesta = f"Leí {cliente}: ${pagado:,.0f}."
+    if es_compra:
+        try:
+            reportes.guardar_en_carpeta(DATA_DIR, telefono, reportes.CARPETA_COMPRAS,
+                                        dict(gasto_nuevo, movimiento="gasto", tienda=vision_response.get('tienda')))
+        except Exception as e:
+            logger.warning(f"No pude guardar la compra en su carpeta: {e}")
+        # Factura de compra: sus productos alimentan el comparador de precios de la ciudad
+        try:
+            texto_precios = registrar_precios_factura(
+                telefono, vision_response.get('tienda') or cliente, vision_response.get('ciudad'),
+                vision_response.get('articulos'), fecha_gasto)
+            if texto_precios:
+                respuesta += "\n\n" + texto_precios
+        except Exception as e:
+            logger.error(f"Error guardando precios de la factura: {e}", exc_info=True)
+    return respuesta
+
+def contexto_agentes(telefono):
+    """Lo que el orquestador (app.py) necesita de main para guardar cada cosa en su lugar."""
+    phone_clean = normalizar_telefono(telefono)
+
+    def marcar_pregunta_tabla():
+        memoria_usuarios.setdefault(phone_clean, {})['ultima_pregunta'] = 'dashboard'
+        guardar_memoria(memoria_usuarios)
+
+    return orquestador.Contexto(
+        cliente=client,
+        modelo=MODELO_CLAUDE,
+        phone_clean=phone_clean,
+        guardar_imagen=lambda webp: guardar_imagen_factura(telefono, webp),
+        guardar_cobro=guardar_cobro,
+        cobro_actual=lambda: obtener_cobro(phone_clean),
+        guardar_gasto=lambda vision, pagos, total, ruta: guardar_gasto_factura(telefono, vision, pagos, total, ruta),
+        guardar_transferencia=lambda vision, pagos, total, ruta, texto: guardar_transferencia(
+            telefono, vision, pagos, total, ruta, texto),
+        huellas_vistas=lambda: huellas_vistas(telefono),
+        marcar_vistas=lambda huellas: marcar_vistas(telefono, huellas),
+        marcar_pregunta_tabla=marcar_pregunta_tabla,
+    )
+
+def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None):
+    """
+    Descarga las fotos de Twilio, las pasa a WEBP y las manda por los 4 agentes (app.procesar_fotos):
+    Portero (tipo y repetidas) -> Ojo (Vision) -> Calculadora (sumas en Python) -> Contadora (respuesta).
+    """
+    try:
+        imagenes = []
+        for media_url in media_urls:
+            imagen_bytes = descargar_media_twilio(media_url)
+            if not imagen_bytes:
+                return "❌ No pude descargar la imagen. Intenta de nuevo."
+            webp_bytes = convertir_a_webp(imagen_bytes)
+            if not webp_bytes:
+                return "❌ No pude procesar la imagen. Intenta con otra."
+            imagenes.append(webp_bytes)
+        return orquestador.procesar_fotos(imagenes, texto_usuario, contexto_agentes(telefono), info)
+    except Exception as e:
+        logger.error(f"Error en procesar_fotos_whatsapp: {e}", exc_info=True)
+        return f"❌ Error procesando factura: {str(e)}"
+
 def procesar_foto_inteligente(media_url, telefono, texto_usuario="", info=None):
     """
-    Procesa una foto de factura/recibo usando Claude Vision.
-    Descarga, convierte a WEBP, guarda en /app/data/{telefono}/facturas/
-    y extrae información con IA.
+    Procesa una foto de factura/recibo/libretita/transferencia (ver procesar_fotos_whatsapp).
     texto_usuario: lo que el usuario escribió junto a la foto (ayuda a clasificar transferencias).
     info: dict opcional donde se anota el tipo de documento leído (info["tipo"]).
     """
-    gasto = None  # Inicializar variable antes de try/except
-    try:
-        # Descargar imagen
-        imagen_bytes = descargar_media_twilio(media_url)
-        if not imagen_bytes:
-            return "❌ No pude descargar la imagen. Intenta de nuevo."
-
-        # Convertir a WEBP
-        webp_bytes = convertir_a_webp(imagen_bytes)
-        if not webp_bytes:
-            return "❌ No pude procesar la imagen. Intenta con otra."
-
-        # Guardar temporalmente en carpeta de facturas (con nombre genérico)
-        ruta_datos = obtener_ruta_datos(telefono)
-        ruta_facturas = f"{ruta_datos}/facturas"
-        os.makedirs(ruta_facturas, exist_ok=True)
-        fecha_hoy = datetime.now().strftime("%Y-%m-%d")
-        # Guardar con nombre temporal; se renombrará después de parsear
-        timestamp_tmp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ruta_archivo = f"{ruta_facturas}/{fecha_hoy}_{timestamp_tmp}.webp"
-        with open(ruta_archivo, "wb") as f:
-            f.write(webp_bytes)
-
-        # Convertir a base64 para Claude Vision
-        imagen_base64 = base64.standard_b64encode(webp_bytes).decode('utf-8')
-
-        # Llamar a Claude Vision con imagen WEBP
-        # CRÍTICO: Vision SOLO extrae números en JSON, NO suma
-        response = client.messages.create(
-            model=MODELO_CLAUDE,
-            max_tokens=3000,
-            messages=[{
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/webp",
-                            "data": imagen_base64
-                        }
-                    },
-                    {
-                        "type": "text",
-                        "text": """Eres OCR de libretita de cobros y facturas. Extrae TODO lo que veas en la imagen.
-
-Devuelve SOLO JSON valido, sin explicaciones:
-
-{
-  "cliente": "Maria Cristina",
-  "deuda_total": 3000,
-  "pagos": [
-    {"fecha": "2026-01-03", "monto": 200, "metodo": "efectivo", "nota": ""},
-    {"fecha": "2026-01-15", "monto": 120, "metodo": "transferencia", "nota": ""}
-  ],
-  "descripcion": "resumen breve de qué es",
-  "tipo": "libreta_cobros",
-  "tienda": null,
-  "ciudad": null,
-  "articulos": []
-}
-
-Si es una FACTURA o TICKET DE COMPRA con productos (supermercado, farmacia, ferretería...):
-  "tipo": "factura_compra",
-  "tienda": "Supermaxi",
-  "ciudad": "Quito",
-  "articulos": [
-    {"producto": "Arroz blanco", "producto_norm": "arroz blanco", "marca": "Balu", "medida": "2kg", "cantidad": 1, "precio": 3.50, "categoria": "granos"}
-  ]
-y en "pagos" pon el TOTAL de la factura como un solo pago.
-
-Si es una TRANSFERENCIA, deposito o comprobante de pago (captura de la app del banco, Zelle, Venmo, recibo de pago a una persona):
-  "tipo": "transferencia",
-  "concepto": "el concepto, motivo, descripcion o memo TAL CUAL aparece (ej: Sueldo mensual)",
-  "beneficiario": "a quien se le envio el dinero",
-  "ordenante": "quien envio el dinero",
-  "direccion": "enviada" si el dueño del celular mando el dinero, "recibida" si lo recibio, null si no se sabe,
-  "banco": "banco o app",
-  "referencia": "numero de comprobante si aparece",
-y en "pagos" pon el monto como un solo pago con la fecha de la transferencia. No inventes el concepto: si no aparece, null.
-
-Reglas:
-- pagos: un objeto por cada pago individual, en el mismo orden de la imagen.
-- fecha: extrae de la libretita "01-3-26" -> "2026-01-03" (formato YYYY-MM-DD). Si no hay fecha, usa null pero NO inventes.
-- monto: numero sin simbolo.
-- metodo: busca palabras clave en la misma linea: "transf", "transferencia", "T", "efectivo", "efec", "E", "cheque", "chq", "deposito", "zelle". Si dice "200 T" es transferencia. Si solo dice "200", metodo = "no especificado".
-- nota: si hay nota como "banco X" guardala en nota.
-- deuda_total: solo si aparece en la imagen.
-- Si es una factura o ticket normal con un solo total, pon ese total como un solo pago.
-- tipo: "libreta_cobros" (cuaderno de pagos/deudas), "factura_compra" (ticket con productos y precios), "transferencia" (comprobante de transferencia o pago a una persona) u "otro".
-- articulos: SOLO en factura_compra, una linea por producto. precio = precio UNITARIO (si dice "2 x 1.75  3.50", precio 1.75 y cantidad 2). producto_norm en minusculas, sin acentos, sin marca ni medida. marca y medida solo si aparecen (si no, ""). Si el precio de un producto no se lee claro, pon precio null.
-- ciudad: solo si aparece impresa en la factura (direccion de la tienda). Si no aparece, null. No la adivines.
-
-No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
-                    }
-                ]
-            }]
-        )
-
-        # Parsear respuesta JSON de Vision
-        try:
-            texto_respuesta = response.content[0].text.strip()
-            # Limpiar posibles marcas de código
-            if texto_respuesta.startswith('```'):
-                texto_respuesta = texto_respuesta.split('```')[1]
-                if texto_respuesta.startswith('json'):
-                    texto_respuesta = texto_respuesta[4:]
-            if texto_respuesta.endswith('```'):
-                texto_respuesta = texto_respuesta[:-3]
-
-            vision_response = json.loads(texto_respuesta)
-        except json.JSONDecodeError as e:
-            print(f"Error parseando JSON de Claude: {e}")
-            print(f"Respuesta: {texto_respuesta}")
-            return "❌ No pude procesar la factura. Asegúrate que sea una imagen clara."
-
-        # Verificar que se haya parseado correctamente
-        if not vision_response:
-            return "❌ No pude leer los números de la factura. Por favor, envía una imagen más clara o escribe el monto manualmente."
-
-        # PASO CRÍTICO: Calcular sumas determinísticas en Python, NO confiar en Vision
-        pagos = normalizar_pagos(vision_response.get('pagos', []))
-        deuda = a_numero(vision_response.get('deuda_total')) or 0
-        cliente = vision_response.get('cliente') or 'Cliente'
-        descripcion = vision_response.get('descripcion') or 'Gasto'
-        pagado = sum(p['monto'] for p in pagos)  # Suma real en Python, no Vision
-
-        phone_clean = normalizar_telefono(telefono)
-
-        es_compra = vision_response.get('tipo') == 'factura_compra'
-        if info is not None:
-            info['tipo'] = vision_response.get('tipo')
-
-        # Transferencia (sueldo, renta, deuda...): se clasifica sola y va a su carpeta
-        if vision_response.get('tipo') == 'transferencia':
-            if pagado <= 0:
-                return "❌ No pude leer el monto de la transferencia. Envía una captura más clara o escribe el monto."
-            return guardar_transferencia(telefono, vision_response, pagos, pagado, ruta_archivo, texto_usuario)
-
-        # Registro de pagos de una deuda: se guarda como LISTA de pagos, no como 1 gasto
-        if not es_compra and (deuda > 0 or len(pagos) > 1):
-            datos = {
-                "tipo": "cobro_deuda",
-                "cliente": cliente,
-                "deuda": deuda,
-                "pagado": pagado,
-                "saldo": deuda - pagado,
-                "pagos": pagos,
-                "descripcion": descripcion,
-                "fecha": datetime.now().isoformat(),
-                "factura_path": ruta_archivo,
-                "ultima_pregunta": "dashboard",
-            }
-            guardar_cobro(phone_clean, datos)
-
-            pagos_str = "+".join(f"{p['monto']:,.0f}" for p in pagos)
-            respuesta = f"Leí {len(pagos)} pagos de {cliente}:\n{pagos_str} = ${pagado:,.0f}"
-            if deuda:
-                respuesta += f"\nDeuda original: ${deuda:,.0f}\nTe falta: ${deuda - pagado:,.0f}"
-            return respuesta + "\n\n" + PREGUNTA_TABLA
-
-        # Factura/recibo normal: un solo gasto
-        if pagado <= 0:
-            return "❌ No pude leer los números de la factura. Por favor, envía una imagen más clara o escribe el monto manualmente."
-
-        fecha_gasto = pagos[0].get('fecha') or vision_response.get('fecha') or datetime.now().strftime("%Y-%m-%d")
-        if not fecha_valida(fecha_gasto):
-            fecha_gasto = datetime.now().strftime("%Y-%m-%d")
-        timestamp_formato = datetime.now().strftime("%Y%m%d_%H%M")
-        desc_normalizada = descripcion.lower().replace(' ', '').replace('-', '')[:15]
-        gasto_nuevo = {
-            "id": f"{timestamp_formato}_{desc_normalizada}_{int(pagado)}",
-            "fecha": fecha_gasto,
-            "timestamp": datetime.now().isoformat(),
-            "descripcion": descripcion,
-            "categoria": "otro",
-            "monto": pagado,
-            "cliente": cliente,
-            "factura_path": ruta_archivo
-        }
-        if es_compra:
-            gasto_nuevo["categoria"] = reportes.CARPETA_COMPRAS
-        gastos = cargar_gastos(telefono)
-        gastos.append(gasto_nuevo)
-        guardar_gastos(telefono, gastos)
-        if es_compra:
-            try:
-                reportes.guardar_en_carpeta(DATA_DIR, telefono, reportes.CARPETA_COMPRAS,
-                                            dict(gasto_nuevo, movimiento="gasto", tienda=vision_response.get('tienda')))
-            except Exception as e:
-                logger.warning(f"No pude guardar la compra en su carpeta: {e}")
-
-        respuesta = f"Leí {cliente}: ${pagado:,.0f}.\n\n"
-        if es_compra:
-            # Factura de compra: sus productos alimentan el comparador de precios de la ciudad
-            try:
-                texto_precios = registrar_precios_factura(
-                    telefono, vision_response.get('tienda') or cliente, vision_response.get('ciudad'),
-                    vision_response.get('articulos'), fecha_gasto)
-                if texto_precios:
-                    respuesta += texto_precios + "\n\n"
-            except Exception as e:
-                logger.error(f"Error guardando precios de la factura: {e}", exc_info=True)
-        respuesta += PREGUNTA_TABLA
-        memoria_usuarios.setdefault(phone_clean, {})['ultima_pregunta'] = 'dashboard'
-        guardar_memoria(memoria_usuarios)
-        return respuesta
-
-    except Exception as e:
-        logger.error(f"Error en procesar_foto_inteligente: {e}", exc_info=True)
-        return f"❌ Error procesando factura: {str(e)}"
+    return procesar_fotos_whatsapp([media_url], telefono, texto_usuario, info)
 
 NOMBRES_CARPETA = {"sueldo": "Sueldos", "renta": "Renta", "deuda": "Deudas", "servicios": "Servicios",
                    "ingreso": "Ingresos", "compras": "Compras", "por_revisar": "Por revisar"}
@@ -2139,90 +1961,48 @@ def gastos_del_mes(phone):
             gastos_mes.append(g)
     return sorted(gastos_mes, key=lambda x: x.get('fecha', ''))
 
-def titulo_cobro(cobro):
-    return f"Estado de Cuenta {cobro['cliente']} - Deuda ${cobro['deuda']:,.0f} - Saldo ${cobro['saldo']:,.0f}"
+# Estado de cuenta (PDF/Excel de la libretita): lo arma la Contadora (agent_reporter)
+titulo_cobro = agent_reporter.titulo_cobro
+estilo_tabla = agent_reporter.estilo_tabla
 
 def generar_excel_gastos(phone):
     """Excel con openpyxl. Cobro de deuda: hojas Pagos y Resumen. Si no: gastos del mes."""
     if not HAS_OPENPYXL:
         return None
     try:
-        from openpyxl.styles import Font, PatternFill
         phone_clean = normalizar_telefono(phone)
-        cobro = obtener_cobro(phone_clean)
-        negrita = Font(bold=True, color="FFFFFF")
-        relleno = PatternFill("solid", fgColor="1E40AF")
-        wb = Workbook()
-
-        def encabezado(ws, columnas):
-            ws.append(columnas)
-            for celda in ws[ws.max_row]:
-                celda.font = negrita
-                celda.fill = relleno
-
-        if cobro:
-            ws = wb.active
-            ws.title = "Pagos"
-            encabezado(ws, ["Fecha", "Monto", "Metodo", "Nota", "Saldo"])
-            gris = Font(color="9CA3AF", italic=True)
-            for fila in cobro['filas']:
-                fecha = datetime.strptime(fila['fecha'], '%Y-%m-%d') if fila['fecha'] else "sin fecha"
-                ws.append([fecha, fila['monto'], fila['metodo'], fila['nota'], fila['saldo']])
-                if fila['fecha']:
-                    ws.cell(row=ws.max_row, column=1).number_format = 'DD-MM-YY'
-                if fila['metodo'] == 'no especificado':
-                    ws.cell(row=ws.max_row, column=3).font = gris
-            ws.append(["TOTAL PAGADO", cobro['pagado'], "", "", cobro['saldo']])
-            ws[ws.max_row][0].font = Font(bold=True)
-
-            resumen = wb.create_sheet("Resumen")
-            encabezado(resumen, ["Concepto", "Valor"])
-            resumen.append(["Cliente", cobro['cliente']])
-            resumen.append(["Deuda", cobro['deuda']])
-            resumen.append(["Pagado", cobro['pagado']])
-            resumen.append(["Saldo", cobro['saldo']])
-            resumen.append(["Número de pagos", len(cobro['pagos'])])
-            if cobro['frecuencia_dias']:
-                resumen.append(["Frecuencia", f"Paga cada {cobro['frecuencia_dias']} días promedio"])
-            hojas = [ws, resumen]
-        else:
-            gastos_mes = gastos_del_mes(phone_clean)
-            if not gastos_mes:
-                return None
-            ws = wb.active
-            ws.title = "Transacciones"
-            encabezado(ws, ["Fecha", "Descripción", "Categoría", "Monto"])
-            for g in gastos_mes:
-                ws.append([g.get('fecha', ''), g.get('descripcion', ''), g.get('categoria', 'otro'), g.get('monto', 0)])
-            ws.append(["", "", "TOTAL", sum(g.get('monto', 0) for g in gastos_mes)])
-            hojas = [ws]
-
-        for hoja in hojas:
-            for col in hoja.columns:
-                hoja.column_dimensions[col[0].column_letter].width = max(12, max(len(str(c.value or '')) for c in col) + 2)
-            for fila in hoja.iter_rows(min_row=2):
-                for celda in fila:
-                    if isinstance(celda.value, (int, float)) and celda.column_letter != 'A':
-                        celda.number_format = '"$"#,##0.00'
-
         excel_path = f"/tmp/gastos_{phone_clean}_{datetime.now().strftime('%Y%m%d%H%M%S')}.xlsx"
+        cobro = obtener_cobro(phone_clean)
+        if cobro:
+            with open(excel_path, 'wb') as f:
+                f.write(agent_reporter.excel_cobro(cobro))
+            return excel_path
+
+        from openpyxl.styles import Font, PatternFill
+        gastos_mes = gastos_del_mes(phone_clean)
+        if not gastos_mes:
+            return None
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Transacciones"
+        ws.append(["Fecha", "Descripción", "Categoría", "Monto"])
+        for celda in ws[ws.max_row]:
+            celda.font = Font(bold=True, color="FFFFFF")
+            celda.fill = PatternFill("solid", fgColor="1E40AF")
+        for g in gastos_mes:
+            ws.append([g.get('fecha', ''), g.get('descripcion', ''), g.get('categoria', 'otro'), g.get('monto', 0)])
+        ws.append(["", "", "TOTAL", sum(g.get('monto', 0) for g in gastos_mes)])
+        for col in ws.columns:
+            ws.column_dimensions[col[0].column_letter].width = max(12, max(len(str(c.value or '')) for c in col) + 2)
+        for fila in ws.iter_rows(min_row=2):
+            for celda in fila:
+                if isinstance(celda.value, (int, float)) and celda.column_letter != 'A':
+                    celda.number_format = '"$"#,##0.00'
         wb.save(excel_path)
         return excel_path
     except Exception as e:
         logger.error(f"Error generando Excel: {e}", exc_info=True)
         return None
-
-def estilo_tabla(color_encabezado, color_filas):
-    return TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(color_encabezado)),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-        ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.HexColor(color_filas)]),
-        ('TOPPADDING', (0, 0), (-1, -1), 6),
-        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
-    ])
 
 def generar_pdf_dashboard(phone):
     """PDF con tabla. Cobro de deuda: estado de cuenta con pagos. Si no: gastos del mes."""
@@ -2236,59 +2016,26 @@ def generar_pdf_dashboard(phone):
         hoy = datetime.now()
         pdf_path = f"/tmp/gastos_{phone_clean}_{hoy.strftime('%Y%m%d')}.pdf"
         tmp_path = ruta_temporal(pdf_path)
+        if cobro:
+            with open(tmp_path, 'wb') as f:
+                f.write(agent_reporter.pdf_cobro(cobro))
+            publicar_pdf(tmp_path, pdf_path)
+            return pdf_path
+
         doc = SimpleDocTemplate(tmp_path, pagesize=letter)
         styles = getSampleStyleSheet()
         title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=15,
                                      textColor=colors.HexColor('#1e40af'), spaceAfter=6)
-        h2 = ParagraphStyle('H2', parent=styles['Heading2'], textColor=colors.HexColor('#1e40af'))
-        story = []
-
-        if cobro:
-            story.append(Paragraph(titulo_cobro(cobro), title_style))
-            story.append(Paragraph(f"Generado: {hoy.strftime('%d/%m/%Y')}", styles['Normal']))
-            story.append(Spacer(1, 0.25*inch))
-
-            resumen = Table([
-                ['Deuda', 'Pagado', 'Saldo'],
-                [f"${cobro['deuda']:,.2f}", f"${cobro['pagado']:,.2f}", f"${cobro['saldo']:,.2f}"],
-            ], colWidths=[2*inch, 2*inch, 2*inch])
-            estilo = estilo_tabla('#1e40af', '#f3f4f6')
-            estilo.add('FONTSIZE', (0, 1), (-1, 1), 13)
-            estilo.add('FONTNAME', (0, 1), (-1, 1), 'Helvetica-Bold')
-            if cobro['saldo'] > 0:
-                estilo.add('TEXTCOLOR', (2, 1), (2, 1), colors.HexColor('#dc2626'))
-            resumen.setStyle(estilo)
-            story.append(resumen)
-            if cobro['frecuencia_dias']:
-                story.append(Spacer(1, 0.1*inch))
-                story.append(Paragraph(f"Paga cada {cobro['frecuencia_dias']} días promedio", styles['Normal']))
-            story.append(Spacer(1, 0.3*inch))
-
-            story.append(Paragraph(f"Historial de Pagos ({len(cobro['pagos'])})", h2))
-            data = [['Pago #', 'Fecha', 'Monto', 'Metodo', 'Saldo Restante']]
-            for idx, fila in enumerate(cobro['filas'], 1):
-                data.append([str(idx), fila['fecha_corta'], f"${fila['monto']:,.2f}", fila['metodo'].capitalize(), f"${fila['saldo']:,.2f}"])
-            data.append(['', 'TOTAL', f"${cobro['pagado']:,.2f}", '', f"${cobro['saldo']:,.2f}"])
-            tabla = Table(data, colWidths=[0.7*inch, 1.1*inch, 1.3*inch, 1.6*inch, 1.5*inch])
-            estilo = estilo_tabla('#059669', '#f0fdf4')
-            for idx, fila in enumerate(cobro['filas'], 1):
-                if fila['metodo'] == 'no especificado':
-                    estilo.add('TEXTCOLOR', (3, idx), (3, idx), colors.HexColor('#9ca3af'))
-            estilo.add('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold')
-            estilo.add('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#e5e7eb'))
-            tabla.setStyle(estilo)
-            story.append(tabla)
-        else:
-            story.append(Paragraph("Reporte de Gastos del Mes", title_style))
-            story.append(Paragraph(f"Fecha: {hoy.strftime('%d/%m/%Y')}", styles['Normal']))
-            story.append(Spacer(1, 0.3*inch))
-            data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
-            for g in gastos_mes:
-                data.append([g.get('fecha', ''), g.get('descripcion', '')[:30], g.get('categoria', 'otro'), f"${g.get('monto', 0):,.2f}"])
-            data.append(['', '', 'TOTAL', f"${sum(g.get('monto', 0) for g in gastos_mes):,.2f}"])
-            tabla = Table(data)
-            tabla.setStyle(estilo_tabla('#1e40af', '#f3f4f6'))
-            story.append(tabla)
+        story = [Paragraph("Reporte de Gastos del Mes", title_style),
+                 Paragraph(f"Fecha: {hoy.strftime('%d/%m/%Y')}", styles['Normal']),
+                 Spacer(1, 0.3*inch)]
+        data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
+        for g in gastos_mes:
+            data.append([g.get('fecha', ''), g.get('descripcion', '')[:30], g.get('categoria', 'otro'), f"${g.get('monto', 0):,.2f}"])
+        data.append(['', '', 'TOTAL', f"${sum(g.get('monto', 0) for g in gastos_mes):,.2f}"])
+        tabla = Table(data)
+        tabla.setStyle(estilo_tabla('#1e40af', '#f3f4f6'))
+        story.append(tabla)
 
         doc.build(story)
         publicar_pdf(tmp_path, pdf_path)
@@ -3297,7 +3044,14 @@ def whatsapp():
     # Si hay media, procesar según tipo
     if media_url_0:
         if media_content_type.startswith("image/"):
-            return atender_con_imagen(media_url_0, incoming_msg, from_number, server_url)
+            # WhatsApp puede mandar varias fotos juntas (MediaUrl0, MediaUrl1...): van todas al Portero
+            try:
+                num_media = int(request.form.get('NumMedia', '1') or 1)
+            except ValueError:
+                num_media = 1
+            media_urls = [request.form.get(f'MediaUrl{i}', '') for i in range(max(num_media, 1))
+                          if request.form.get(f'MediaContentType{i}', media_content_type).startswith("image/")]
+            return atender_con_imagen([u for u in media_urls if u] or [media_url_0], incoming_msg, from_number, server_url)
         elif media_content_type.startswith("audio/"):
             return atender_con_audio(media_url_0, incoming_msg, from_number, server_url)
 
@@ -3352,8 +3106,11 @@ def atender(incoming_msg, from_number, server_url):
     return str(resp)
 
 
-def atender_con_imagen(media_url, incoming_msg, from_number, server_url):
-    """Procesa una imagen (factura/recibo) con Claude Vision"""
+def atender_con_imagen(media_urls, incoming_msg, from_number, server_url):
+    """Procesa una o varias imágenes (factura/recibo/libretita) con los 4 agentes"""
+    if isinstance(media_urls, str):
+        media_urls = [media_urls]
+    media_url = media_urls[0]
     salida = Salida()
     estado = {"listo": False, "tarde": False}
     candado = threading.Lock()
@@ -3400,12 +3157,13 @@ def atender_con_imagen(media_url, incoming_msg, from_number, server_url):
             # Si no es precio, usar el flujo normal de gastos
             # Procesar la imagen con visión
             info_foto = {}
-            resultado = procesar_foto_inteligente(media_url, from_number, incoming_msg or "", info_foto)
+            resultado = procesar_fotos_whatsapp(media_urls, from_number, incoming_msg or "", info_foto)
             salida.message(resultado)
 
-            # Si hay texto adicional, validar antes de reclasificar
-            # (en transferencias el texto ya se usó para elegir la carpeta)
-            if incoming_msg and incoming_msg.lower().strip() and info_foto.get('tipo') != 'transferencia':
+            # Si hay texto adicional, validar antes de reclasificar. Solo si la foto se guardó como
+            # UN gasto: en transferencias el texto ya eligió la carpeta, y una libretita no es un gasto.
+            solo_un_gasto = info_foto.get('caminos') == ['facturas']
+            if incoming_msg and incoming_msg.lower().strip() and solo_un_gasto:
                 msg_lower = incoming_msg.lower()
 
                 # VALIDACIÓN: Detectar si es una queja/comentario o un envio_ecuador
