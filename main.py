@@ -167,6 +167,10 @@ print("[STARTUP] Yoly Bot initialization complete")
 GOALS_FILE = 'goals.json'
 FINANCIAL_CONTEXT_FILE = 'financial_context.json'
 
+# ==================== TEMPORARY EXPENSES FOR CONFIRMATION FLOW ====================
+# Global dict to store expenses temporarily until user confirms with SI/NO
+temp_gastos = {}
+
 # ==================== FINANCIAL CONTEXT PERSISTENCE ====================
 
 def cargar_contexto_financiero():
@@ -1695,6 +1699,12 @@ def generar_presupuesto(datos):
 
 # ==================== DASHBOARD FUNCTIONS ====================
 
+def normalizar_telefono(phone):
+    """Normaliza el número de teléfono removiendo +, espacios, y guiones"""
+    if not phone:
+        return ""
+    return phone.replace('+', '').replace(' ', '').replace('-', '').strip()
+
 def generar_excel_gastos(phone):
     """Genera un archivo Excel con los gastos del usuario del mes actual"""
     if not HAS_PANDAS:
@@ -1852,7 +1862,26 @@ def download_informe_metas():
 def dashboard(phone):
     """Dashboard con vista de gastos y botones de descarga - Tailwind CSS + PWA"""
     try:
-        gastos = cargar_gastos(phone)
+        # Normalizar teléfono
+        phone_clean = normalizar_telefono(phone)
+        phone_display = phone_clean[-4:] if phone_clean else "?????"
+
+        # Intentar cargar gastos con teléfono normalizado
+        gastos = cargar_gastos(phone_clean)
+
+        # Si no encuentra gastos, buscar en carpetas existentes normalizando
+        if not gastos:
+            ruta_datos = obtener_ruta_datos(phone_clean)
+            if not os.path.exists(ruta_datos):
+                # Buscar en /home/claude/yoly/data/ por variaciones
+                data_dir = '/home/claude/yoly/data'
+                if os.path.exists(data_dir):
+                    for folder in os.listdir(data_dir):
+                        if normalizar_telefono(folder) == phone_clean:
+                            gastos = cargar_gastos(folder)
+                            if gastos:
+                                phone_clean = folder
+                            break
 
         if not gastos:
             return render_template_string("""
@@ -1877,7 +1906,7 @@ def dashboard(phone):
         <div class="bg-white rounded-2xl shadow-xl p-8 text-center">
             <div class="text-5xl mb-4">📭</div>
             <h1 class="text-3xl font-bold text-gray-800 mb-2">Aún no hay gastos</h1>
-            <p class="text-gray-600 text-lg mb-6">Hola {phone}! Comienza a registrar tus gastos para ver tu panel aquí.</p>
+            <p class="text-gray-600 text-lg mb-6">Hola {{ phone_display }}! Comienza a registrar tus gastos para ver tu panel aquí.</p>
 
             <div class="bg-blue-50 border-l-4 border-blue-500 p-4 mb-6 rounded">
                 <p class="text-blue-800">
@@ -1899,12 +1928,12 @@ def dashboard(phone):
             navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW registration failed'));
         }
         if (localStorage) {
-            localStorage.setItem('yoly_phone', '{phone}');
+            localStorage.setItem('yoly_phone', '{{ phone_clean }}');
         }
     </script>
 </body>
 </html>
-            """)
+            """, phone_display=phone_display, phone_clean=phone_clean)
 
         # Filtrar gastos del mes actual
         hoy = datetime.now()
@@ -2002,7 +2031,7 @@ def dashboard(phone):
     <div class="bg-gradient-to-r from-blue-600 to-indigo-600 text-white py-6 slideDown">
         <div class="container mx-auto px-4 max-w-6xl">
             <h1 class="text-3xl font-bold mb-1">💰 Yoly - Panel de Finanzas</h1>
-            <p class="text-blue-100">{hoy.strftime('%B %Y')} | {phone}</p>
+            <p class="text-blue-100">{hoy.strftime('%B %Y')} | {phone_display}</p>
         </div>
     </div>
 
@@ -2026,10 +2055,10 @@ def dashboard(phone):
 
         <!-- Action Buttons -->
         <div class="flex flex-wrap gap-3 mb-8 fadeIn" style="animation-delay: 200ms;">
-            <a href="/dashboard/{phone}/excel" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+            <a href="/dashboard/{phone_clean}/excel" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
                 📊 Descargar Excel
             </a>
-            <a href="/dashboard/{phone}/pdf" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+            <a href="/dashboard/{phone_clean}/pdf" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
                 📄 Descargar PDF
             </a>
             <button onclick="compartir()" class="flex-1 md:flex-none bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105">
@@ -2070,13 +2099,13 @@ def dashboard(phone):
 
         // localStorage
         if (localStorage) {{
-            localStorage.setItem('yoly_phone', '{phone}');
+            localStorage.setItem('yoly_phone', '{phone_clean}');
             localStorage.setItem('yoly_dashboard_visited', new Date().toISOString());
         }}
 
         // Share functionality
         function compartir() {{
-            const text = 'Mi panel de finanzas en Yoly: {phone}';
+            const text = 'Mi panel de finanzas en Yoly: {phone_display}';
             if (navigator.share) {{
                 navigator.share({{
                     title: 'Yoly - Panel de Finanzas',
@@ -2108,7 +2137,9 @@ def descargar_excel(phone):
         return "Excel no disponible (pandas no instalado)", 501
 
     try:
-        excel_path = generar_excel_gastos(phone)
+        # Normalizar teléfono
+        phone_clean = normalizar_telefono(phone)
+        excel_path = generar_excel_gastos(phone_clean)
         if not excel_path or not os.path.exists(excel_path):
             return "No hay gastos para descargar", 404
 
@@ -2116,7 +2147,7 @@ def descargar_excel(phone):
             datos = f.read()
 
         return Response(datos, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                       headers={"Content-Disposition": f"attachment; filename=gastos_{phone}.xlsx"})
+                       headers={"Content-Disposition": f"attachment; filename=gastos_{phone_clean}.xlsx"})
     except Exception as e:
         logger.error(f"Error descargando Excel: {e}", exc_info=True)
         return f"Error al generar Excel: {str(e)}", 500
@@ -2125,11 +2156,13 @@ def descargar_excel(phone):
 def descargar_pdf(phone):
     """Descarga los gastos en PDF"""
     try:
-        pdf_path = generar_pdf_dashboard(phone)
+        # Normalizar teléfono
+        phone_clean = normalizar_telefono(phone)
+        pdf_path = generar_pdf_dashboard(phone_clean)
         if not pdf_path or not os.path.exists(pdf_path):
             return "No hay gastos para descargar", 404
 
-        return servir_pdf(pdf_path, f'gastos_{phone}.pdf')
+        return servir_pdf(pdf_path, f'gastos_{phone_clean}.pdf')
     except Exception as e:
         logger.error(f"Error descargando PDF: {e}", exc_info=True)
         return f"Error al generar PDF: {str(e)}", 500
@@ -2455,9 +2488,73 @@ def atender_con_audio(media_url, incoming_msg, from_number, server_url):
 
 def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     """Arma la respuesta de Yoly. `resp` junta los textos (ver Salida)."""
+    global temp_gastos
     msg_lower = incoming_msg.lower()
 
     try:
+        # ==================== CONFIRMATION FLOW: SI/NO ====================
+        # Check if user is confirming or rejecting a temporary expense
+        confirmacion_palabras = ['si', 'yes', 'ok', 'vale', 'correcto', 'está bien', 'esta bien', 'ok!', 'si!', 'sí']
+        rechazo_palabras = ['no', 'nope', 'incorrecto', 'de nuevo', 'de vueltas', 'otra vez']
+
+        if msg_lower.strip() in confirmacion_palabras and from_number in temp_gastos:
+            # User confirmed the expense!
+            gasto_temp = temp_gastos[from_number]
+            phone_clean = normalizar_telefono(from_number)
+            gastos = cargar_gastos(phone_clean)
+            timestamp_iso = datetime.now().isoformat()
+            gasto_id = f"desglose_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+            total = gasto_temp["total_enviado"]
+            desglose = gasto_temp["desglose"]
+            reserva = gasto_temp["reserva"]
+            alerta = gasto_temp.get("alerta")
+
+            gasto_nuevo = {
+                "id": gasto_id,
+                "fecha": datetime.now().strftime("%Y-%m-%d"),
+                "timestamp": timestamp_iso,
+                "descripcion": "Desglose de gastos",
+                "monto": total,
+                "categoria": "desglose",
+                "total": total,
+                "desglose_json": desglose,
+                "reserva": reserva,
+                "diferencia": gasto_temp["diferencia"],
+                "validacion_alerta": alerta
+            }
+
+            gastos.append(gasto_nuevo)
+            guardar_gastos(phone_clean, gastos)
+            del temp_gastos[from_number]
+
+            logger.info(f"Expense breakdown confirmed and saved for {from_number}: ${total}")
+
+            # Send confirmation
+            auto_respuesta = "¡Listo! ✅\n📤 Total: $" + f"{total:.2f}\n"
+            for categoria, monto in desglose.items():
+                auto_respuesta += f"  • {categoria.title()}: ${monto:.2f}\n"
+
+            if reserva > 0:
+                auto_respuesta += f"  • Reserva por si acaso: ${reserva:.2f}\n"
+            elif reserva < 0:
+                auto_respuesta += f"  • Sobregiro: ${abs(reserva):.2f} ⚠️\n"
+
+            if alerta:
+                auto_respuesta += f"\n{alerta}\n"
+
+            dashboard_url = f"{server_url}/dashboard/{phone_clean}"
+            auto_respuesta += f"\nAquí tienes tu panel: {dashboard_url}\n\n"
+            auto_respuesta += "¿Quieres PDF del mes o con esto es suficiente?"
+
+            resp.message(auto_respuesta)
+            return
+
+        elif msg_lower.strip() in rechazo_palabras and from_number in temp_gastos:
+            # User rejected the expense
+            del temp_gastos[from_number]
+            resp.message("❌ Listo, cancelado. Dime de nuevo cómo es. Ejemplo: 'Envié 500, renta 380, comida 120'")
+            return
         # ==================== DETECCIÓN DE PALABRAS CLAVE: PDF, EXCEL, LINK, PANEL, DASHBOARD ====================
 
         palabras_clave_link = ['pdf', 'excel', 'link', 'panel', 'dashboard', 'descargar']
@@ -2466,11 +2563,12 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
             logger.info(f"Keyword detection for dashboard/downloads: {from_number}")
 
             # Generar respuesta rápida
+            phone_clean = normalizar_telefono(from_number)
             if 'pdf' in msg_lower:
                 try:
-                    pdf_path = generar_pdf_dashboard(from_number)
+                    pdf_path = generar_pdf_dashboard(phone_clean)
                     if pdf_path and os.path.exists(pdf_path):
-                        pdf_url = f"{server_url}/dashboard/{from_number}/pdf"
+                        pdf_url = f"{server_url}/dashboard/{phone_clean}/pdf"
                         twilio_client.messages.create(
                             from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
                             to=from_number,
@@ -2487,9 +2585,9 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
                     resp.message("Excel no está disponible en este momento. Usa el PDF en su lugar.")
                     return
                 try:
-                    excel_path = generar_excel_gastos(from_number)
+                    excel_path = generar_excel_gastos(phone_clean)
                     if excel_path and os.path.exists(excel_path):
-                        excel_url = f"{server_url}/dashboard/{from_number}/excel"
+                        excel_url = f"{server_url}/dashboard/{phone_clean}/excel"
                         resp.message(f"Tu Excel está listo: {excel_url}")
                         return
                 except Exception as e:
@@ -2497,8 +2595,9 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
 
             # Si pide link, dashboard, panel o descargar
             if any(keyword in msg_lower for keyword in ['link', 'panel', 'dashboard']):
-                dashboard_url = f"{server_url}/dashboard/{from_number}"
-                resp.message(f"Aquí está: {dashboard_url}\n\nTuenes opciones para descargar Excel o PDF una vez ahí.")
+                phone_clean = normalizar_telefono(from_number)
+                dashboard_url = f"{server_url}/dashboard/{phone_clean}"
+                resp.message(f"Aquí está: {dashboard_url}\n\nTienes opciones para descargar Excel o PDF una vez ahí.")
                 return
 
         # ==================== REGISTRO DE GASTOS CON DESGLOSE ====================
@@ -2518,73 +2617,26 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
             reserva = resultado["reserva"]
             alerta = resultado.get("alerta")
 
-            # Generar resumen detallado
-            resumen = f"✓ Total: ${total:.2f}\n\nDesglose:\n"
+            # STORE TEMPORARILY - Don't save yet!
+            temp_gastos[from_number] = resultado
+            logger.info(f"Expense breakdown stored temporarily for {from_number}: ${total}")
+
+            # Ask for confirmation
+            resumen = f"Entendí esto:\n📤 Total: ${total:.2f}\n\nDesglose:\n"
             for categoria, monto in desglose.items():
                 resumen += f"  • {categoria.title()}: ${monto:.2f}\n"
 
             if reserva > 0:
                 resumen += f"  • Reserva: ${reserva:.2f}\n"
             elif reserva < 0:
-                resumen += f"  • Reserva: ${reserva:.2f} ⚠️\n"
-
-            resumen += f"\nTotal verificado: ${total:.2f}"
+                resumen += f"  • Sobregiro: ${abs(reserva):.2f} ⚠️\n"
 
             if alerta:
-                resumen += f"\n\n{alerta}"
+                resumen += f"\n{alerta}\n"
+
+            resumen += "\n¿Está bien? Responde **SI** o **NO**"
 
             resp.message(resumen)
-
-            # Guardar gasto en la BD
-            try:
-                gastos = cargar_gastos(from_number)
-                timestamp_iso = datetime.now().isoformat()
-                gasto_id = f"desglose_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-
-                gasto_nuevo = {
-                    "id": gasto_id,
-                    "fecha": datetime.now().strftime("%Y-%m-%d"),
-                    "timestamp": timestamp_iso,
-                    "descripcion": "Desglose de gastos",
-                    "monto": total,
-                    "categoria": "desglose",
-                    "total": total,
-                    "desglose_json": desglose,
-                    "reserva": reserva,
-                    "diferencia": resultado["diferencia"],
-                    "validacion_alerta": alerta
-                }
-
-                gastos.append(gasto_nuevo)
-                guardar_gastos(from_number, gastos)
-                logger.info(f"Expense breakdown saved for {from_number}: ${total}")
-
-                # ==================== AUTO-RESPUESTA POST-GASTO ====================
-                # Construir resumen detallado del desglose para la auto-respuesta
-                auto_respuesta = "¡Listo! ✅\n📤 Total: $" + f"{total:.2f}\n"
-                for categoria, monto in desglose.items():
-                    auto_respuesta += f"  • {categoria.title()}: ${monto:.2f}\n"
-
-                if reserva > 0:
-                    auto_respuesta += f"  • Reserva por si acaso: ${reserva:.2f}\n"
-                elif reserva < 0:
-                    auto_respuesta += f"  • Sobregiro: ${abs(reserva):.2f} ⚠️\n"
-                else:
-                    auto_respuesta += f"  • Reserva por si acaso: $0\n"
-
-                # Alerta si hay sobregiro
-                if alerta:
-                    auto_respuesta += f"\n{alerta}\n"
-
-                # Enviar link del dashboard
-                dashboard_url = f"{server_url}/dashboard/{from_number}"
-                auto_respuesta += f"\nAquí tienes tu panel para ver todo: {dashboard_url}\n\n"
-                auto_respuesta += "¿Quieres que también te genere el PDF del mes o con esto es suficiente?"
-
-                resp.message(auto_respuesta)
-            except Exception as e:
-                logger.error(f"Error saving expense breakdown: {e}", exc_info=True)
-
             return
 
         # ==================== BORRAR GASTO ====================
