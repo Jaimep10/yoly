@@ -175,6 +175,34 @@ temp_gastos = {}
 # Global dict to store products extracted from tickets/receipts temporarily
 temp_productos = {}
 
+# ==================== USER MEMORY PERSISTENCE ====================
+# Global dict to store user memory by phone number
+memoria_usuarios = {}
+
+def cargar_memoria():
+    """Carga memoria global existente desde archivo si existe"""
+    memoria_archivo = '/app/data/memoria_global.json'
+    if os.path.exists(memoria_archivo):
+        try:
+            with open(memoria_archivo, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def guardar_memoria(memoria):
+    """Guarda memoria global en archivo"""
+    memoria_archivo = '/app/data/memoria_global.json'
+    try:
+        os.makedirs(os.path.dirname(memoria_archivo), exist_ok=True)
+        with open(memoria_archivo, 'w', encoding='utf-8') as f:
+            json.dump(memoria, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"Error guardando memoria: {e}")
+
+# Carga memoria al inicio
+memoria_usuarios = cargar_memoria()
+
 # ==================== FINANCIAL CONTEXT PERSISTENCE ====================
 
 def cargar_contexto_financiero():
@@ -542,6 +570,32 @@ Sé específico en categoría: si es Home Depot o ferretería -> materiales. Si 
         gastos = cargar_gastos(telefono)
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
+
+        # Guardar en memoria si contiene información de deuda
+        palabras_deuda = ['deuda', 'alan', 'balance', 'adeudo', 'debo', 'pendiente', 'pago']
+        descripcion_lower = descripcion.lower()
+        categoria_lower = categoria.lower()
+
+        es_deuda = any(palabra in descripcion_lower or palabra in categoria_lower
+                       for palabra in palabras_deuda)
+
+        if es_deuda:
+            phone_clean = normalizar_telefono(telefono)
+            deuda_total = gasto.get('monto', monto)
+            total_pagado = gasto.get('total_pagado', 0) if 'total_pagado' in gasto else 0
+
+            memoria_usuarios[phone_clean] = {
+                'tipo': 'deuda',
+                'deuda_total': deuda_total,
+                'total_pagado': total_pagado,
+                'fecha_inicio': fecha_hoy,
+                'fecha_final': fecha_hoy,
+                'balance': deuda_total - total_pagado,
+                'estado': 'guardado',
+                'descripcion': descripcion,
+                'gasto_id': gasto_id
+            }
+            guardar_memoria(memoria_usuarios)
 
         # Respuesta al usuario
         items = gasto.get('descripcion', '')
@@ -3013,10 +3067,34 @@ def buscar_precios(producto_query):
 
 def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     """Arma la respuesta de Yoly. `resp` junta los textos (ver Salida)."""
-    global temp_gastos, temp_productos
+    global temp_gastos, temp_productos, memoria_usuarios
     msg_lower = incoming_msg.lower()
+    phone_clean = normalizar_telefono(from_number)
 
     try:
+        # ==================== INTENT DETECTION: BALANCE / DEUDA ====================
+        # Palabras clave para detectar consulta de balance
+        palabras_balance = ['balance', 'alan', 'debo', 'cuanto debo', 'cuanto falta', 'deuda', 'adeudo', 'que debo']
+        tiene_intent_balance = any(palabra in msg_lower for palabra in palabras_balance)
+
+        if tiene_intent_balance and phone_clean in memoria_usuarios:
+            datos = memoria_usuarios[phone_clean]
+            if datos.get('tipo') == 'deuda':
+                deuda = datos.get('deuda_total', 0)
+                pagado = datos.get('total_pagado', 0)
+                balance = datos.get('balance', 0)
+                fecha = datos.get('fecha_final', '')
+
+                respuesta_balance = f"""💳 Según lo que registraste:
+Deuda: ${deuda}
+Pagado (hasta {fecha}): ${pagado}
+Te falta: ${balance}
+
+Link: {server_url}/dashboard/{phone_clean}"""
+
+                resp.message(respuesta_balance)
+                return
+
         # ==================== CONFIRMATION FLOW: SI/NO ====================
         # Check if user is confirming or rejecting a temporary expense
         confirmacion_palabras = ['si', 'yes', 'ok', 'vale', 'correcto', 'está bien', 'esta bien', 'ok!', 'si!', 'sí']
