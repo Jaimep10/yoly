@@ -267,6 +267,56 @@ def procesar_audio_groq(ruta_tmp):
         )
     return result if isinstance(result, str) else str(result)
 
+def extraer_gastos(transcripcion):
+    """
+    FUNCION SEGURA: Extrae SOLO números que aparecen en la transcripción real.
+    NUNCA inventa montos ni usa ejemplos hardcodeados.
+
+    PASO 1: Extrae SOLO números que aparecen en texto
+    PASO 2: Si no hay números, retorna error pidiendo confirmación
+    PASO 3: Log para debug
+    PASO 4: Procesa solo números reales de transcripción
+    """
+    import re
+
+    try:
+        # PASO 1: Extrae SOLO números que aparecen en el texto
+        # Busca números con o sin $ o punto decimal
+        numeros_en_texto = re.findall(r'\$?(\d+(?:\.\d+)?)', transcripcion)
+
+        # PASO 2: Si no hay números, NO sumes nada
+        if not numeros_en_texto:
+            return {"error": "No escuché montos precisos. ¿Puedes repetir los números?", "numeros": []}
+
+        # PASO 3: Log para debug
+        print(f"[SEGURIDAD] TRANSCRIPCION ORIGINAL: {transcripcion}")
+        print(f"[SEGURIDAD] NUMEROS EXTRAIDOS: {numeros_en_texto}")
+
+        # PASO 4: Procesa solo números reales de transcripción
+        numeros_float = []
+        for n in numeros_en_texto:
+            try:
+                numeros_float.append(float(n))
+            except ValueError:
+                continue
+
+        if not numeros_float:
+            return {"error": "No escuché montos válidos. ¿Puedes repetir?", "numeros": []}
+
+        total = sum(numeros_float)
+        print(f"[SEGURIDAD] TOTAL CALCULADO: {total}")
+
+        return {
+            "total": round(total, 2),
+            "numeros": numeros_float,
+            "cantidad_items": len(numeros_float),
+            "transcripcion_usada": transcripcion
+        }
+
+    except Exception as e:
+        logger.error(f"Error en extraer_gastos: {e}", exc_info=True)
+        return {"error": f"Error procesando transcripción: {str(e)}", "numeros": []}
+
 def procesar_audio(media_url, telefono):
     """
     Descarga un audio desde Twilio y lo transcribe con Groq Whisper Large V3.
@@ -352,18 +402,19 @@ def procesar_foto_inteligente(media_url, telefono):
                         "type": "text",
                         "text": """Analiza esta factura/recibo/ticket. Extrae SOLO un JSON válido, sin explicaciones:
 {
-  "monto": (número, ej: 45.50),
+  "monto": cantidad total de la factura,
   "fecha": "YYYY-MM-DD",
   "proveedor": "nombre del lugar/empresa",
   "categoria": "materiales|envio_ecuador|comida|renta|otro",
   "tipo_documento": "factura|recibo_envio|ticket",
   "destino": "nombre del destino o lugar",
-  "tarifa_envio": (número o 0),
+  "tarifa_envio": solo si aparece envío en la factura,
   "para_quien": "persona o descripción",
   "descripcion": "resumen breve"
 }
 
-Sé específico: si es Home Depot o ferretería -> materiales. Si menciona Ecuador o envío -> envio_ecuador. Si es comida -> comida. Si es alquiler/renta -> renta."""
+INSTRUCCION CRITICA: SOLO extrae números que REALMENTE aparecen en la factura. NUNCA inventes montos. Si no ves claramente el precio, deja el campo vacío o pregunta.
+Sé específico en categoría: si es Home Depot o ferretería -> materiales. Si menciona Ecuador o envío -> envio_ecuador. Si es comida -> comida. Si es alquiler/renta -> renta."""
                     }
                 ]
             }]
@@ -388,7 +439,7 @@ Sé específico: si es Home Depot o ferretería -> materiales. Si menciona Ecuad
 
         # Verificar que gasto se haya parseado correctamente
         if not gasto:
-            return "No pude leer bien los números, ¿puedes escribirlos así: Renta 500, Comida 480...?"
+            return "❌ No pude leer los números de la factura. Por favor, envía una imagen más clara o escribe el monto manualmente."
 
         # Crear estructura de gasto en nuevo formato
         fecha_hoy = datetime.now().strftime("%Y-%m-%d")
@@ -1919,12 +1970,11 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
             logger.info(f"New goal creation request from {from_number}")
             respuesta = """Para crear una meta, necesito estos datos:
 🎯 Nombre: ¿Cuál es tu objetivo?
-💰 Monto: ¿Cuánto necesitas?
+💰 Monto: ¿Cuánto necesitas? (especifica el monto exacto que tienes en mente)
 📅 Plazo: ¿Para cuándo? (ej: 3 meses, 31/12/2024)
 📂 Tipo: deuda, ahorro o inversión
 
-Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
-"""
+Dime cada dato claramente. NUNCA usaré números que no menciones explícitamente."""
             resp.message(respuesta)
             return
 
