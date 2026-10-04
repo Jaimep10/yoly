@@ -1,6 +1,8 @@
 import os
+os.environ["MPLBACKEND"] = "Agg"  # sin ventanas: los gráficos se dibujan fuera del hilo principal (Mac)
 import json
 import logging
+import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, send_file, jsonify
 from twilio.twiml.messaging_response import MessagingResponse
@@ -45,9 +47,52 @@ for var_name, var_desc in required_env_vars.items():
         print(f"[OK] {var_desc} is configured")
         logger.info(f"Environment variable {var_name} is configured")
 
+# Modelo fijo: claude-3-5-haiku y claude-3-haiku ya están retirados por Anthropic.
+MODELO_CLAUDE = "claude-haiku-4-5"
+
+# WhatsApp/Twilio rechaza mensajes de más de 1600 caracteres.
+LIMITE_WHATSAPP = 1500
+
+def partir_mensaje(texto, limite=LIMITE_WHATSAPP):
+    """Divide el texto en partes de <= limite, cortando en salto de línea o espacio."""
+    partes = []
+    while len(texto) > limite:
+        corte = texto.rfind("\n", 0, limite + 1)
+        if corte <= 0:
+            corte = texto.rfind(" ", 0, limite + 1)
+        if corte <= 0:
+            corte = limite
+        partes.append(texto[:corte].rstrip())
+        texto = texto[corte:].lstrip()
+    if texto:
+        partes.append(texto)
+    return partes
+
+def responder(resp, texto):
+    """Agrega la respuesta al TwiML, en varios mensajes si es larga."""
+    print(f"Respuesta generada: {len(texto)} caracteres")
+    for parte in partir_mensaje(texto):
+        resp.message(parte)
+
+# Twilio corta el webhook a los 15 s y entonces el usuario no recibe nada.
+# Si Yoly tarda más que esto, contesta "ya te respondo" y manda la respuesta
+# después por la API de Twilio.
+ESPERA_MAX_SEGUNDOS = 10
+MENSAJE_ESPERA = "⏳ Recibí tu mensaje. Lo estoy procesando, en unos segundos te respondo."
+
+class Salida:
+    """Junta los textos de la respuesta. Tiene .message() como MessagingResponse,
+    así el código de cada comando no cambia si la respuesta sale después."""
+    def __init__(self):
+        self.textos = []
+
+    def message(self, texto):
+        self.textos.append(texto)
+
 # Initialize clients
 try:
-    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+    # Sin esto el SDK espera hasta 10 min por llamada y reintenta 2 veces.
+    client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"), timeout=60.0, max_retries=1)
     logger.info("[OK] Anthropic client initialized")
 except Exception as e:
     print(f"[WARNING] Failed to initialize Anthropic client: {e}")
@@ -186,7 +231,7 @@ def analizar_metas_y_dar_consejos():
     # Solicitar análisis a Claude
     try:
         response = client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
+            model=MODELO_CLAUDE,
             max_tokens=800,
             system="""Eres Yoly, un asesor financiero amable y motivador.
 Analiza las metas del usuario y proporciona:
@@ -402,28 +447,106 @@ def generar_informe_gastos():
     c.save()
     return pdf_path
 
-def generar_presupuesto():
-    """Genera un PDF profesional con análisis de presupuesto mensual y asesoramiento financiero"""
+SEMANAS_POR_MES = 52 / 12
+
+ESQUEMA_PRESUPUESTO = {
+    "type": "object",
+    "properties": {
+        "ingresos": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "concepto": {"type": "string"},
+                "monto": {"type": "number"},
+                "periodo": {"type": "string", "enum": ["hora", "dia", "semana", "quincena", "mes", "año"]},
+                "horas_por_dia": {"type": "number", "description": "0 si el usuario no lo dijo"},
+                "dias_por_semana": {"type": "number", "description": "0 si el usuario no lo dijo"},
+            },
+            "required": ["concepto", "monto", "periodo", "horas_por_dia", "dias_por_semana"],
+            "additionalProperties": False,
+        }},
+        "gastos": {"type": "array", "items": {
+            "type": "object",
+            "properties": {
+                "concepto": {"type": "string"},
+                "monto": {"type": "number"},
+                "periodo": {"type": "string", "enum": ["dia", "semana", "quincena", "mes", "año"]},
+                "es_deuda": {"type": "boolean"},
+            },
+            "required": ["concepto", "monto", "periodo", "es_deuda"],
+            "additionalProperties": False,
+        }},
+    },
+    "required": ["ingresos", "gastos"],
+    "additionalProperties": False,
+}
+
+FACTOR_MENSUAL = {"semana": SEMANAS_POR_MES, "quincena": 2, "mes": 1, "año": 1 / 12, "dia": 365 / 12}
+
+def extraer_presupuesto(mensaje):
+    """Lee ingresos y gastos del mensaje del usuario y los pasa a montos mensuales.
+    Devuelve (datos, faltan). Si falta algo, datos es None y faltan dice qué preguntar."""
+    response = client.messages.create(
+        model=MODELO_CLAUDE,
+        max_tokens=2000,
+        system=("Extrae los ingresos y gastos que el usuario escribió, tal como los dijo. "
+                "No inventes montos ni conceptos que no estén en el mensaje. "
+                "Corrige solo errores de tipeo obvios en los conceptos (ej. 'rebta' -> 'renta'). "
+                "Marca es_deuda=true solo si el usuario dice que es una deuda o un pago de préstamo."),
+        messages=[{"role": "user", "content": mensaje}],
+        output_config={"format": {"type": "json_schema", "schema": ESQUEMA_PRESUPUESTO}},
+    )
+    data = json.loads(next(b.text for b in response.content if b.type == "text"))
+
+    faltan = []
+    ingreso = 0.0
+    for ing in data["ingresos"]:
+        if ing["periodo"] == "hora":
+            if not ing["horas_por_dia"] or not ing["dias_por_semana"]:
+                faltan.append(f"¿Cuántas horas al día y cuántos días a la semana trabajas por tu ingreso de ${ing['monto']:g}/hora?")
+                continue
+            ingreso += ing["monto"] * ing["horas_por_dia"] * ing["dias_por_semana"] * SEMANAS_POR_MES
+        elif ing["periodo"] == "dia":
+            if not ing["dias_por_semana"]:
+                faltan.append(f"¿Cuántos días a la semana recibes tu ingreso de ${ing['monto']:g}/día?")
+                continue
+            ingreso += ing["monto"] * ing["dias_por_semana"] * SEMANAS_POR_MES
+        else:
+            ingreso += ing["monto"] * FACTOR_MENSUAL[ing["periodo"]]
+
+    if not data["ingresos"] or (not faltan and ingreso <= 0):
+        faltan.append("¿Cuánto ganas y cada cuánto (por hora, semana o mes)?")
+    if not data["gastos"]:
+        faltan.append("¿Cuáles son tus gastos y cuánto pagas en cada uno?")
+    if faltan:
+        return None, faltan
+
+    gastos_fijos, deudas = {}, {}
+    for g in data["gastos"]:
+        destino = deudas if g["es_deuda"] else gastos_fijos
+        destino[g["concepto"]] = destino.get(g["concepto"], 0) + round(g["monto"] * FACTOR_MENSUAL[g["periodo"]], 2)
+    return {"ingreso": round(ingreso, 2), "gastos_fijos": gastos_fijos, "deudas": deudas}, []
+
+def salud_financiera(surplus, income):
+    """Resumen según el porcentaje del ingreso que queda libre cada mes."""
+    if surplus < 0:
+        return "En riesgo: gastas más de lo que ganas"
+    tasa = surplus / income * 100
+    if tasa < 10:
+        return "Ajustado: te queda menos del 10% del ingreso"
+    if tasa < 20:
+        return "Aceptable: te queda entre 10% y 20% del ingreso"
+    return "Saludable: te queda 20% o más del ingreso"
+
+def generar_presupuesto(datos):
+    """Genera un PDF con el presupuesto mensual del usuario y consejos de Claude.
+    Devuelve (pdf_path, consejo_ok); consejo_ok es False si Claude no pudo dar consejos."""
     pdf_path = '/tmp/presupuesto_analisis.pdf'
     chart_path_pie = '/tmp/presupuesto_pie.png'
     chart_path_bar = '/tmp/presupuesto_bar.png'
 
-    # Datos del presupuesto
-    income = 3640
-    fixed_expenses = {
-        "Rent": 600,
-        "Food": 480,
-        "Gym": 53,
-        "Phone": 85,
-        "Subscriptions": 100
-    }
-    debt_expenses = {
-        "Collaborator Debt": 120,
-        "Debt-eciador": 380,
-        "Debt-César": 300,
-        "Debt-Yoly": 300,
-        "Debt-Jenny": 200
-    }
+    income = datos["ingreso"]
+    fixed_expenses = datos["gastos_fijos"]
+    debt_expenses = datos["deudas"]
 
     total_fixed = sum(fixed_expenses.values())
     total_debt = sum(debt_expenses.values())
@@ -450,7 +573,7 @@ def generar_presupuesto():
     bars = plt.bar(labels, values, color=colors_bar, width=0.6)
     plt.ylabel('Amount ($)', fontsize=11, fontweight='bold')
     plt.title('Income vs Expenses', fontsize=14, fontweight='bold')
-    plt.ylim(0, 4000)
+    plt.axhline(0, color='black', linewidth=0.8)
 
     # Add value labels on bars
     for bar, value in zip(bars, values):
@@ -585,14 +708,17 @@ def generar_presupuesto():
 
     try:
         advisor_response = client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
+            model=MODELO_CLAUDE,
             max_tokens=800,
             system="Eres un asesor financiero profesional. Proporciona análisis financiero detallado pero conciso en español.",
             messages=[{"role": "user", "content": advisor_message}]
         )
         advice_text = advisor_response.content[0].text
+        consejo_ok = True
     except Exception as e:
-        advice_text = f"Unable to generate advice: {str(e)}"
+        logger.error(f"Error generando consejo del asesor: {e}", exc_info=True)
+        advice_text = "No se pudo generar el análisis del asesor en este momento."
+        consejo_ok = False
 
     story.append(Paragraph(advice_text, styles['Normal']))
     story.append(Spacer(1, 0.2*inch))
@@ -602,7 +728,7 @@ def generar_presupuesto():
     summary_text = f"""<b>Monthly Surplus:</b> ${surplus:.2f}<br/>
     <b>Debt-to-Income Ratio:</b> {(total_debt/income)*100:.1f}%<br/>
     <b>Savings Rate:</b> {(surplus/income)*100:.1f}%<br/>
-    <b>Overall Health:</b> Excellent - Strong surplus for debt payoff and emergency savings
+    <b>Overall Health:</b> {salud_financiera(surplus, income)}
     """
     story.append(Paragraph(summary_text, styles['Normal']))
 
@@ -621,7 +747,7 @@ def generar_presupuesto():
     except:
         pass
 
-    return pdf_path
+    return pdf_path, consejo_ok
 
 @app.route("/", methods=["GET"])
 def home():
@@ -691,6 +817,8 @@ def whatsapp():
     print(f"[WHATSAPP] Extracted - From: {from_number}, MessageSID: {message_sid}, Body: {incoming_msg}")
     logger.info(f"[WHATSAPP] Message received - From: {from_number}, Body: {incoming_msg[:100]}")
 
+    print(f"Pregunta recibida: {len(incoming_msg)} caracteres")
+
     if not incoming_msg:
         logger.warning(f"Empty message body received from {from_number}")
         print(f"[WARNING] Empty message body from {from_number}")
@@ -708,8 +836,60 @@ def whatsapp():
     print(f"[WHATSAPP MESSAGE] From: {from_number} | SID: {message_sid} | Body: {incoming_msg[:100]}")
     logger.info(f"Message received | From: {from_number} | MessageSID: {message_sid} | Body: {incoming_msg}")
 
-    # Initialize response
+    server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
+    return atender(incoming_msg, from_number, server_url)
+
+
+def enviar_por_twilio(to, textos):
+    """Manda la respuesta por la API de Twilio (para cuando el webhook ya contestó)."""
+    for texto in textos:
+        for parte in partir_mensaje(texto):
+            try:
+                twilio_client.messages.create(from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'), to=to, body=parte)
+            except Exception as e:
+                logger.error(f"No se pudo enviar la respuesta a {to}: {e}", exc_info=True)
+                return
+
+
+def atender(incoming_msg, from_number, server_url):
+    """Procesa el mensaje en otro hilo. Si termina dentro de ESPERA_MAX_SEGUNDOS,
+    la respuesta va en el TwiML como siempre; si no, el webhook contesta
+    MENSAJE_ESPERA y el hilo manda la respuesta por Twilio al terminar."""
+    salida = Salida()
+    estado = {"listo": False, "tarde": False}
+    candado = threading.Lock()
+
+    def trabajar():
+        try:
+            procesar_mensaje(incoming_msg, from_number, server_url, salida)
+        except Exception as e:
+            logger.error(f"Error procesando mensaje de {from_number}: {e}", exc_info=True)
+            salida.message("Disculpa, hubo un error procesando tu mensaje. Intenta de nuevo.")
+        with candado:
+            estado["listo"] = True
+            enviar_despues = estado["tarde"]
+        if enviar_despues:
+            logger.info(f"Respuesta tardía enviada por Twilio a {from_number}")
+            enviar_por_twilio(from_number, salida.textos)
+
+    hilo = threading.Thread(target=trabajar, daemon=True)
+    hilo.start()
+    hilo.join(ESPERA_MAX_SEGUNDOS)
+
     resp = MessagingResponse()
+    with candado:
+        if estado["listo"]:
+            for texto in salida.textos:
+                resp.message(texto)
+            return str(resp)
+        estado["tarde"] = True
+    logger.info(f"Respuesta a {from_number} tarda más de {ESPERA_MAX_SEGUNDOS}s: se enviará por Twilio")
+    resp.message(MENSAJE_ESPERA)
+    return str(resp)
+
+
+def procesar_mensaje(incoming_msg, from_number, server_url, resp):
+    """Arma la respuesta de Yoly. `resp` junta los textos (ver Salida)."""
     msg_lower = incoming_msg.lower()
 
     try:
@@ -722,7 +902,7 @@ def whatsapp():
             if not metas:
                 logger.info("No goals found for user")
                 resp.message("No tienes metas registradas. Puedo ayudarte a crearlas. ¿Cuál es tu objetivo financiero?")
-                return str(resp)
+                return
 
             # Generar resumen de metas
             resumen = "📊 *Tus Metas Financieras:*\n"
@@ -737,14 +917,14 @@ def whatsapp():
 
             logger.info(f"Goals summary sent to {from_number}")
             resp.message(resumen)
-            return str(resp)
+            return
 
         # Solicitar consejos y análisis de metas
         if any(keyword in msg_lower for keyword in ['consejo', 'consejos metas', 'analiza metas', 'tips', 'motivación']):
             logger.info(f"Financial advice request from {from_number}")
             consejo = analizar_metas_y_dar_consejos()
-            resp.message(consejo)
-            return str(resp)
+            responder(resp, consejo)
+            return
 
         # Ver progreso de una meta específica
         if 'progreso' in msg_lower or 'avance' in msg_lower:
@@ -752,7 +932,7 @@ def whatsapp():
             metas = obtener_metas()
             if not metas:
                 resp.message("No tienes metas. Crea una para empezar.")
-                return str(resp)
+                return
 
             resumen_progreso = "📈 *Progreso de Metas:*\n"
             for meta in metas:
@@ -761,7 +941,7 @@ def whatsapp():
 
             logger.info(f"Progress report sent to {from_number}")
             resp.message(resumen_progreso)
-            return str(resp)
+            return
 
         # Descargar informe de metas
         if 'informe metas' in msg_lower or 'reporte metas' in msg_lower:
@@ -769,7 +949,6 @@ def whatsapp():
             try:
                 pdf_path = generar_informe_metas()
                 if pdf_path and os.path.exists(pdf_path):
-                    server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
                     pdf_url = f"{server_url}/download/informe_metas.pdf"
                     logger.info(f"Goals report generated: {pdf_url}")
 
@@ -781,15 +960,15 @@ def whatsapp():
                     )
                     logger.info(f"Goals report sent to {from_number}")
                     resp.message("Informe de metas enviado ✓")
-                    return str(resp)
+                    return
                 else:
                     logger.warning(f"Goals report generation failed for {from_number}")
                     resp.message("No tienes metas para generar el informe. ¡Crea algunas!")
-                    return str(resp)
+                    return
             except Exception as e:
                 logger.error(f"Error generando informe de metas: {e}", exc_info=True)
                 resp.message(f"Error al generar informe: {str(e)}")
-                return str(resp)
+                return
 
         # Registrar nueva meta - detectar patrones
         if any(keyword in msg_lower for keyword in ['quiero ahorrar', 'quiero pagar', 'meta:', 'objetivo:', 'nueva meta', 'nueva objetivo']):
@@ -803,7 +982,7 @@ def whatsapp():
 Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
 """
             resp.message(respuesta)
-            return str(resp)
+            return
 
         # Actualizar progreso de meta
         if 'actualizar' in msg_lower or 'ahorré' in msg_lower or 'pagué' in msg_lower:
@@ -811,13 +990,13 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
             metas = obtener_metas()
             if not metas:
                 resp.message("No tienes metas. Crea una primero.")
-                return str(resp)
+                return
 
             respuesta = "¿Cuál meta actualizaste? Dime el nombre:\n"
             for meta in metas:
                 respuesta += f"\n• {meta['nombre']}"
             resp.message(respuesta)
-            return str(resp)
+            return
 
         # ==================== BUDGET & EXPENSE KEYWORDS ====================
 
@@ -826,7 +1005,6 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
             logger.info(f"Expense report request from {from_number}")
             try:
                 generar_informe_gastos()
-                server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
                 pdf_url = f"{server_url}/download/informe_gastos.pdf"
                 logger.info(f"Expense report generated: {pdf_url}")
 
@@ -838,11 +1016,11 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
                 )
                 logger.info(f"Expense report sent to {from_number}")
                 resp.message("Informe de gastos enviado. Descárgalo desde el enlace.")
-                return str(resp)
+                return
             except Exception as e:
                 logger.error(f"Error generando informe de gastos: {e}", exc_info=True)
                 resp.message(f"Error al generar informe: {str(e)}")
-                return str(resp)
+                return
 
         # Detectar palabras clave para asesor financiero
         financial_keywords = ['presupuesto', 'gastos', 'asesor', 'ahorro']
@@ -851,36 +1029,42 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
         if should_generate_budget:
             logger.info(f"Budget analysis request from {from_number}")
             try:
-                logger.debug("Generating budget analysis...")
-                generar_presupuesto()
+                logger.debug("Extracting budget data from message...")
+                datos, faltan = extraer_presupuesto(incoming_msg)
+                if faltan:
+                    responder(resp, "Para armar tu presupuesto me falta:\n" + "\n".join(f"• {f}" for f in faltan))
+                    return
+                logger.debug(f"Generating budget analysis: {datos}")
+                _, consejo_ok = generar_presupuesto(datos)
 
-                server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
                 pdf_url = f"{server_url}/download/presupuesto_analisis.pdf"
                 logger.info(f"Budget analysis generated: {pdf_url}")
 
                 twilio_client.messages.create(
                     from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
                     to=from_number,
-                    body="📊 Aquí está tu análisis de presupuesto mensual con recomendaciones del asesor financiero de IA:",
+                    body=("📊 Aquí está tu análisis de presupuesto mensual con recomendaciones del asesor financiero de IA:"
+                          if consejo_ok else "📊 Aquí está tu presupuesto mensual:"),
                     media_url=[pdf_url]
                 )
 
                 logger.info(f"Budget analysis sent to {from_number}")
-                resp = MessagingResponse()
-                resp.message("✅ Reporte de presupuesto enviado. Incluye tu análisis financiero y recomendaciones personalizadas.")
-                return str(resp)
+                if consejo_ok:
+                    resp.message("✅ Reporte de presupuesto enviado. Incluye tu análisis financiero y recomendaciones personalizadas.")
+                else:
+                    resp.message("📄 Te envié el reporte con tus números, pero no pude generar los consejos del asesor. Intenta de nuevo en unos minutos.")
+                return
             except Exception as e:
                 logger.error(f"Error generando presupuesto: {e}", exc_info=True)
-                resp = MessagingResponse()
                 resp.message(f"❌ Error al generar presupuesto: {str(e)}")
-                return str(resp)
+                return
 
         # ==================== DEFAULT RESPONSE ====================
 
         # Respuesta normal con Claude
         logger.info(f"Processing message with Claude API for {from_number}")
         response = client.messages.create(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-20241022"),
+            model=MODELO_CLAUDE,
             max_tokens=500,
             system="Eres Yoly, un asistente virtual amable, útil, que responde corto y en español. Eres especialista en finanzas personales y ayudas a tus usuarios a gestionar sus metas financieras.",
             messages=[{"role": "user", "content": incoming_msg}]
@@ -893,10 +1077,10 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
         print(f"[ERROR] Unexpected error processing message: {e}")
         bot_response = f"Disculpa, hubo un error procesando tu mensaje: {str(e)}"
 
-    resp.message(bot_response)
+    responder(resp, bot_response)
     print(f"[RESPONSE] Sent to {from_number}: {bot_response[:100]}")
     logger.info(f"Response sent to {from_number}")
-    return str(resp)
+    return
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

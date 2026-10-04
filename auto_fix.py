@@ -8,7 +8,7 @@ if not os.getenv('ANTHROPIC_API_KEY'):
     print("ERROR: Falta ANTHROPIC_API_KEY")
     sys.exit(1)
 
-os.environ.setdefault('ANTHROPIC_MODEL', 'claude-3-5-haiku-20241022')
+os.environ.setdefault('ANTHROPIC_MODEL', 'claude-haiku-4-5')
 os.environ.setdefault('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+14155238886')
 
 from simular_whatsapp import simular_mensaje
@@ -40,8 +40,8 @@ while intento < max_intentos:
             # El error ya está arreglado en main.py
 
         elif "model" in error_msg or "404" in error_msg:
-            print(f"[FIX] Modelo no encontrado - usando claude-3-5-haiku-20241022...")
-            os.environ['ANTHROPIC_MODEL'] = 'claude-3-5-haiku-20241022'
+            print(f"[FIX] Modelo no encontrado - usando claude-haiku-4-5...")
+            os.environ['ANTHROPIC_MODEL'] = 'claude-haiku-4-5'
 
         elif "hardcoded" in error_msg:
             print(f"[FIX] Número hardcodeado detectado...")
