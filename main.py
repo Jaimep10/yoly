@@ -4,7 +4,9 @@ import json
 import logging
 import threading
 import io
+import re
 from datetime import datetime, timedelta
+from calendar import monthrange
 from flask import Flask, request, jsonify, Response
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
@@ -22,7 +24,9 @@ import base64
 import requests
 from requests.auth import HTTPBasicAuth
 from PIL import Image as PILImage
-from openai import OpenAI
+from faster_whisper import WhisperModel
+import zipfile
+import io
 
 app = Flask(__name__)
 
@@ -39,8 +43,7 @@ required_env_vars = {
     'TWILIO_ACCOUNT_SID': 'Twilio Account SID',
     'TWILIO_AUTH_TOKEN': 'Twilio Auth Token',
     'TWILIO_WHATSAPP_NUMBER': 'Twilio WhatsApp Number',
-    'ANTHROPIC_API_KEY': 'Anthropic API Key',
-    'OPENAI_API_KEY': 'OpenAI API Key'
+    'ANTHROPIC_API_KEY': 'Anthropic API Key'
 }
 
 missing_vars = []
@@ -137,6 +140,14 @@ except Exception as e:
     print(f"[WARNING] Failed to initialize Twilio client: {e}")
     logger.warning(f"Failed to initialize Twilio client: {e}")
     twilio_client = None
+
+try:
+    modelo_whisper = WhisperModel("small", device="cpu", compute_type="int8")
+    logger.info("[OK] Whisper model loaded")
+except Exception as e:
+    print(f"[WARNING] Failed to initialize Whisper model: {e}")
+    logger.warning(f"Failed to initialize Whisper model: {e}")
+    modelo_whisper = None
 
 if missing_vars:
     print(f"[WARNING] App will start but some features may not work. Missing: {', '.join(missing_vars)}")
@@ -244,9 +255,26 @@ def convertir_a_webp(imagen_bytes, max_dimension=1024, quality=70):
         logger.error(f"Error convirtiendo a WEBP: {e}", exc_info=True)
         return None
 
+def procesar_audio_local(ruta_tmp):
+    """
+    Transcribe un audio local usando faster-whisper.
+    Retorna el texto transcrito o None en caso de error.
+    """
+    try:
+        if not modelo_whisper:
+            return None
+
+        segments, _ = modelo_whisper.transcribe(ruta_tmp, language="es")
+        texto = " ".join([s.text for s in segments]).strip()
+        return texto
+    except Exception as e:
+        print(f"Error transcribiendo audio: {e}")
+        logger.error(f"Error transcribiendo audio: {e}", exc_info=True)
+        return None
+
 def procesar_audio(media_url, telefono):
     """
-    Descarga un audio desde Twilio y lo transcribe con Whisper.
+    Descarga un audio desde Twilio y lo transcribe con Whisper local.
     Retorna el texto transcrito o un mensaje de error.
     """
     try:
@@ -260,14 +288,8 @@ def procesar_audio(media_url, telefono):
         with open(temp_path, "wb") as f:
             f.write(contenido)
 
-        # Transcribir con Whisper
-        client_oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        with open(temp_path, "rb") as f:
-            transcripcion = client_oai.audio.transcriptions.create(
-                model="whisper-1",
-                file=f,
-                language="es"
-            )
+        # Transcribir con Whisper local
+        texto = procesar_audio_local(temp_path)
 
         # Limpiar archivo temporal
         try:
@@ -275,7 +297,10 @@ def procesar_audio(media_url, telefono):
         except:
             pass
 
-        return transcripcion.text
+        if not texto:
+            return "❌ No pude transcribir el audio. Intenta de nuevo."
+
+        return texto
     except Exception as e:
         print(f"Error procesando audio: {e}")
         logger.error(f"Error procesando audio: {e}", exc_info=True)
@@ -299,10 +324,12 @@ def procesar_foto_inteligente(media_url, telefono):
             return "❌ No pude procesar la imagen. Intenta con otra."
 
         # Guardar en carpeta de facturas
-        ruta_facturas = f"/app/data/{telefono}/facturas"
+        ruta_datos = obtener_ruta_datos(telefono)
+        ruta_facturas = f"{ruta_datos}/facturas"
         os.makedirs(ruta_facturas, exist_ok=True)
-        timestamp = datetime.now().isoformat().replace(':', '-')
-        ruta_archivo = f"{ruta_facturas}/factura_{timestamp}.webp"
+        fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+        desc_normalizada = gasto.get('descripcion', 'factura').lower().replace(' ', '').replace('-', '')[:15]
+        ruta_archivo = f"{ruta_facturas}/{fecha_hoy}_{desc_normalizada}.webp"
         with open(ruta_archivo, "wb") as f:
             f.write(webp_bytes)
 
@@ -362,18 +389,34 @@ Sé específico: si es Home Depot o ferretería -> materiales. Si menciona Ecuad
             print(f"Respuesta: {texto_respuesta}")
             return "❌ No pude procesar la factura. Asegúrate que sea una imagen clara."
 
-        # Agregar timestamp y guardar
-        gasto['id'] = datetime.now().isoformat()
+        # Crear estructura de gasto en nuevo formato
+        fecha_hoy = datetime.now().strftime("%Y-%m-%d")
+        timestamp_iso = datetime.now().isoformat()
+        descripcion = gasto.get('descripcion', gasto.get('proveedor', 'Gasto'))
+        monto = gasto.get('monto', 0)
+        categoria = gasto.get('categoria', 'otro')
+
+        # Crear ID único: fecha_hora_descripcion_monto
+        timestamp_formato = datetime.now().strftime("%Y%m%d_%H%M")
+        desc_normalizada = descripcion.lower().replace(' ', '').replace('-', '')[:15]
+        gasto_id = f"{timestamp_formato}_{desc_normalizada}_{int(monto)}"
+
+        gasto_nuevo = {
+            "id": gasto_id,
+            "fecha": fecha_hoy,
+            "timestamp": timestamp_iso,
+            "descripcion": descripcion,
+            "monto": monto,
+            "categoria": categoria,
+            "factura_path": ruta_archivo
+        }
+
         gastos = cargar_gastos(telefono)
-        gastos.append(gasto)
+        gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
 
         # Respuesta al usuario
-        categoria = gasto.get('categoria', 'otro')
-        monto = gasto.get('monto', '0')
-        proveedor = gasto.get('proveedor', 'Proveedor')
         items = gasto.get('descripcion', '')
-
         return f"Listo, leí tu nota: {items}. Total ${monto} guardado. ¿Quieres el balance?"
 
     except Exception as e:
@@ -460,6 +503,366 @@ Devuelve SOLO un JSON válido con un array 'gastos':
     except Exception as e:
         logger.error(f"Error en reclasificar_gasto: {e}", exc_info=True)
         return f"❌ Error reclasificando: {str(e)}"
+
+def borrar_gasto(telefono, query_usuario):
+    """
+    Borra un gasto según lo que pida el usuario.
+    - "borra el ultimo gasto" -> toma ultimo de gastos.json
+    - "borra Blusanprom 100" -> busca desc contiene "blusanprom" y monto 100
+    Responde con confirmación y luego elimina.
+    """
+    try:
+        gastos = cargar_gastos(telefono)
+        if not gastos:
+            return "No tienes gastos para borrar."
+
+        query_lower = query_usuario.lower()
+        gasto_a_borrar = None
+
+        # Buscar el último gasto
+        if 'ultimo' in query_lower or 'última' in query_lower:
+            gasto_a_borrar = gastos[-1]
+        else:
+            # Buscar por descripción y monto
+            for gasto in reversed(gastos):
+                desc = gasto.get('descripcion', '').lower()
+                # Extraer números de la query
+                numeros = re.findall(r'\d+', query_usuario)
+
+                for num in numeros:
+                    monto = gasto.get('monto', 0)
+                    if desc.find(query_lower.split()[0].lower()) >= 0 and float(monto) == float(num):
+                        gasto_a_borrar = gasto
+                        break
+
+                if gasto_a_borrar:
+                    break
+
+        if not gasto_a_borrar:
+            # Búsqueda más flexible: solo por descripción
+            for gasto in reversed(gastos):
+                desc = gasto.get('descripcion', '').lower()
+                if query_lower.replace('borra', '').strip() in desc:
+                    gasto_a_borrar = gasto
+                    break
+
+        if not gasto_a_borrar:
+            return "No encontré ese gasto. ¿Puedes dar más detalles?"
+
+        # Responder con confirmación
+        desc = gasto_a_borrar.get('descripcion', '')
+        monto = gasto_a_borrar.get('monto', 0)
+        fecha = gasto_a_borrar.get('fecha', '')
+
+        # Guardar para confirmación (guardar en contexto de usuario si es posible)
+        ruta_datos = obtener_ruta_datos(telefono)
+        pendiente_path = f"{ruta_datos}/.pendiente_borrar.json"
+        with open(pendiente_path, "w") as f:
+            json.dump(gasto_a_borrar, f)
+
+        return f"¿Confirmas borrar: {desc} ${monto} del {fecha}? Responde si/no"
+
+    except Exception as e:
+        logger.error(f"Error en borrar_gasto: {e}", exc_info=True)
+        return f"❌ Error al borrar: {str(e)}"
+
+def confirmar_borrado(telefono):
+    """
+    Confirma el borrado de un gasto pendiente.
+    Se llama si el usuario responde 'si' a la confirmación.
+    """
+    try:
+        ruta_datos = obtener_ruta_datos(telefono)
+        pendiente_path = f"{ruta_datos}/.pendiente_borrar.json"
+
+        if not os.path.exists(pendiente_path):
+            return "No hay gasto pendiente para borrar."
+
+        with open(pendiente_path, "r") as f:
+            gasto_a_borrar = json.load(f)
+
+        gastos = cargar_gastos(telefono)
+
+        # Borrar el gasto
+        gastos = [g for g in gastos if g.get('id') != gasto_a_borrar.get('id')]
+        guardar_gastos(telefono, gastos)
+
+        # Borrar factura si existe
+        factura_path = gasto_a_borrar.get('factura_path', '')
+        if factura_path and os.path.exists(factura_path):
+            try:
+                os.remove(factura_path)
+            except:
+                pass
+
+        # Calcular nuevo balance
+        nuevo_total = sum(g.get('monto', 0) for g in gastos)
+
+        # Limpiar pendiente
+        os.remove(pendiente_path)
+
+        return f"Listo, borrada. Tu balance ahora es ${nuevo_total}."
+
+    except Exception as e:
+        logger.error(f"Error confirmando borrado: {e}", exc_info=True)
+        return f"❌ Error al confirmar: {str(e)}"
+
+def parsear_rango_fechas(texto_usuario):
+    """
+    Parsea diferentes formatos de rango de fechas.
+    Retorna (fecha_inicio, fecha_fin) o (None, None) si no puede parsear.
+    """
+    try:
+        hoy = datetime.now()
+        texto = texto_usuario.lower()
+
+        # "1 al 15 de octubre" o "1 al 15 de este mes"
+        if '1 al 15' in texto or 'primer quincena' in texto:
+            mes_actual = hoy.month
+            anio_actual = hoy.year
+            if 'pasado' in texto or 'mes pasado' in texto:
+                mes_actual -= 1
+                if mes_actual == 0:
+                    mes_actual = 12
+                    anio_actual -= 1
+            return datetime(anio_actual, mes_actual, 1), datetime(anio_actual, mes_actual, 15)
+
+        if '16 al 31' in texto or '16 al 30' in texto or 'segunda quincena' in texto:
+            mes_actual = hoy.month
+            anio_actual = hoy.year
+            if 'pasado' in texto or 'mes pasado' in texto:
+                mes_actual -= 1
+                if mes_actual == 0:
+                    mes_actual = 12
+                    anio_actual -= 1
+            # Ultimo día del mes
+            if mes_actual == 12:
+                ultimo_dia = 31
+            else:
+                ultimo_dia = monthrange(anio_actual, mes_actual)[1]
+            return datetime(anio_actual, mes_actual, 16), datetime(anio_actual, mes_actual, ultimo_dia)
+
+        # "ultimos 15 dias"
+        if 'ultimos' in texto and 'dias' in texto:
+            match = re.search(r'ultimos?\s+(\d+)\s+dias?', texto)
+            if match:
+                dias = int(match.group(1))
+                fin = hoy
+                inicio = hoy - timedelta(days=dias)
+                return inicio, fin
+
+        # "esta quincena"
+        if 'esta quincena' in texto or 'esta quincena' in texto:
+            if hoy.day <= 15:
+                return datetime(hoy.year, hoy.month, 1), datetime(hoy.year, hoy.month, 15)
+            else:
+                ultimo_dia = monthrange(hoy.year, hoy.month)[1]
+                return datetime(hoy.year, hoy.month, 16), datetime(hoy.year, hoy.month, ultimo_dia)
+
+        # "este mes"
+        if 'este mes' in texto:
+            return datetime(hoy.year, hoy.month, 1), hoy
+
+        # "corte del mes pasado" o "balance de agosto"
+        meses = {
+            'enero': 1, 'febrero': 2, 'marzo': 3, 'abril': 4, 'mayo': 5, 'junio': 6,
+            'julio': 7, 'agosto': 8, 'septiembre': 9, 'octubre': 10, 'noviembre': 11, 'diciembre': 12
+        }
+
+        for mes_nombre, mes_num in meses.items():
+            if mes_nombre in texto:
+                anio = hoy.year
+                if 'pasado' in texto or 'mes pasado' in texto:
+                    anio -= 1
+                from calendar import monthrange
+                ultimo_dia = monthrange(anio, mes_num)[1]
+                return datetime(anio, mes_num, 1), datetime(anio, mes_num, ultimo_dia)
+
+        return None, None
+
+    except Exception as e:
+        logger.error(f"Error parseando rango de fechas: {e}")
+        return None, None
+
+def generar_corte(telefono, texto_usuario):
+    """
+    Genera un corte de gastos e ingresos para un rango de fechas.
+    Parsea la fecha, filtra gastos/ingresos, calcula totales.
+    Si usuario dice "zip" o "mandale a mi contadora", crea ZIP.
+    """
+    try:
+        fecha_inicio, fecha_fin = parsear_rango_fechas(texto_usuario)
+
+        if not fecha_inicio or not fecha_fin:
+            return "No entendí las fechas. Prueba: '1 al 15 de octubre', 'ultimos 15 dias', 'este mes', 'corte de agosto'"
+
+        gastos = cargar_gastos(telefono)
+
+        # Filtrar por rango de fechas
+        gastos_rango = []
+        ingresos_rango = []
+
+        for gasto in gastos:
+            fecha_str = gasto.get('fecha', '')
+            try:
+                fecha_gasto = datetime.strptime(fecha_str, '%Y-%m-%d')
+                if fecha_inicio <= fecha_gasto <= fecha_fin:
+                    gastos_rango.append(gasto)
+            except:
+                pass
+
+        # Cargar ingresos si existen
+        ruta_datos = obtener_ruta_datos(telefono)
+        ingresos_file = f"{ruta_datos}/ingresos.json"
+        if os.path.exists(ingresos_file):
+            try:
+                with open(ingresos_file, 'r') as f:
+                    ingresos = json.load(f)
+                for ingreso in ingresos:
+                    fecha_str = ingreso.get('fecha', '')
+                    try:
+                        fecha_ingreso = datetime.strptime(fecha_str, '%Y-%m-%d')
+                        if fecha_inicio <= fecha_ingreso <= fecha_fin:
+                            ingresos_rango.append(ingreso)
+                    except:
+                        pass
+            except:
+                pass
+
+        # Calcular totales
+        total_ingresos = sum(i.get('monto', 0) for i in ingresos_rango)
+        total_gastos = sum(g.get('monto', 0) for g in gastos_rango)
+        ganancia = total_ingresos - total_gastos
+
+        # Desglose por categoría de gastos
+        por_categoria = {}
+        for gasto in gastos_rango:
+            cat = gasto.get('categoria', 'otro')
+            monto = gasto.get('monto', 0)
+            por_categoria[cat] = por_categoria.get(cat, 0) + monto
+
+        # Crear respuesta
+        fecha_inicio_str = fecha_inicio.strftime('%d/%m/%Y')
+        fecha_fin_str = fecha_fin.strftime('%d/%m/%Y')
+
+        respuesta = f"Corte {fecha_inicio_str} al {fecha_fin_str}:\n"
+        respuesta += f"Ingresos: ${total_ingresos:.2f}\n"
+        respuesta += f"Gastos: ${total_gastos:.2f}\n"
+        respuesta += f"Ganancia: ${ganancia:.2f}\n\n"
+        respuesta += "Detalle de gastos:\n"
+
+        for cat, monto in sorted(por_categoria.items(), key=lambda x: x[1], reverse=True):
+            respuesta += f"  • {cat}: ${monto:.2f}\n"
+
+        # Verificar si user pide ZIP
+        if 'zip' in texto_usuario.lower() or 'contadora' in texto_usuario.lower() or 'contador' in texto_usuario.lower():
+            respuesta += "\n¿Te armo el ZIP con facturas y PDF del balance?"
+
+        return respuesta
+
+    except Exception as e:
+        logger.error(f"Error en generar_corte: {e}", exc_info=True)
+        return f"❌ Error al generar corte: {str(e)}"
+
+def crear_zip_corte(telefono, fecha_inicio, fecha_fin):
+    """
+    Crea un ZIP con las facturas del rango + PDF con reporte.
+    Retorna la ruta del ZIP o None.
+    """
+    try:
+        gastos = cargar_gastos(telefono)
+        ruta_datos = obtener_ruta_datos(telefono)
+
+        # Filtrar gastos por rango
+        gastos_rango = []
+        for gasto in gastos:
+            fecha_str = gasto.get('fecha', '')
+            try:
+                fecha_gasto = datetime.strptime(fecha_str, '%Y-%m-%d')
+                if fecha_inicio <= fecha_gasto <= fecha_fin:
+                    gastos_rango.append(gasto)
+            except:
+                pass
+
+        # Crear ZIP en memoria
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Agregar facturas
+            for gasto in gastos_rango:
+                factura_path = gasto.get('factura_path', '')
+                if factura_path and os.path.exists(factura_path):
+                    arcname = os.path.basename(factura_path)
+                    zf.write(factura_path, arcname=arcname)
+
+            # Generar PDF de reporte
+            total_gastos = sum(g.get('monto', 0) for g in gastos_rango)
+            pdf_content = generar_pdf_corte(gastos_rango, fecha_inicio, fecha_fin, total_gastos)
+            zf.writestr('reporte_corte.pdf', pdf_content)
+
+        # Guardar ZIP
+        zip_path = f"{ruta_datos}/corte_{fecha_inicio.strftime('%Y%m%d')}_al_{fecha_fin.strftime('%Y%m%d')}.zip"
+        with open(zip_path, 'wb') as f:
+            f.write(zip_buffer.getvalue())
+
+        return zip_path
+
+    except Exception as e:
+        logger.error(f"Error creando ZIP: {e}", exc_info=True)
+        return None
+
+def generar_pdf_corte(gastos, fecha_inicio, fecha_fin, total):
+    """
+    Genera PDF de reporte de corte usando reportlab.
+    Retorna bytes del PDF.
+    """
+    try:
+        pdf_buffer = io.BytesIO()
+        doc = SimpleDocTemplate(pdf_buffer, pagesize=letter)
+        story = []
+        styles = getSampleStyleSheet()
+
+        # Título
+        title_style = ParagraphStyle(
+            'CustomTitle',
+            parent=styles['Heading1'],
+            fontSize=18,
+            textColor=colors.HexColor('#1e40af'),
+            spaceAfter=12
+        )
+
+        story.append(Paragraph("Corte de Gastos", title_style))
+        story.append(Paragraph(f"Período: {fecha_inicio.strftime('%d/%m/%Y')} al {fecha_fin.strftime('%d/%m/%Y')}", styles['Normal']))
+        story.append(Spacer(1, 0.3*inch))
+
+        # Tabla de gastos
+        table_data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
+        for gasto in gastos:
+            table_data.append([
+                gasto.get('fecha', ''),
+                gasto.get('descripcion', '')[:20],
+                gasto.get('categoria', ''),
+                f"${gasto.get('monto', 0):.2f}"
+            ])
+
+        table_data.append(['', '', 'TOTAL', f"${total:.2f}"])
+
+        table = Table(table_data)
+        table.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+        ]))
+
+        story.append(table)
+        doc.build(story)
+
+        return pdf_buffer.getvalue()
+
+    except Exception as e:
+        logger.error(f"Error generando PDF de corte: {e}")
+        return b""
 
 # ==================== GOAL MANAGEMENT FUNCTIONS ====================
 
@@ -1410,9 +1813,32 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     msg_lower = incoming_msg.lower()
 
     try:
+        # ==================== BORRAR GASTO ====================
+
+        if any(keyword in msg_lower for keyword in ['borrar', 'eliminar', 'quitar', 'borra']):
+            if any(keyword in msg_lower for keyword in ['gasto', 'factura', 'gasta']):
+                # Verificar si es confirmación
+                if msg_lower.strip() in ['si', 'sí', 'si.', 'sí.']:
+                    resultado = confirmar_borrado(from_number)
+                    resp.message(resultado)
+                    return
+
+                # Solicitar borrado
+                resultado = borrar_gasto(from_number, incoming_msg)
+                resp.message(resultado)
+                return
+
+        # ==================== CORTE/REPORTE ====================
+
+        if any(keyword in msg_lower for keyword in ['corte', 'balance', 'reporte', 'estado']):
+            if any(keyword in msg_lower for keyword in ['quincena', 'mes', 'dias', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre', 'enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio']):
+                resultado = generar_corte(from_number, incoming_msg)
+                responder(resp, resultado)
+                return
+
         # ==================== GOALS KEYWORDS ====================
 
-                # Ver metas o solicitar análisis de metas
+        # Ver metas o solicitar análisis de metas
         if any(keyword in msg_lower for keyword in ['metas', 'objetivos', 'mis objetivos', 'ver metas', 'estado metas']):
             logger.info(f"Goals request detected for {from_number}")
             metas = obtener_metas()

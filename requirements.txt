@@ -7,4 +7,5 @@ matplotlib
 reportlab
 pillow
 requests
-openai
+faster-whisper
+zipfile36
