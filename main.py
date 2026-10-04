@@ -494,6 +494,7 @@ def procesar_foto_inteligente(media_url, telefono):
         imagen_base64 = base64.standard_b64encode(webp_bytes).decode('utf-8')
 
         # Llamar a Claude Vision con imagen WEBP
+        # CRÍTICO: Vision SOLO extrae números en JSON, NO suma
         response = client.messages.create(
             model=MODELO_CLAUDE,
             max_tokens=500,
@@ -510,27 +511,29 @@ def procesar_foto_inteligente(media_url, telefono):
                     },
                     {
                         "type": "text",
-                        "text": """Analiza esta factura/recibo/ticket. Extrae SOLO un JSON válido, sin explicaciones:
+                        "text": """Analiza esta factura/recibo/ticket/comprobante de pagos. Extrae SOLO un JSON válido, sin explicaciones, sin calcular:
 {
-  "monto": cantidad total de la factura,
-  "fecha": "YYYY-MM-DD",
-  "proveedor": "nombre del lugar/empresa",
-  "categoria": "materiales|envio_ecuador|comida|renta|otro",
-  "tipo_documento": "factura|recibo_envio|ticket",
-  "destino": "nombre del destino o lugar",
-  "tarifa_envio": solo si aparece envío en la factura,
-  "para_quien": "persona o descripción",
-  "descripcion": "resumen breve"
+  "pagos": [lista de números pagados, ej: [200, 120, 130]],
+  "deuda_total": número total adeudado (si aparece),
+  "cliente": "nombre de la persona o razón social",
+  "fecha": "YYYY-MM-DD si aparece",
+  "tipo_documento": "factura|recibo_envio|ticket|comprobante",
+  "descripcion": "resumen breve de qué es"
 }
 
-INSTRUCCION CRITICA: SOLO extrae números que REALMENTE aparecen en la factura. NUNCA inventes montos. Si no ves claramente el precio, deja el campo vacío o pregunta.
-Sé específico en categoría: si es Home Depot o ferretería -> materiales. Si menciona Ecuador o envío -> envio_ecuador. Si es comida -> comida. Si es alquiler/renta -> renta."""
+INSTRUCCIONES CRÍTICAS:
+1. NUNCA calcules sumas. Si ves "200 + 120 + 130", devuelve [200, 120, 130] solamente
+2. "pagos": siempre es un ARRAY de números individuales encontrados
+3. "deuda_total": número total del documento (si aparece en la imagen)
+4. NUNCA inventes números que no estén en la imagen
+5. NO incluyas campos vacíos, ommitelos
+6. Python sumará los pagos, tu SOLO extrae números en array"""
                     }
                 ]
             }]
         )
 
-        # Parsear respuesta JSON
+        # Parsear respuesta JSON de Vision
         try:
             texto_respuesta = response.content[0].text.strip()
             # Limpiar posibles marcas de código
@@ -541,35 +544,52 @@ Sé específico en categoría: si es Home Depot o ferretería -> materiales. Si 
             if texto_respuesta.endswith('```'):
                 texto_respuesta = texto_respuesta[:-3]
 
-            gasto = json.loads(texto_respuesta)
+            vision_response = json.loads(texto_respuesta)
         except json.JSONDecodeError as e:
             print(f"Error parseando JSON de Claude: {e}")
             print(f"Respuesta: {texto_respuesta}")
             return "❌ No pude procesar la factura. Asegúrate que sea una imagen clara."
 
-        # Verificar que gasto se haya parseado correctamente
-        if not gasto:
+        # Verificar que se haya parseado correctamente
+        if not vision_response:
             return "❌ No pude leer los números de la factura. Por favor, envía una imagen más clara o escribe el monto manualmente."
 
-        # Crear estructura de gasto en nuevo formato
+        # PASO CRÍTICO: Calcular sumas determinísticas en Python, NO confiar en Vision
+        # Vision extrae: pagos (lista), deuda_total (número), cliente (string)
+        pagos_lista = vision_response.get('pagos', [])
+        deuda_total = vision_response.get('deuda_total', 0)
+        cliente = vision_response.get('cliente', 'Cliente')
+        descripcion = vision_response.get('descripcion', 'Gasto')
+
+        # CÁLCULO DETERMINÍSTICO CON PYTHON sum()
+        if pagos_lista and isinstance(pagos_lista, list):
+            pagado = sum(float(p) for p in pagos_lista)  # Suma real, no GPT
+        else:
+            # Si no hay lista de pagos, usar deuda_total como monto único
+            pagado = float(deuda_total) if deuda_total else 0
+            pagos_lista = [pagado] if pagado > 0 else []
+
+        balance = deuda_total - pagado if deuda_total else 0
+
+        # Crear estructura de gasto para guardar
         fecha_hoy = datetime.now().strftime("%Y-%m-%d")
         timestamp_iso = datetime.now().isoformat()
-        descripcion = gasto.get('descripcion', gasto.get('proveedor', 'Gasto'))
-        monto = gasto.get('monto', 0)
-        categoria = gasto.get('categoria', 'otro')
 
-        # Crear ID único: fecha_hora_descripcion_monto
+        # Crear ID único
         timestamp_formato = datetime.now().strftime("%Y%m%d_%H%M")
         desc_normalizada = descripcion.lower().replace(' ', '').replace('-', '')[:15]
-        gasto_id = f"{timestamp_formato}_{desc_normalizada}_{int(monto)}"
+        gasto_id = f"{timestamp_formato}_{desc_normalizada}_{int(pagado)}"
 
         gasto_nuevo = {
             "id": gasto_id,
             "fecha": fecha_hoy,
             "timestamp": timestamp_iso,
             "descripcion": descripcion,
-            "monto": monto,
-            "categoria": categoria,
+            "monto": deuda_total,
+            "pagos": pagos_lista,  # Lista de pagos individuales
+            "pagado": pagado,      # Suma calculada en Python
+            "balance": balance,    # Deuda - pagado
+            "cliente": cliente,
             "factura_path": ruta_archivo
         }
 
@@ -577,19 +597,19 @@ Sé específico en categoría: si es Home Depot o ferretería -> materiales. Si 
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
 
-        # Guardar en memoria datos del gasto para poder responder a balance
+        # Guardar en memoria datos del pago para poder responder a balance
         phone_clean = normalizar_telefono(telefono)
-        deuda_total = gasto.get('monto', monto)
-        total_pagado = gasto.get('total_pagado', 0) if 'total_pagado' in gasto else 0
 
         # Guardar siempre en memoria para poder mostrar balance cuando se pregunta
         memoria_usuarios[phone_clean] = {
             'tipo': 'deuda',
-            'deuda_total': deuda_total,
-            'total_pagado': total_pagado,
+            'pagos': pagos_lista,
+            'pagado': pagado,        # Suma Python, no Vision
+            'deuda': deuda_total,
+            'balance': balance,
+            'cliente': cliente,
             'fecha_inicio': fecha_hoy,
             'fecha_final': fecha_hoy,
-            'balance': deuda_total - total_pagado,
             'estado': 'guardado',
             'descripcion': descripcion,
             'gasto_id': gasto_id,
@@ -597,9 +617,14 @@ Sé específico en categoría: si es Home Depot o ferretería -> materiales. Si 
         }
         guardar_memoria(memoria_usuarios)
 
-        # Respuesta al usuario
-        items = gasto.get('descripcion', '')
-        return f"Listo, leí tu nota: {items}. Total ${monto} guardado. ¿Quieres el balance?"
+        # Respuesta al usuario CON NÚMEROS CALCULADOS POR PYTHON
+        if pagos_lista:
+            pagos_str = "+".join(str(int(p)) for p in pagos_lista)
+            respuesta = f"Leí {len(pagos_lista)} pagos de {cliente}:\n{pagos_str} = ${pagado:,.0f}\nDeuda original: ${deuda_total:,.0f}\nTe falta: ${balance:,.0f}\n\n¿Te mando tabla al dashboard?"
+        else:
+            respuesta = f"Leí {cliente}. Total deuda: ${deuda_total:,.0f}. ¿Te mando tabla al dashboard?"
+
+        return respuesta
 
     except Exception as e:
         logger.error(f"Error en procesar_foto_inteligente: {e}", exc_info=True)
@@ -2824,13 +2849,29 @@ def atender_con_imagen(media_url, incoming_msg, from_number, server_url):
             resultado = procesar_foto_inteligente(media_url, from_number)
             salida.message(resultado)
 
-            # Si hay texto adicional, intentar reclasificar
+            # Si hay texto adicional, validar antes de reclasificar
             if incoming_msg and incoming_msg.lower().strip():
-                # Esperar un momento para que se guarde el gasto
-                import time
-                time.sleep(0.5)
-                resultado_reclasificacion = reclasificar_gasto(incoming_msg, from_number)
-                salida.message(resultado_reclasificacion)
+                msg_lower = incoming_msg.lower()
+
+                # VALIDACIÓN: Detectar si es una queja/comentario o un envio_ecuador
+                # Palabras que indican queja/problema, NO reclasificar
+                falso_positivo_keywords = ["link", "cuentas", "longizo", "equivoca", "error", "mal", "no", "problem", "falla", "bug", "ayuda"]
+                es_queja = any(k in msg_lower for k in falso_positivo_keywords)
+
+                # Palabras que realmente indican envio_ecuador
+                envio_ecuador_keywords = ["ecuador", "envio", "giro", "remesa"]
+                es_envio_ecuador = any(k in msg_lower for k in envio_ecuador_keywords)
+
+                # Solo reclasificar si NO es una queja/comentario
+                if not es_queja:
+                    # Esperar un momento para que se guarde el gasto
+                    import time
+                    time.sleep(0.5)
+                    resultado_reclasificacion = reclasificar_gasto(incoming_msg, from_number)
+                    salida.message(resultado_reclasificacion)
+                else:
+                    # Es una queja o comentario, ignorar reclasificación automática
+                    logger.info(f"Detected complaint/comment from {from_number}, skipping reclassification: {msg_lower}")
         except Exception as e:
             logger.error(f"Error procesando imagen de {from_number}: {e}", exc_info=True)
             salida.message("Disculpa, hubo un error procesando tu factura. Intenta de nuevo.")
