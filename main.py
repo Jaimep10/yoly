@@ -24,7 +24,7 @@ import base64
 import requests
 from requests.auth import HTTPBasicAuth
 from PIL import Image as PILImage
-from faster_whisper import WhisperModel
+from groq import Groq
 import zipfile
 import io
 
@@ -43,7 +43,8 @@ required_env_vars = {
     'TWILIO_ACCOUNT_SID': 'Twilio Account SID',
     'TWILIO_AUTH_TOKEN': 'Twilio Auth Token',
     'TWILIO_WHATSAPP_NUMBER': 'Twilio WhatsApp Number',
-    'ANTHROPIC_API_KEY': 'Anthropic API Key'
+    'ANTHROPIC_API_KEY': 'Anthropic API Key',
+    'GROQ_API_KEY': 'Groq API Key'
 }
 
 missing_vars = []
@@ -142,12 +143,12 @@ except Exception as e:
     twilio_client = None
 
 try:
-    modelo_whisper = WhisperModel("small", device="cpu", compute_type="int8")
-    logger.info("[OK] Whisper model loaded")
+    groq_client = Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    logger.info("[OK] Groq client initialized")
 except Exception as e:
-    print(f"[WARNING] Failed to initialize Whisper model: {e}")
-    logger.warning(f"Failed to initialize Whisper model: {e}")
-    modelo_whisper = None
+    print(f"[WARNING] Failed to initialize Groq client: {e}")
+    logger.warning(f"Failed to initialize Groq client: {e}")
+    groq_client = None
 
 if missing_vars:
     print(f"[WARNING] App will start but some features may not work. Missing: {', '.join(missing_vars)}")
@@ -255,26 +256,34 @@ def convertir_a_webp(imagen_bytes, max_dimension=1024, quality=70):
         logger.error(f"Error convirtiendo a WEBP: {e}", exc_info=True)
         return None
 
-def procesar_audio_local(ruta_tmp):
+def procesar_audio_groq(ruta_tmp):
     """
-    Transcribe un audio local usando faster-whisper.
+    Transcribe un audio usando Groq Whisper Large V3.
     Retorna el texto transcrito o None en caso de error.
     """
     try:
-        if not modelo_whisper:
+        if not groq_client:
             return None
 
-        segments, _ = modelo_whisper.transcribe(ruta_tmp, language="es")
-        texto = " ".join([s.text for s in segments]).strip()
-        return texto
+        with open(ruta_tmp, "rb") as f:
+            result = groq_client.audio.transcriptions.create(
+                file=(ruta_tmp, f.read()),
+                model="whisper-large-v3",
+                language="es",
+                response_format="text"
+            )
+
+        # result puede ser string o tener atributo .text
+        texto = result if isinstance(result, str) else result.text
+        return texto.strip() if texto else None
     except Exception as e:
-        print(f"Error transcribiendo audio: {e}")
-        logger.error(f"Error transcribiendo audio: {e}", exc_info=True)
+        print(f"Error transcribiendo audio con Groq: {e}")
+        logger.error(f"Error transcribiendo audio con Groq: {e}", exc_info=True)
         return None
 
 def procesar_audio(media_url, telefono):
     """
-    Descarga un audio desde Twilio y lo transcribe con Whisper local.
+    Descarga un audio desde Twilio y lo transcribe con Groq Whisper Large V3.
     Retorna el texto transcrito o un mensaje de error.
     """
     try:
@@ -288,8 +297,8 @@ def procesar_audio(media_url, telefono):
         with open(temp_path, "wb") as f:
             f.write(contenido)
 
-        # Transcribir con Whisper local
-        texto = procesar_audio_local(temp_path)
+        # Transcribir con Groq Whisper Large V3
+        texto = procesar_audio_groq(temp_path)
 
         # Limpiar archivo temporal
         try:

@@ -1,11 +1,9 @@
+anthropic
 flask
 twilio
-anthropic
-gunicorn
-python-dotenv
-matplotlib
-reportlab
-pillow
 requests
-faster-whisper
-zipfile36
+Pillow
+python-dotenv
+groq
+reportlab
+python-dateutil
