@@ -141,6 +141,160 @@ else:
 print("[STARTUP] Yoly Bot initialization complete")
 
 GOALS_FILE = 'goals.json'
+FINANCIAL_CONTEXT_FILE = 'financial_context.json'
+
+# ==================== FINANCIAL CONTEXT PERSISTENCE ====================
+
+def cargar_contexto_financiero():
+    """Carga el contexto financiero acumulado"""
+    if os.path.exists(FINANCIAL_CONTEXT_FILE):
+        try:
+            with open(FINANCIAL_CONTEXT_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error cargando contexto financiero: {e}")
+            return {'ingresos_mensuales': 0, 'gastos': {}}
+    return {'ingresos_mensuales': 0, 'gastos': {}}
+
+def guardar_contexto_financiero(contexto):
+    """Guarda el contexto financiero acumulado"""
+    try:
+        with open(FINANCIAL_CONTEXT_FILE, 'w', encoding='utf-8') as f:
+            json.dump(contexto, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error guardando contexto financiero: {e}")
+        return False
+
+def extraer_ingresos(texto):
+    """Extrae ingresos mensuales del texto del usuario"""
+    import re
+
+    texto_lower = texto.lower()
+    ingresos = 0
+    numeros_capturados = set()  # Para evitar duplicados
+
+    # Palabras clave para ingresos
+    palabras_ingresos = ['gano', 'trabajo', 'horas', 'sueldo', 'negocio', 'otro trabajo', 'ingreso', 'ganancias']
+
+    # Verificar si hay palabras clave de ingresos
+    tiene_ingreso = any(palabra in texto_lower for palabra in palabras_ingresos)
+
+    if not tiene_ingreso:
+        return 0
+
+    # Patrón 1: "X dolares la hora" o "gano X por hora"
+    # Requiere "dolares" o estar después de "gano"/"sueldo" para evitar capturar "6 horas diarias"
+    patron_horas = r'(?:gano|sueldo|ganancia|ingreso)?\s*(\d+(?:[\.,]\d+)?)\s*(?:dolares|dólares|pesos)\s*(?:la\s*)?(?:hora|horas|hr|hrs|/hora)'
+    matches_horas = re.finditer(patron_horas, texto_lower)
+
+    for match in matches_horas:
+        try:
+            num_str = match.group(1).replace(',', '.')
+            numero = float(num_str)
+            # Calcular mensual: 6 horas/día * 5 días/semana * 4 semanas
+            numero = numero * 6 * 5 * 4
+            numeros_capturados.add(match.start())
+            ingresos += numero
+        except ValueError:
+            continue
+
+    # Patrón 2: "X semanal" o "X por semana"
+    patron_semanal = r'(\d+(?:[\.,]\d+)?)\s*(?:dolares|dólares|pesos)?\s*(?:semanal|semana|por\s*semana|a\s*la\s*semana)'
+    matches_semanal = re.finditer(patron_semanal, texto_lower)
+
+    for match in matches_semanal:
+        try:
+            num_str = match.group(1).replace(',', '.')
+            numero = float(num_str)
+            numero = numero * 4.33  # Semanas por mes
+            numeros_capturados.add(match.start())
+            ingresos += numero
+        except ValueError:
+            continue
+
+    # Patrón 3: "sueldo X" o "gano X" - SOLO si no fue capturado ya
+    patron_sueldo = r'(?:sueldo|gano|salario|ganancias|ingreso)\s+(?:de\s+)?(?:dolares|dólares|pesos)?\s*(\d+(?:[\.,]\d+)?)'
+    matches_sueldo = re.finditer(patron_sueldo, texto_lower)
+
+    for match in matches_sueldo:
+        # Saltar si este número ya fue capturado por otro patrón
+        if match.start(1) in numeros_capturados:  # start(1) es la posición del primer grupo capturado
+            continue
+
+        try:
+            num_str = match.group(1).replace(',', '.')
+            numero = float(num_str)
+
+            # Verificar si está en contexto mensual o semanal
+            # Si ya fue capturado como horas o semanal, no agregar de nuevo
+            texto_contexto = texto_lower[max(0, match.start()-30):min(len(texto_lower), match.end()+30)]
+            if 'semanal' in texto_contexto or 'semana' in texto_contexto:
+                numero = numero * 4.33
+            elif 'hora' not in texto_contexto:
+                # Asumir mensual si no hay contexto especial
+                pass
+
+            numeros_capturados.add(match.start(1))
+            ingresos += numero
+        except ValueError:
+            continue
+
+    return ingresos
+
+def extraer_gastos(texto):
+    """Extrae gastos del texto del usuario"""
+    import re
+
+    texto_lower = texto.lower()
+    gastos = {}
+
+    # Palabras clave para gastos
+    palabras_gastos = {
+        'renta': ['renta', 'arriendo'],
+        'comida': ['comida', 'comidas', 'alimentos'],
+        'gimnasio': ['gimnasio', 'gym'],
+        'telefonoFijo': ['teléfono', 'telefono'],
+        'deudas': ['deuda', 'deudas'],
+        'seguros': ['seguro', 'seguros'],
+        'suscripcion': ['suscripción', 'suscripcion', 'netflix', 'spotify']
+    }
+
+    # Buscar patrones de gastos más robustos
+    for categoria, palabras_clave in palabras_gastos.items():
+        for palabra in palabras_clave:
+            # Patrón mejorado: palabra + (palabras opcionales) + número + (semanal opcional)
+            # Ej: "renta usa 500" o "renta 500" o "comida 120 semanal"
+            patron = rf'{palabra}\s+(?:[a-z]+\s+)?(\d+(?:[\.,]\d+)?)'
+            matches = re.finditer(patron, texto_lower)
+
+            for match in matches:
+                try:
+                    # El número está en el grupo 1
+                    num_str = match.group(1)
+                    num_str = num_str.replace(',', '.')
+                    numero = float(num_str)
+
+                    # Detectar si es semanal y convertir a mensual
+                    # Buscar "semanal" o "semana" INMEDIATAMENTE después del número
+                    match_end = match.end()
+                    proxima_coma = texto_lower.find(',', match_end)
+                    if proxima_coma == -1:
+                        proxima_coma = len(texto_lower)
+
+                    # Solo revisar hasta la próxima coma (dato actual)
+                    contexto_futuro = texto_lower[match_end:proxima_coma]
+
+                    if 'semanal' in contexto_futuro or 'semana' in contexto_futuro:
+                        numero = numero * 4.33
+
+                    if categoria not in gastos:
+                        gastos[categoria] = 0
+                    gastos[categoria] += numero
+                except (ValueError, AttributeError):
+                    continue
+
+    return gastos
 
 # ==================== GOAL MANAGEMENT FUNCTIONS ====================
 
@@ -235,6 +389,57 @@ def actualizar_progreso_meta(nombre, cantidad):
             return False, "Error al actualizar la meta"
 
     return False, f"Meta '{nombre}' no encontrada"
+
+def procesar_analisis_financiero(texto_usuario):
+    """
+    Procesa un mensaje financiero, extrae ingresos/gastos y mantiene contexto acumulado.
+    Retorna el análisis con el resultado final.
+    """
+    # Cargar contexto anterior
+    contexto = cargar_contexto_financiero()
+    ingresos_previos = contexto.get('ingresos_mensuales', 0)
+    gastos_previos = contexto.get('gastos', {})
+
+    # Extraer nuevos ingresos y gastos del mensaje
+    nuevos_ingresos = extraer_ingresos(texto_usuario)
+    nuevos_gastos = extraer_gastos(texto_usuario)
+
+    # Actualizar contexto
+    if nuevos_ingresos > 0:
+        contexto['ingresos_mensuales'] = nuevos_ingresos
+
+    # Sumar nuevos gastos a los existentes
+    for categoria, cantidad in nuevos_gastos.items():
+        if categoria in gastos_previos:
+            gastos_previos[categoria] += cantidad
+        else:
+            gastos_previos[categoria] = cantidad
+
+    contexto['gastos'] = gastos_previos
+    guardar_contexto_financiero(contexto)
+
+    # Calcular totales
+    ingresos_totales = contexto['ingresos_mensuales']
+    gastos_totales = sum(contexto['gastos'].values())
+    superavit = ingresos_totales - gastos_totales
+
+    # Generar análisis
+    analisis = f"""📊 *ANÁLISIS FINANCIERO*\n
+
+*Ingresos Mensuales:* ${ingresos_totales:.2f}
+*Gastos Totales:* ${gastos_totales:.2f}
+
+*Desglose de Gastos:*"""
+
+    for categoria, cantidad in contexto['gastos'].items():
+        analisis += f"\n  • {categoria.replace('_', ' ').title()}: ${cantidad:.2f}"
+
+    if superavit > 0:
+        analisis += f"\n\n✅ *Superávit:* +${superavit:.2f}"
+    else:
+        analisis += f"\n\n⚠️ *Déficit:* ${superavit:.2f}"
+
+    return analisis, ingresos_totales, gastos_totales, superavit
 
 def analizar_metas_y_dar_consejos():
     """Usa Claude API para analizar metas y dar consejos personalizados"""
@@ -1021,6 +1226,20 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
                 respuesta += f"\n• {meta['nombre']}"
             resp.message(respuesta)
             return
+
+        # ==================== FINANCIAL ANALYSIS ====================
+
+        # Detectar palabras clave financieras (ingresos y gastos)
+        financial_keywords = ['gano', 'trabajo', 'renta', 'pago', 'comida', 'gimnasio', 'teléfono', 'telefono',
+                             'deuda', 'seguro', 'suscripción', 'suscripcion', 'ingreso', 'sueldo', 'horas',
+                             'negocio', 'gasto', 'gastos', 'arriendo', 'cuota', 'otra ingreso']
+        tiene_info_financiera = any(keyword in msg_lower for keyword in financial_keywords)
+
+        if tiene_info_financiera and ('gano' in msg_lower or 'renta' in msg_lower or 'pago' in msg_lower or 'trabajo' in msg_lower):
+            logger.info(f"Financial analysis request from {from_number}")
+            analisis, ingresos, gastos, superavit = procesar_analisis_financiero(incoming_msg)
+            resp.message(analisis)
+            return str(resp)
 
         # ==================== BUDGET & EXPENSE KEYWORDS ====================
 
