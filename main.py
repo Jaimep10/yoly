@@ -257,29 +257,15 @@ def convertir_a_webp(imagen_bytes, max_dimension=1024, quality=70):
         return None
 
 def procesar_audio_groq(ruta_tmp):
-    """
-    Transcribe un audio usando Groq Whisper Large V3.
-    Retorna el texto transcrito o None en caso de error.
-    """
-    try:
-        if not groq_client:
-            return None
-
-        with open(ruta_tmp, "rb") as f:
-            result = groq_client.audio.transcriptions.create(
-                file=(ruta_tmp, f.read()),
-                model="whisper-large-v3",
-                language="es",
-                response_format="text"
-            )
-
-        # result puede ser string o tener atributo .text
-        texto = result if isinstance(result, str) else result.text
-        return texto.strip() if texto else None
-    except Exception as e:
-        print(f"Error transcribiendo audio con Groq: {e}")
-        logger.error(f"Error transcribiendo audio con Groq: {e}", exc_info=True)
-        return None
+    client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    with open(ruta_tmp, "rb") as f:
+        result = client.audio.transcriptions.create(
+            file=(ruta_tmp, f.read()),
+            model="whisper-large-v3",
+            language="es",
+            response_format="text"
+        )
+    return result if isinstance(result, str) else str(result)
 
 def procesar_audio(media_url, telefono):
     """
