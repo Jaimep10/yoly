@@ -17,6 +17,8 @@ from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, 
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import inch
 from datetime import datetime
+import base64
+import requests
 
 app = Flask(__name__)
 
@@ -166,128 +168,223 @@ def guardar_contexto_financiero(contexto):
         print(f"Error guardando contexto financiero: {e}")
         return False
 
-def extraer_ingresos(texto):
-    """Extrae ingresos mensuales del texto del usuario sumando TODAS las fuentes.
+# ==================== SMART FILING SYSTEM WITH CLAUDE VISION ====================
 
-    Patrón 1: "X horas al mes y gano Y la hora" → horas * tarifa
-    Patrón 2: "X a la semana" → monto * 4.333
-    Patrón 3: "X al mes" → monto directo
+def obtener_ruta_datos(telefono):
+    """Obtiene la ruta de la carpeta de datos del usuario"""
+    ruta = f'/home/claude/yoly/data/{telefono}'
+    os.makedirs(ruta, exist_ok=True)
+    return ruta
+
+def cargar_gastos(telefono):
+    """Carga los gastos guardados del usuario"""
+    ruta = obtener_ruta_datos(telefono)
+    archivo = f'{ruta}/gastos.json'
+    if os.path.exists(archivo):
+        try:
+            with open(archivo, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error cargando gastos: {e}")
+            return []
+    return []
+
+def guardar_gastos(telefono, gastos):
+    """Guarda los gastos del usuario"""
+    ruta = obtener_ruta_datos(telefono)
+    archivo = f'{ruta}/gastos.json'
+    try:
+        with open(archivo, 'w', encoding='utf-8') as f:
+            json.dump(gastos, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception as e:
+        print(f"Error guardando gastos: {e}")
+        return False
+
+def descargar_imagen(media_url):
+    """Descarga una imagen desde una URL y la retorna como bytes"""
+    try:
+        response = requests.get(media_url, timeout=30)
+        response.raise_for_status()
+        return response.content
+    except Exception as e:
+        print(f"Error descargando imagen: {e}")
+        return None
+
+def procesar_foto_inteligente(media_url, telefono):
     """
-    import re
+    Procesa una foto de factura/recibo usando Claude Vision.
+    Descarga, convierte a base64, y extrae información con IA.
+    Guarda en /data/{telefono}/gastos.json
+    """
+    try:
+        # Descargar imagen
+        imagen_bytes = descargar_imagen(media_url)
+        if not imagen_bytes:
+            return "❌ No pude descargar la imagen. Intenta de nuevo."
 
-    texto_lower = texto.lower()
-    ingresos_totales = 0
-    posiciones_capturadas = set()
+        # Convertir a base64
+        imagen_base64 = base64.standard_b64encode(imagen_bytes).decode('utf-8')
 
-    # Palabras clave para verificar si hay contexto de ingresos
-    palabras_ingresos = ['gano', 'trabajo', 'horas', 'sueldo', 'negocio', 'ingreso', 'ganancias']
-    tiene_ingreso = any(palabra in texto_lower for palabra in palabras_ingresos)
+        # Determinar tipo de media (asumir JPEG por defecto)
+        media_type = "image/jpeg"
+        if media_url.lower().endswith('.png'):
+            media_type = "image/png"
+        elif media_url.lower().endswith('.gif'):
+            media_type = "image/gif"
+        elif media_url.lower().endswith('.webp'):
+            media_type = "image/webp"
 
-    if not tiene_ingreso:
-        return 0
+        # Llamar a Claude Vision
+        response = client.messages.create(
+            model=MODELO_CLAUDE,
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": imagen_base64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": """Analiza esta factura/recibo/ticket. Extrae SOLO un JSON válido, sin explicaciones:
+{
+  "monto": (número, ej: 45.50),
+  "fecha": "YYYY-MM-DD",
+  "proveedor": "nombre del lugar/empresa",
+  "categoria": "materiales|envio_ecuador|comida|renta|otro",
+  "tipo_documento": "factura|recibo_envio|ticket",
+  "destino": "nombre del destino o lugar",
+  "tarifa_envio": (número o 0),
+  "para_quien": "persona o descripción",
+  "descripcion": "resumen breve"
+}
 
-    # PATRÓN 1: "X horas al mes y gano Y la hora"
-    # Extrae: horas * tarifa (SIN multiplicación por 120)
-    patron_horas_mensuales = r'(\d+(?:[\.,]\d+)?)\s*(?:horas?)\s*(?:al\s*)?(?:mes|mes).*?(?:gano|pago|cobro)?\s*(\d+(?:[\.,]\d+)?)\s*(?:la\s*)?(?:hora|horas?)'
-    matches_h = re.finditer(patron_horas_mensuales, texto_lower)
-    for match in matches_h:
+Sé específico: si es Home Depot o ferretería -> materiales. Si menciona Ecuador o envío -> envio_ecuador. Si es comida -> comida. Si es alquiler/renta -> renta."""
+                    }
+                ]
+            }]
+        )
+
+        # Parsear respuesta JSON
         try:
-            horas_str = match.group(1).replace(',', '.')
-            tarifa_str = match.group(2).replace(',', '.')
-            horas = float(horas_str)
-            tarifa = float(tarifa_str)
-            ingreso = horas * tarifa
-            ingresos_totales += ingreso
-            posiciones_capturadas.add(match.start())
-        except (ValueError, AttributeError):
-            continue
+            texto_respuesta = response.content[0].text.strip()
+            # Limpiar posibles marcas de código
+            if texto_respuesta.startswith('```'):
+                texto_respuesta = texto_respuesta.split('```')[1]
+                if texto_respuesta.startswith('json'):
+                    texto_respuesta = texto_respuesta[4:]
+            if texto_respuesta.endswith('```'):
+                texto_respuesta = texto_respuesta[:-3]
 
-    # PATRÓN 2: "X a la semana" o "X semanal" o "X por semana"
-    patron_semanal = r'(\d+(?:[\.,]\d+)?)\s*(?:dolares|dólares|pesos)?\s*(?:a\s*la\s*semana|semanal|por\s*semana)'
-    matches_s = re.finditer(patron_semanal, texto_lower)
-    for match in matches_s:
-        # Evitar capturar si ya fue capturado
-        if match.start() in posiciones_capturadas:
-            continue
+            gasto = json.loads(texto_respuesta)
+        except json.JSONDecodeError as e:
+            print(f"Error parseando JSON de Claude: {e}")
+            print(f"Respuesta: {texto_respuesta}")
+            return "❌ No pude procesar la factura. Asegúrate que sea una imagen clara."
+
+        # Agregar timestamp y guardar
+        gasto['id'] = datetime.now().isoformat()
+        gastos = cargar_gastos(telefono)
+        gastos.append(gasto)
+        guardar_gastos(telefono, gastos)
+
+        # Respuesta al usuario
+        categoria = gasto.get('categoria', 'otro')
+        monto = gasto.get('monto', '0')
+        proveedor = gasto.get('proveedor', 'Proveedor')
+
+        return f"✓ Factura archivada y clasificada como *{categoria}*\n💰 ${monto} - {proveedor}"
+
+    except Exception as e:
+        logger.error(f"Error en procesar_foto_inteligente: {e}", exc_info=True)
+        return f"❌ Error procesando factura: {str(e)}"
+
+def reclasificar_gasto(texto, telefono, historial=None):
+    """
+    Reclasifica el último gasto basado en instrucciones del usuario.
+    Ejemplo: "de esos X, Y son para comida y Z para materiales"
+    """
+    try:
+        gastos = cargar_gastos(telefono)
+        if not gastos:
+            return "No tienes gastos registrados para reclasificar."
+
+        # Obtener el último gasto
+        ultimo_gasto = gastos[-1]
+
+        # Construir historial si no se proporciona
+        if historial is None:
+            historial = json.dumps(ultimo_gasto, ensure_ascii=False)
+
+        # Llamar a Claude para reclasificar
+        response = client.messages.create(
+            model=MODELO_CLAUDE,
+            max_tokens=500,
+            messages=[{
+                "role": "user",
+                "content": f"""Historial: {historial}
+Usuario dice: '{texto}'
+
+Desglos o reclasifica el gasto según lo que dijo el usuario.
+Si el usuario quiere dividir un gasto, crea múltiples transacciones.
+Devuelve SOLO un JSON válido con un array 'gastos':
+{{
+  "gastos": [
+    {{
+      "monto": número,
+      "fecha": "YYYY-MM-DD",
+      "proveedor": "string",
+      "categoria": "materiales|envio_ecuador|comida|renta|otro",
+      "tipo_documento": "factura|recibo_envio|ticket",
+      "destino": "string",
+      "tarifa_envio": número,
+      "para_quien": "string",
+      "descripcion": "string"
+    }}
+  ]
+}}"""
+            }]
+        )
+
         try:
-            monto_str = match.group(1).replace(',', '.')
-            monto = float(monto_str)
-            ingreso = monto * 4.333  # Promedio de semanas por mes
-            ingresos_totales += ingreso
-            posiciones_capturadas.add(match.start())
-        except ValueError:
-            continue
+            texto_respuesta = response.content[0].text.strip()
+            # Limpiar posibles marcas de código
+            if texto_respuesta.startswith('```'):
+                texto_respuesta = texto_respuesta.split('```')[1]
+                if texto_respuesta.startswith('json'):
+                    texto_respuesta = texto_respuesta[4:]
+            if texto_respuesta.endswith('```'):
+                texto_respuesta = texto_respuesta[:-3]
 
-    # PATRÓN 3: "X al mes" o "gano X al mes" (contexto mensual claro)
-    patron_mensual = r'(?:gano|pago|cobro|ingreso|sueldo)?\s*(\d+(?:[\.,]\d+)?)\s*(?:dolares|dólares|pesos)?\s*(?:al\s*)?mes(?:\b|[,.!?])'
-    matches_m = re.finditer(patron_mensual, texto_lower)
-    for match in matches_m:
-        # Evitar capturar si ya fue capturado
-        if match.start() in posiciones_capturadas:
-            continue
-        try:
-            monto_str = match.group(1).replace(',', '.')
-            monto = float(monto_str)
-            ingresos_totales += monto
-            posiciones_capturadas.add(match.start())
-        except ValueError:
-            continue
+            datos = json.loads(texto_respuesta)
+        except json.JSONDecodeError as e:
+            print(f"Error parseando JSON de Claude en reclasificación: {e}")
+            return "❌ No pude reclasificar. Intenta con otra descripción."
 
-    return ingresos_totales
+        # Reemplazar el último gasto con los nuevos
+        gastos.pop()
+        for nuevo_gasto in datos.get('gastos', []):
+            nuevo_gasto['id'] = datetime.now().isoformat()
+            gastos.append(nuevo_gasto)
 
-def extraer_gastos(texto):
-    """Extrae gastos del texto del usuario"""
-    import re
+        guardar_gastos(telefono, gastos)
 
-    texto_lower = texto.lower()
-    gastos = {}
+        # Respuesta
+        if len(datos.get('gastos', [])) > 1:
+            return f"✓ Gasto dividido en {len(datos['gastos'])} transacciones"
+        else:
+            cat = datos['gastos'][0].get('categoria', 'otro') if datos.get('gastos') else 'otro'
+            return f"✓ Gasto reclasificado como *{cat}*"
 
-    # Palabras clave para gastos
-    palabras_gastos = {
-        'renta': ['renta', 'arriendo'],
-        'comida': ['comida', 'comidas', 'alimentos'],
-        'gimnasio': ['gimnasio', 'gym'],
-        'telefonoFijo': ['teléfono', 'telefono'],
-        'deudas': ['deuda', 'deudas'],
-        'seguros': ['seguro', 'seguros'],
-        'suscripcion': ['suscripción', 'suscripcion', 'netflix', 'spotify']
-    }
-
-    # Buscar patrones de gastos más robustos
-    for categoria, palabras_clave in palabras_gastos.items():
-        for palabra in palabras_clave:
-            # Patrón mejorado: palabra + (palabras opcionales) + número + (semanal opcional)
-            # Ej: "renta usa 500" o "renta 500" o "comida 120 semanal"
-            patron = rf'{palabra}\s+(?:[a-z]+\s+)?(\d+(?:[\.,]\d+)?)'
-            matches = re.finditer(patron, texto_lower)
-
-            for match in matches:
-                try:
-                    # El número está en el grupo 1
-                    num_str = match.group(1)
-                    num_str = num_str.replace(',', '.')
-                    numero = float(num_str)
-
-                    # Detectar si es semanal y convertir a mensual
-                    # Buscar "semanal" o "semana" INMEDIATAMENTE después del número
-                    match_end = match.end()
-                    proxima_coma = texto_lower.find(',', match_end)
-                    if proxima_coma == -1:
-                        proxima_coma = len(texto_lower)
-
-                    # Solo revisar hasta la próxima coma (dato actual)
-                    contexto_futuro = texto_lower[match_end:proxima_coma]
-
-                    if 'semanal' in contexto_futuro or 'semana' in contexto_futuro:
-                        numero = numero * 4.33
-
-                    if categoria not in gastos:
-                        gastos[categoria] = 0
-                    gastos[categoria] += numero
-                except (ValueError, AttributeError):
-                    continue
-
-    return gastos
+    except Exception as e:
+        logger.error(f"Error en reclasificar_gasto: {e}", exc_info=True)
+        return f"❌ Error reclasificando: {str(e)}"
 
 # ==================== GOAL MANAGEMENT FUNCTIONS ====================
 
@@ -383,19 +480,40 @@ def actualizar_progreso_meta(nombre, cantidad):
 
     return False, f"Meta '{nombre}' no encontrada"
 
-def procesar_analisis_financiero(texto_usuario):
+def procesar_analisis_financiero(texto_usuario, telefono):
     """
-    Procesa un mensaje financiero, extrae ingresos/gastos y mantiene contexto acumulado.
-    Retorna el análisis con el resultado final.
+    Procesa un mensaje financiero usando Claude para extraer ingresos/gastos.
+    Mantiene contexto acumulado en archivos JSON.
     """
     # Cargar contexto anterior
     contexto = cargar_contexto_financiero()
     ingresos_previos = contexto.get('ingresos_mensuales', 0)
     gastos_previos = contexto.get('gastos', {})
 
-    # Extraer nuevos ingresos y gastos del mensaje
-    nuevos_ingresos = extraer_ingresos(texto_usuario)
-    nuevos_gastos = extraer_gastos(texto_usuario)
+    # Usar Claude para extraer ingresos y gastos de forma inteligente
+    response = client.messages.create(
+        model=MODELO_CLAUDE,
+        max_tokens=500,
+        system="Extrae ingresos y gastos del mensaje. Devuelve JSON: {\"ingresos\": número, \"gastos\": {\"categoria\": monto}}",
+        messages=[{"role": "user", "content": texto_usuario}]
+    )
+
+    try:
+        # Intentar parsear JSON de la respuesta
+        respuesta_texto = response.content[0].text
+        if '{' in respuesta_texto and '}' in respuesta_texto:
+            inicio = respuesta_texto.find('{')
+            fin = respuesta_texto.rfind('}') + 1
+            json_str = respuesta_texto[inicio:fin]
+            datos = json.loads(json_str)
+            nuevos_ingresos = datos.get('ingresos', 0)
+            nuevos_gastos = datos.get('gastos', {})
+        else:
+            nuevos_ingresos = 0
+            nuevos_gastos = {}
+    except:
+        nuevos_ingresos = 0
+        nuevos_gastos = {}
 
     # Actualizar contexto
     if nuevos_ingresos > 0:
@@ -1016,7 +1134,7 @@ def download_informe_metas():
 def whatsapp():
     """
     WhatsApp webhook handler for Twilio.
-    Processes messages for budget and goal management.
+    Processes messages and images for budget and goal management.
     """
     print(f"[REQUEST] {request.method} /whatsapp - Webhook request received")
     logger.info(f"Webhook request received via {request.method}")
@@ -1035,14 +1153,17 @@ def whatsapp():
     message_sid = request.form.get('MessageSid', 'unknown')
     account_sid = request.form.get('AccountSid', 'unknown')
 
+    # Verificar si hay imagen adjunta
+    media_url_0 = request.form.get('MediaUrl0', '')
+
     print(f"[WHATSAPP] Received request from Twilio")
-    print(f"[WHATSAPP] Extracted - From: {from_number}, MessageSID: {message_sid}, Body: {incoming_msg}")
-    logger.info(f"[WHATSAPP] Message received - From: {from_number}, Body: {incoming_msg[:100]}")
+    print(f"[WHATSAPP] Extracted - From: {from_number}, MessageSID: {message_sid}, Body: {incoming_msg}, MediaUrl0: {media_url_0}")
+    logger.info(f"[WHATSAPP] Message received - From: {from_number}, Body: {incoming_msg[:100]}, Has Media: {bool(media_url_0)}")
 
-    print(f"Pregunta recibida: {len(incoming_msg)} caracteres")
+    print(f"Pregunta recibida: {len(incoming_msg)} caracteres, Media: {bool(media_url_0)}")
 
-    if not incoming_msg:
-        logger.warning(f"Empty message body received from {from_number}")
+    if not incoming_msg and not media_url_0:
+        logger.warning(f"Empty message body and no media received from {from_number}")
         print(f"[WARNING] Empty message body from {from_number}")
         resp = MessagingResponse()
         return str(resp), 200
@@ -1055,10 +1176,15 @@ def whatsapp():
         return str(resp), 400
 
     # Log incoming message details
-    print(f"[WHATSAPP MESSAGE] From: {from_number} | SID: {message_sid} | Body: {incoming_msg[:100]}")
-    logger.info(f"Message received | From: {from_number} | MessageSID: {message_sid} | Body: {incoming_msg}")
+    print(f"[WHATSAPP MESSAGE] From: {from_number} | SID: {message_sid} | Body: {incoming_msg[:100]} | Media: {bool(media_url_0)}")
+    logger.info(f"Message received | From: {from_number} | MessageSID: {message_sid} | Body: {incoming_msg} | Media: {bool(media_url_0)}")
 
     server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
+
+    # Si hay imagen, procesar con visión
+    if media_url_0:
+        return atender_con_imagen(media_url_0, incoming_msg, from_number, server_url)
+
     return atender(incoming_msg, from_number, server_url)
 
 
@@ -1087,6 +1213,51 @@ def atender(incoming_msg, from_number, server_url):
         except Exception as e:
             logger.error(f"Error procesando mensaje de {from_number}: {e}", exc_info=True)
             salida.message("Disculpa, hubo un error procesando tu mensaje. Intenta de nuevo.")
+        with candado:
+            estado["listo"] = True
+            enviar_despues = estado["tarde"]
+        if enviar_despues:
+            logger.info(f"Respuesta tardía enviada por Twilio a {from_number}")
+            enviar_por_twilio(from_number, salida.textos)
+
+    hilo = threading.Thread(target=trabajar, daemon=True)
+    hilo.start()
+    hilo.join(ESPERA_MAX_SEGUNDOS)
+
+    resp = MessagingResponse()
+    with candado:
+        if estado["listo"]:
+            for texto in salida.textos:
+                resp.message(texto)
+            return str(resp)
+        estado["tarde"] = True
+    logger.info(f"Respuesta a {from_number} tarda más de {ESPERA_MAX_SEGUNDOS}s: se enviará por Twilio")
+    resp.message(MENSAJE_ESPERA)
+    return str(resp)
+
+
+def atender_con_imagen(media_url, incoming_msg, from_number, server_url):
+    """Procesa una imagen (factura/recibo) con Claude Vision"""
+    salida = Salida()
+    estado = {"listo": False, "tarde": False}
+    candado = threading.Lock()
+
+    def trabajar():
+        try:
+            # Procesar la imagen con visión
+            resultado = procesar_foto_inteligente(media_url, from_number)
+            salida.message(resultado)
+
+            # Si hay texto adicional, intentar reclasificar
+            if incoming_msg and incoming_msg.lower().strip():
+                # Esperar un momento para que se guarde el gasto
+                import time
+                time.sleep(0.5)
+                resultado_reclasificacion = reclasificar_gasto(incoming_msg, from_number)
+                salida.message(resultado_reclasificacion)
+        except Exception as e:
+            logger.error(f"Error procesando imagen de {from_number}: {e}", exc_info=True)
+            salida.message("Disculpa, hubo un error procesando tu factura. Intenta de nuevo.")
         with candado:
             estado["listo"] = True
             enviar_despues = estado["tarde"]
@@ -1222,6 +1393,13 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
 
         # ==================== FINANCIAL ANALYSIS ====================
 
+        # Detectar si es reclasificación de gasto (ej: "de esos X, Y son para...")
+        if any(keyword in msg_lower for keyword in ['de esos', 'de eso', 'ese es', 'esa es para', 'son para']):
+            logger.info(f"Expense reclassification request from {from_number}")
+            resultado = reclasificar_gasto(incoming_msg, from_number)
+            resp.message(resultado)
+            return
+
         # Detectar palabras clave financieras (ingresos y gastos)
         financial_keywords = ['gano', 'trabajo', 'renta', 'pago', 'comida', 'gimnasio', 'teléfono', 'telefono',
                              'deuda', 'seguro', 'suscripción', 'suscripcion', 'ingreso', 'sueldo', 'horas',
@@ -1230,7 +1408,7 @@ Ejemplo: "Meta: Fondo emergencia, $3000, 3 meses, ahorro"
 
         if tiene_info_financiera and ('gano' in msg_lower or 'renta' in msg_lower or 'pago' in msg_lower or 'trabajo' in msg_lower):
             logger.info(f"Financial analysis request from {from_number}")
-            analisis, ingresos, gastos, superavit = procesar_analisis_financiero(incoming_msg)
+            analisis, ingresos, gastos, superavit = procesar_analisis_financiero(incoming_msg, from_number)
             resp.message(analisis)
             return str(resp)
 

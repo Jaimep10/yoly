@@ -6,3 +6,4 @@ python-dotenv
 matplotlib
 reportlab
 pillow
+requests
