@@ -29,10 +29,22 @@ Si es una FACTURA o TICKET DE COMPRA con productos (supermercado, farmacia, ferr
   "tipo": "factura_compra",
   "tienda": "Supermaxi",
   "ciudad": "Quito",
+  "fecha": "2026-10-04",
+  "fecha_texto": "04/10/2026",
   "articulos": [
     {"producto": "Arroz blanco", "producto_norm": "arroz blanco", "marca": "Balu", "medida": "2kg", "cantidad": 1, "precio": 3.50, "categoria": "granos"}
   ]
-y en "pagos" pon el TOTAL de la factura como un solo pago.
+y en "pagos" pon el TOTAL de la factura como un solo pago, con la fecha de la factura.
+
+FECHA DE LA FACTURA (muy importante): busca la fecha IMPRESA en el ticket. Suele estar arriba o abajo,
+junto a palabras como "Fecha", "Date", "Fecha de emisión", "Emitido", "Hora", "Time", o sola junto a la hora
+(ej: "10/04/2026 14:32"). Puede venir como 04/10/2026, 04-10-2026, 04.10.2026, 04/10/26, 2026-10-04,
+"4 de octubre 2026", "October 4, 2026", "Oct 4, 26", "04-OCT-2026".
+  "fecha_texto": la fecha TAL CUAL está impresa (ej: "10/04/26").
+  "fecha": la misma fecha en formato YYYY-MM-DD. Si los números son ambiguos (04/10/2026), decide por el
+  país de la tienda: tiendas de USA (dirección con estado y ZIP, ej "NY 10035") usan MES/DIA;
+  Ecuador y Latinoamérica usan DIA/MES.
+  Si no ves ninguna fecha impresa, pon "fecha": null y "fecha_texto": null. NO uses la fecha de hoy ni la inventes.
 
 Si es una TRANSFERENCIA, deposito o comprobante de pago (captura de la app del banco, Zelle, Venmo, recibo de pago a una persona):
   "tipo": "transferencia",
@@ -46,7 +58,7 @@ y en "pagos" pon el monto como un solo pago con la fecha de la transferencia. No
 
 Reglas:
 - pagos: un objeto por cada pago individual, en el mismo orden de la imagen.
-- fecha: extrae de la libretita "01-3-26" -> "2026-01-03" (formato YYYY-MM-DD). Si no hay fecha, usa null pero NO inventes.
+- fecha: en facturas, la fecha impresa (ver arriba). En libretitas: extrae de la libretita "01-3-26" -> "2026-01-03" (formato YYYY-MM-DD). Si no hay fecha, usa null pero NO inventes.
 - monto: numero sin simbolo.
 - metodo: busca palabras clave en la misma linea: "transf", "transferencia", "T", "efectivo", "efec", "E", "cheque", "chq", "deposito", "zelle". Si dice "200 T" es transferencia. Si solo dice "200", metodo = "no especificado".
 - nota: si hay nota como "banco X" guardala en nota.

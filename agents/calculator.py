@@ -28,6 +28,102 @@ def fecha_valida(fecha):
         return False
 
 
+MESES = {
+    'enero': 1, 'ene': 1, 'january': 1, 'jan': 1,
+    'febrero': 2, 'feb': 2, 'february': 2,
+    'marzo': 3, 'mar': 3, 'march': 3,
+    'abril': 4, 'abr': 4, 'april': 4, 'apr': 4,
+    'mayo': 5, 'may': 5,
+    'junio': 6, 'jun': 6, 'june': 6,
+    'julio': 7, 'jul': 7, 'july': 7,
+    'agosto': 8, 'ago': 8, 'august': 8, 'aug': 8,
+    'septiembre': 9, 'setiembre': 9, 'sep': 9, 'sept': 9, 'set': 9, 'september': 9,
+    'octubre': 10, 'oct': 10, 'october': 10,
+    'noviembre': 11, 'nov': 11, 'november': 11,
+    'diciembre': 12, 'dic': 12, 'december': 12, 'dec': 12,
+}
+
+
+def _anio(texto):
+    anio = int(texto)
+    return anio + 2000 if anio < 100 else anio
+
+
+def _armar(anio, mes, dia):
+    try:
+        return datetime(anio, mes, dia)
+    except ValueError:
+        return None
+
+
+def _no_futura(fecha, hoy):
+    """Un ticket no puede ser de mañana en adelante (1 día de margen por zona horaria)."""
+    return fecha is not None and (fecha - hoy).days <= 1
+
+
+def normalizar_fecha(valor, hoy=None):
+    """
+    Fecha impresa en una factura -> 'YYYY-MM-DD', o '' si no se entiende (no se inventa).
+    Acepta '2026-10-04', '04/10/2026', '04-10-2026', '04.10.2026', '04/10/26', '4 de octubre 2026',
+    'October 4, 2026', 'Oct 4, 26', '04-Oct-2026', con o sin hora al final.
+    Números ambiguos (04/10) se leen día/mes; si así queda en el futuro y mes/día no, se usa mes/día
+    (tickets de USA). Si el día pasa de 12 no hay duda.
+    """
+    if valor is None:
+        return ""
+    if isinstance(valor, datetime):
+        return valor.strftime('%Y-%m-%d')
+    texto = str(valor).strip().lower()
+    if not texto:
+        return ""
+    hoy = hoy or datetime.now()
+
+    # Año primero: 2026-10-04, 2026/10/04, 2026.10.04
+    m = re.search(r'\b(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\b', texto)
+    if m:
+        anio, mes, dia = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        fecha = _armar(anio, mes, dia)
+        if fecha and not _no_futura(fecha, hoy) and dia <= 12:
+            # Vision a veces cambia día y mes; si al revés queda en el pasado, era al revés
+            al_reves = _armar(anio, dia, mes)
+            if _no_futura(al_reves, hoy):
+                fecha = al_reves
+        return fecha.strftime('%Y-%m-%d') if fecha else ""
+
+    # Solo números: 04/10/2026, 04-10-2026, 04.10.26
+    m = re.search(r'\b(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})\b', texto)
+    if m:
+        a, b, anio = int(m.group(1)), int(m.group(2)), _anio(m.group(3))
+        dia_mes, mes_dia = _armar(anio, b, a), _armar(anio, a, b)
+        if a > 12:
+            fecha = dia_mes
+        elif b > 12:
+            fecha = mes_dia
+        elif not _no_futura(dia_mes, hoy) and _no_futura(mes_dia, hoy):
+            fecha = mes_dia
+        else:
+            fecha = dia_mes
+        return fecha.strftime('%Y-%m-%d') if fecha else ""
+
+    # Con el mes en letras
+    palabras = re.findall(r'[a-záéíóúñ]+|\d+', texto)
+    mes = next((MESES[p.rstrip('.')] for p in palabras if p.rstrip('.') in MESES), None)
+    numeros = [p for p in palabras if p.isdigit()]
+    if mes and numeros:
+        anio = next((int(n) for n in numeros if len(n) == 4), None)
+        resto = [int(n) for n in numeros if len(n) != 4]
+        dia = next((n for n in resto if 1 <= n <= 31), None)
+        if dia is None:
+            return ""
+        if anio is None:
+            # "Oct 4, 26": el número que no es el día es el año
+            otros = [n for n in resto if n != dia] or resto[1:]
+            anio = _anio(otros[0]) if otros else hoy.year
+        fecha = _armar(anio, mes, dia)
+        return fecha.strftime('%Y-%m-%d') if fecha else ""
+    return ""
+
+
 METODOS_PAGO = [
     ('transferencia', ['transferencia', 'transf', 'trans', 't']),
     ('efectivo', ['efectivo', 'efec', 'efect', 'e']),
@@ -58,7 +154,7 @@ def normalizar_pagos(pagos_raw):
         if monto is None or monto <= 0:
             continue
         pagos.append({
-            "fecha": fecha if fecha and fecha_valida(fecha) else "",
+            "fecha": normalizar_fecha(fecha),
             "monto": monto,
             "metodo": normalizar_metodo(metodo),
             "nota": str(nota or '').strip(),

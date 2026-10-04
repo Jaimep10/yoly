@@ -408,7 +408,8 @@ def movimientos_periodo(gastos, ingresos, inicio, fin):
                              "monto": reserva, "revisar": False})
             continue
         movs.append({"fecha": f, "tipo": "gasto", "categoria": (g.get('categoria') or 'otro').lower(),
-                     "descripcion": desc, "monto": _a_numero(g.get('monto')), "revisar": bool(g.get('revisar'))})
+                     "descripcion": desc, "monto": _a_numero(g.get('monto')), "revisar": bool(g.get('revisar')),
+                     "aproximada": bool(g.get('fecha_aproximada'))})
     for i in ingresos:
         f = _fecha(i.get('fecha'))
         if not f:
@@ -417,7 +418,8 @@ def movimientos_periodo(gastos, ingresos, inicio, fin):
         if inicio <= f <= fin:
             movs.append({"fecha": f, "tipo": "ingreso", "categoria": (i.get('categoria') or 'ingreso').lower(),
                          "descripcion": i.get('descripcion') or i.get('cliente') or 'Ingreso',
-                         "monto": _a_numero(i.get('monto')), "revisar": bool(i.get('revisar'))})
+                         "monto": _a_numero(i.get('monto')), "revisar": bool(i.get('revisar')),
+                         "aproximada": bool(i.get('fecha_aproximada'))})
     movs.sort(key=lambda m: (m['fecha'], m['tipo']))
     return movs, sin_fecha
 

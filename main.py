@@ -302,7 +302,7 @@ def guardar_gastos(telefono, gastos):
 
 
 # Cuentas en Python puro: viven en la Calculadora (agents/calculator.py)
-from agents.calculator import (a_numero, fecha_valida, METODOS_PAGO, normalizar_metodo,
+from agents.calculator import (a_numero, fecha_valida, normalizar_fecha, METODOS_PAGO, normalizar_metodo,
                               normalizar_pagos, fecha_corta, armar_cobro)
 
 def guardar_cobro(phone_clean, datos):
@@ -371,6 +371,20 @@ def descargar_media_twilio(media_url):
         print(f"Error descargando media: {e}")
         logger.error(f"Error descargando media: {e}", exc_info=True)
         return None
+
+def fecha_exif(imagen_bytes):
+    """Fecha en que se tomó la foto según su EXIF ('YYYY-MM-DD'), o None. WhatsApp a veces la borra."""
+    try:
+        exif = PILImage.open(io.BytesIO(imagen_bytes)).getexif()
+        # 36867 DateTimeOriginal y 36868 DateTimeDigitized viven en el sub-IFD Exif; 306 DateTime en el principal
+        valores = [exif.get_ifd(0x8769).get(t) for t in (36867, 36868)] + [exif.get(306)]
+        for valor in valores:
+            if valor:
+                fecha = datetime.strptime(str(valor).strip()[:10], '%Y:%m:%d')
+                return fecha.strftime('%Y-%m-%d')
+    except Exception:
+        pass
+    return None
 
 def convertir_a_webp(imagen_bytes, max_dimension=1024, quality=70):
     """
@@ -586,15 +600,39 @@ def guardar_imagen_factura(telefono, webp_bytes):
         f.write(webp_bytes)
     return ruta_archivo
 
+def fecha_documento(vision_response, pagos):
+    """
+    Fecha real de una factura y de dónde salió: ("2026-10-04", "factura" | "foto" | "mensaje").
+    1. La impresa en la factura (en el pago, en "fecha" o en "fecha_texto" tal cual la vio Vision).
+    2. Si no hay: la fecha en que se tomó la foto (EXIF), si vino.
+    3. Si tampoco: el día en que llegó el mensaje. 2 y 3 quedan marcadas como aproximadas.
+    """
+    for valor in ((pagos[0].get('fecha') if pagos else None),
+                  vision_response.get('fecha'), vision_response.get('fecha_texto')):
+        fecha = normalizar_fecha(valor)
+        if fecha:
+            return fecha, "factura"
+    fecha = normalizar_fecha(vision_response.get('fecha_foto'))
+    if fecha:
+        return fecha, "foto"
+    return datetime.now().strftime("%Y-%m-%d"), "mensaje"
+
+def texto_fecha(fecha, origen):
+    """Línea de la fecha para WhatsApp; avisa cuando es aproximada."""
+    bonita = datetime.strptime(fecha, '%Y-%m-%d').strftime('%d/%m/%Y')
+    if origen == "foto":
+        return f"📅 Fecha: {bonita} (aproximada: no vi la fecha impresa, usé cuándo se tomó la foto)"
+    if origen == "mensaje":
+        return f"📅 Fecha: {bonita} (aproximada: no vi la fecha impresa, usé hoy; revísala)"
+    return f"📅 Fecha: {bonita}"
+
 def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo):
     """Factura/recibo normal: un solo gasto. Si es factura de compra, también alimenta el comparador."""
     cliente = vision_response.get('cliente') or 'Cliente'
     descripcion = vision_response.get('descripcion') or 'Gasto'
     es_compra = vision_response.get('tipo') == 'factura_compra'
 
-    fecha_gasto = pagos[0].get('fecha') or vision_response.get('fecha') or datetime.now().strftime("%Y-%m-%d")
-    if not fecha_valida(fecha_gasto):
-        fecha_gasto = datetime.now().strftime("%Y-%m-%d")
+    fecha_gasto, origen_fecha = fecha_documento(vision_response, pagos)
     timestamp_formato = datetime.now().strftime("%Y%m%d_%H%M")
     desc_normalizada = descripcion.lower().replace(' ', '').replace('-', '')[:15]
     gasto_nuevo = {
@@ -605,14 +643,16 @@ def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo
         "categoria": reportes.CARPETA_COMPRAS if es_compra else "otro",
         "monto": pagado,
         "cliente": cliente,
-        "factura_path": ruta_archivo
+        "factura_path": ruta_archivo,
+        "fecha_origen": origen_fecha,
+        "fecha_aproximada": origen_fecha != "factura",
     }
     with candado_archivos:
         gastos = cargar_gastos(telefono)
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
 
-    respuesta = f"Leí {cliente}: ${pagado:,.0f}."
+    respuesta = f"Leí {cliente}: ${pagado:,.0f}.\n{texto_fecha(fecha_gasto, origen_fecha)}"
     if es_compra:
         try:
             reportes.guardar_en_carpeta(DATA_DIR, telefono, reportes.CARPETA_COMPRAS,
@@ -661,12 +701,13 @@ def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None):
     Portero (tipo y repetidas) -> Ojo (Vision) -> Calculadora (sumas en Python) -> Contadora (respuesta).
     """
     try:
-        imagenes, fallidas = [], []
+        imagenes, fechas_foto, fallidas = [], [], []
         for numero, media_url in enumerate(media_urls, 1):
             imagen_bytes = descargar_media_twilio(media_url)
             webp_bytes = convertir_a_webp(imagen_bytes) if imagen_bytes else None
             if webp_bytes:
                 imagenes.append(webp_bytes)
+                fechas_foto.append(fecha_exif(imagen_bytes))
             else:
                 logger.warning(f"Foto {numero} de {len(media_urls)} no se pudo bajar/convertir: {media_url}")
                 fallidas.append(numero)
@@ -675,7 +716,7 @@ def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None):
             if len(media_urls) > 1:
                 return "❌ No pude descargar las fotos. Intenta de nuevo."
             return "❌ No pude descargar la imagen. Intenta de nuevo."
-        texto = orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info)
+        texto = orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info, fechas_foto=fechas_foto)
         if fallidas:
             nums = ", ".join(str(n) for n in fallidas)
             texto = f"❌ No pude descargar la foto {nums}. Mándala otra vez.\n\n" + texto
@@ -692,6 +733,10 @@ def procesar_foto_inteligente(media_url, telefono, texto_usuario="", info=None):
     """
     return procesar_fotos_whatsapp([media_url], telefono, texto_usuario, info)
 
+BADGE_APROXIMADA = ('<span title="No se vio la fecha impresa en la factura" style="display:inline-block;'
+                    'margin-left:6px;padding:1px 8px;border-radius:9999px;background:#fef3c7;color:#92400e;'
+                    'font-size:12px;white-space:nowrap">📅 Fecha aproximada</span>')
+
 NOMBRES_CARPETA = {"sueldo": "Sueldos", "renta": "Renta", "deuda": "Deudas", "servicios": "Servicios",
                    "ingreso": "Ingresos", "compras": "Compras", "por_revisar": "Por revisar"}
 
@@ -707,10 +752,8 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
     clase = reportes.clasificar_transferencia(concepto, direccion, texto_usuario)
     carpeta, movimiento = clase['carpeta'], clase['movimiento']
 
-    fecha = pagos[0].get('fecha') if pagos else None
-    fecha_leida = fecha_valida(fecha) if fecha else False
-    if not fecha_leida:
-        fecha = datetime.now().strftime("%Y-%m-%d")
+    fecha, origen_fecha = fecha_documento(vision_response, pagos)
+    fecha_leida = origen_fecha == "factura"
     persona = vision_response.get('beneficiario') if movimiento == 'gasto' else vision_response.get('ordenante')
     persona = persona or vision_response.get('cliente') or ''
     descripcion = concepto or vision_response.get('descripcion') or 'Transferencia'
@@ -732,6 +775,8 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
         "referencia": vision_response.get('referencia') or '',
         "factura_path": ruta_archivo,
         "revisar": revisar,
+        "fecha_origen": origen_fecha,
+        "fecha_aproximada": not fecha_leida,
     }
     reportes.guardar_en_carpeta(DATA_DIR, telefono, carpeta, transaccion)
 
@@ -757,8 +802,7 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
     lineas = [f"🏦 Transferencia: ${monto:,.2f}" + (f" ({flecha} {persona})" if persona else "")]
     if concepto:
         lineas.append(f"Concepto: {concepto}")
-    lineas.append(f"Fecha: {datetime.strptime(fecha, '%Y-%m-%d').strftime('%d/%m/%Y')}"
-                  + ("" if fecha_leida else " (no vi la fecha, usé hoy; revísala)"))
+    lineas.append(texto_fecha(fecha, origen_fecha))
     if carpeta == reportes.CARPETA_REVISAR:
         lineas.append("")
         lineas.append("❓ No sé si es sueldo, renta, deuda o servicios, así que la guardé en *Por revisar*.")
@@ -2358,7 +2402,7 @@ def dashboard(phone):
             bg_class = "bg-white" if idx % 2 == 0 else "bg-gray-50"
             tabla_html += f"""
                 <tr class="{bg_class} border-b hover:bg-blue-50 transition">
-                    <td class="px-4 py-3 text-gray-700">{gasto.get('fecha', '')}</td>
+                    <td class="px-4 py-3 text-gray-700">{gasto.get('fecha', '')}{BADGE_APROXIMADA if gasto.get('fecha_aproximada') else ''}</td>
                     <td class="px-4 py-3 text-gray-700">{gasto.get('descripcion', '')[:40]}</td>
                     <td class="px-4 py-3"><span class="inline-block bg-blue-100 text-blue-800 px-3 py-1 rounded-full text-sm font-medium">{gasto.get('categoria', 'otro')}</span></td>
                     <td class="px-4 py-3 text-right font-semibold text-gray-900">${gasto.get('monto', 0):.2f}</td>
@@ -2797,7 +2841,7 @@ button {{ padding: 7px 14px; border-radius: 6px; border: 0; background: #1e40af;
             for m in resumen['movimientos']:
                 clase = 'pos' if m['tipo'] == 'ingreso' else 'neg'
                 revisar = " ❓" if m.get('revisar') or m['categoria'] == reportes.CARPETA_REVISAR else ""
-                partes.append(f"<tr><td>{m['fecha'].strftime('%d/%m/%Y')}</td><td>{_e(m['tipo'])}</td>"
+                partes.append(f"<tr><td>{m['fecha'].strftime('%d/%m/%Y')}{BADGE_APROXIMADA if m.get('aproximada') else ''}</td><td>{_e(m['tipo'])}</td>"
                               f"<td>{_e(m['categoria'].replace('_', ' '))}{revisar}</td><td>{_e(m['descripcion'])}</td>"
                               f"<td class='{clase}'>{reportes.dinero(m['monto'])}</td></tr>")
             partes.append("</table></div>")
@@ -2894,6 +2938,8 @@ def dashboard_carpetas(phone):
                     except ValueError:
                         pass
                     marca = " ❓" if t.get('revisar') else ""
+                    if t.get('fecha_aproximada'):
+                        marca += BADGE_APROXIMADA
                     partes.append(f"<tr><td>{_e(fecha)}{marca}</td><td>{_e(t.get('descripcion', ''))}</td>"
                                   f"<td>{_e(t.get('movimiento', 'gasto'))}</td><td class='price'>{reportes.dinero(reportes._a_numero(t.get('monto')))}</td></tr>")
                 partes.append("</table></div>")

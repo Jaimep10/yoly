@@ -97,9 +97,10 @@ class OrquestadorYoly:
         self.contadora = Contadora()
         self.herramientas = herramientas
 
-    def handle_whatsapp(self, phone, images, texto="", info=None, ctx=None):
+    def handle_whatsapp(self, phone, images, texto="", info=None, ctx=None, fechas_foto=None):
         """
         phone: quien escribe. images: lista de fotos (webp) del mismo mensaje, 1 o varias. texto: lo que escribió.
+        fechas_foto: fecha EXIF de cada foto (o None), respaldo si la factura no trae fecha impresa.
         Devuelve el texto de la respuesta para WhatsApp.
         1. Portero: qué es, cuántas fotos, si es repetida.
         2. Ojo: lee cada foto (fecha, monto, método, cliente).
@@ -107,9 +108,9 @@ class OrquestadorYoly:
         4. Contadora: respuesta WA + tarjetas del dashboard (+ PDF y Excel en las descargas) y guarda.
         """
         ctx = ctx or self.herramientas(phone)
-        return self._procesar(list(images), texto or "", ctx, info)
+        return self._procesar(list(images), texto or "", ctx, info, fechas_foto)
 
-    def _procesar(self, imagenes, texto_usuario, ctx, info=None):
+    def _procesar(self, imagenes, texto_usuario, ctx, info=None, fechas_foto=None):
         """
         imagenes: lista de fotos ya en webp (bytes). Devuelve el texto para WhatsApp.
         info (opcional): se anota info["tipo"] (lo que leyó Vision en la primera foto) e info["clasificacion"].
@@ -152,6 +153,8 @@ class OrquestadorYoly:
                 respuestas.append(f"❌ No pude leer la foto {numero}. Mándala otra vez más clara."
                                   if varias else ERROR_LECTURA)
                 continue
+            if fechas_foto and img_info['indice'] < len(fechas_foto) and fechas_foto[img_info['indice']]:
+                vision.setdefault('fecha_foto', fechas_foto[img_info['indice']])
             info.setdefault('tipo', vision.get('tipo'))
             leidas.append((vision, ruta, ruta_documento(vision, img_info['tipo']), img_info['huella']))
 
