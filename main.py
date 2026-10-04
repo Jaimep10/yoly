@@ -3,6 +3,7 @@ os.environ["MPLBACKEND"] = "Agg"  # sin ventanas: los gráficos se dibujan fuera
 import json
 import logging
 import threading
+import io
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify, Response
 from twilio.twiml.messaging_response import MessagingResponse
@@ -19,6 +20,9 @@ from reportlab.lib.units import inch
 from datetime import datetime
 import base64
 import requests
+from requests.auth import HTTPBasicAuth
+from PIL import Image as PILImage
+from openai import OpenAI
 
 app = Flask(__name__)
 
@@ -35,7 +39,8 @@ required_env_vars = {
     'TWILIO_ACCOUNT_SID': 'Twilio Account SID',
     'TWILIO_AUTH_TOKEN': 'Twilio Auth Token',
     'TWILIO_WHATSAPP_NUMBER': 'Twilio WhatsApp Number',
-    'ANTHROPIC_API_KEY': 'Anthropic API Key'
+    'ANTHROPIC_API_KEY': 'Anthropic API Key',
+    'OPENAI_API_KEY': 'OpenAI API Key'
 }
 
 missing_vars = []
@@ -201,41 +206,110 @@ def guardar_gastos(telefono, gastos):
         print(f"Error guardando gastos: {e}")
         return False
 
-def descargar_imagen(media_url):
-    """Descarga una imagen desde una URL y la retorna como bytes"""
+def descargar_media_twilio(media_url):
+    """Descarga media desde Twilio con autenticación básica"""
     try:
-        response = requests.get(media_url, timeout=30)
-        response.raise_for_status()
-        return response.content
+        auth = HTTPBasicAuth(os.getenv("TWILIO_ACCOUNT_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+        r = requests.get(media_url, auth=auth, timeout=20)
+        r.raise_for_status()
+        return r.content
     except Exception as e:
-        print(f"Error descargando imagen: {e}")
+        print(f"Error descargando media: {e}")
+        logger.error(f"Error descargando media: {e}", exc_info=True)
+        return None
+
+def convertir_a_webp(imagen_bytes, max_dimension=1024, quality=70):
+    """
+    Convierte imagen bytes a WEBP
+    Redimensiona a max_dimension x max_dimension manteniendo aspect ratio
+    """
+    try:
+        img = PILImage.open(io.BytesIO(imagen_bytes))
+
+        # Convertir a RGB si es necesario
+        if img.mode in ('RGBA', 'LA', 'P'):
+            rgb_img = PILImage.new('RGB', img.size, (255, 255, 255))
+            rgb_img.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = rgb_img
+
+        # Redimensionar manteniendo aspect ratio
+        img.thumbnail((max_dimension, max_dimension), PILImage.Resampling.LANCZOS)
+
+        # Convertir a WEBP
+        output = io.BytesIO()
+        img.save(output, format='WEBP', quality=quality)
+        return output.getvalue()
+    except Exception as e:
+        print(f"Error convirtiendo a WEBP: {e}")
+        logger.error(f"Error convirtiendo a WEBP: {e}", exc_info=True)
+        return None
+
+def procesar_audio(media_url, telefono):
+    """
+    Descarga un audio desde Twilio y lo transcribe con Whisper.
+    Retorna el texto transcrito o un mensaje de error.
+    """
+    try:
+        # Descargar audio
+        contenido = descargar_media_twilio(media_url)
+        if not contenido:
+            return "❌ No pude descargar el audio. Intenta de nuevo."
+
+        # Guardar en archivo temporal
+        temp_path = f"/tmp/{telefono}.ogg"
+        with open(temp_path, "wb") as f:
+            f.write(contenido)
+
+        # Transcribir con Whisper
+        client_oai = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        with open(temp_path, "rb") as f:
+            transcripcion = client_oai.audio.transcriptions.create(
+                model="whisper-1",
+                file=f,
+                language="es"
+            )
+
+        # Limpiar archivo temporal
+        try:
+            os.remove(temp_path)
+        except:
+            pass
+
+        return transcripcion.text
+    except Exception as e:
+        print(f"Error procesando audio: {e}")
+        logger.error(f"Error procesando audio: {e}", exc_info=True)
         return None
 
 def procesar_foto_inteligente(media_url, telefono):
     """
     Procesa una foto de factura/recibo usando Claude Vision.
-    Descarga, convierte a base64, y extrae información con IA.
-    Guarda en /data/{telefono}/gastos.json
+    Descarga, convierte a WEBP, guarda en /app/data/{telefono}/facturas/
+    y extrae información con IA.
     """
     try:
         # Descargar imagen
-        imagen_bytes = descargar_imagen(media_url)
+        imagen_bytes = descargar_media_twilio(media_url)
         if not imagen_bytes:
             return "❌ No pude descargar la imagen. Intenta de nuevo."
 
-        # Convertir a base64
-        imagen_base64 = base64.standard_b64encode(imagen_bytes).decode('utf-8')
+        # Convertir a WEBP
+        webp_bytes = convertir_a_webp(imagen_bytes)
+        if not webp_bytes:
+            return "❌ No pude procesar la imagen. Intenta con otra."
 
-        # Determinar tipo de media (asumir JPEG por defecto)
-        media_type = "image/jpeg"
-        if media_url.lower().endswith('.png'):
-            media_type = "image/png"
-        elif media_url.lower().endswith('.gif'):
-            media_type = "image/gif"
-        elif media_url.lower().endswith('.webp'):
-            media_type = "image/webp"
+        # Guardar en carpeta de facturas
+        ruta_facturas = f"/app/data/{telefono}/facturas"
+        os.makedirs(ruta_facturas, exist_ok=True)
+        timestamp = datetime.now().isoformat().replace(':', '-')
+        ruta_archivo = f"{ruta_facturas}/factura_{timestamp}.webp"
+        with open(ruta_archivo, "wb") as f:
+            f.write(webp_bytes)
 
-        # Llamar a Claude Vision
+        # Convertir a base64 para Claude Vision
+        imagen_base64 = base64.standard_b64encode(webp_bytes).decode('utf-8')
+
+        # Llamar a Claude Vision con imagen WEBP
         response = client.messages.create(
             model=MODELO_CLAUDE,
             max_tokens=500,
@@ -246,7 +320,7 @@ def procesar_foto_inteligente(media_url, telefono):
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": media_type,
+                            "media_type": "image/webp",
                             "data": imagen_base64
                         }
                     },
@@ -298,8 +372,9 @@ Sé específico: si es Home Depot o ferretería -> materiales. Si menciona Ecuad
         categoria = gasto.get('categoria', 'otro')
         monto = gasto.get('monto', '0')
         proveedor = gasto.get('proveedor', 'Proveedor')
+        items = gasto.get('descripcion', '')
 
-        return f"✓ Factura archivada y clasificada como *{categoria}*\n💰 ${monto} - {proveedor}"
+        return f"Listo, leí tu nota: {items}. Total ${monto} guardado. ¿Quieres el balance?"
 
     except Exception as e:
         logger.error(f"Error en procesar_foto_inteligente: {e}", exc_info=True)
@@ -1153,14 +1228,15 @@ def whatsapp():
     message_sid = request.form.get('MessageSid', 'unknown')
     account_sid = request.form.get('AccountSid', 'unknown')
 
-    # Verificar si hay imagen adjunta
+    # Verificar si hay media adjunta
     media_url_0 = request.form.get('MediaUrl0', '')
+    media_content_type = request.form.get('MediaContentType0', '')
 
     print(f"[WHATSAPP] Received request from Twilio")
-    print(f"[WHATSAPP] Extracted - From: {from_number}, MessageSID: {message_sid}, Body: {incoming_msg}, MediaUrl0: {media_url_0}")
-    logger.info(f"[WHATSAPP] Message received - From: {from_number}, Body: {incoming_msg[:100]}, Has Media: {bool(media_url_0)}")
+    print(f"[WHATSAPP] Extracted - From: {from_number}, MessageSID: {message_sid}, Body: {incoming_msg}, MediaUrl0: {media_url_0}, Type: {media_content_type}")
+    logger.info(f"[WHATSAPP] Message received - From: {from_number}, Body: {incoming_msg[:100]}, Has Media: {bool(media_url_0)}, Type: {media_content_type}")
 
-    print(f"Pregunta recibida: {len(incoming_msg)} caracteres, Media: {bool(media_url_0)}")
+    print(f"Pregunta recibida: {len(incoming_msg)} caracteres, Media: {bool(media_url_0)}, Tipo: {media_content_type}")
 
     if not incoming_msg and not media_url_0:
         logger.warning(f"Empty message body and no media received from {from_number}")
@@ -1181,9 +1257,12 @@ def whatsapp():
 
     server_url = os.environ.get('SERVER_URL', request.host_url.rstrip('/'))
 
-    # Si hay imagen, procesar con visión
+    # Si hay media, procesar según tipo
     if media_url_0:
-        return atender_con_imagen(media_url_0, incoming_msg, from_number, server_url)
+        if media_content_type.startswith("image/"):
+            return atender_con_imagen(media_url_0, incoming_msg, from_number, server_url)
+        elif media_content_type.startswith("audio/"):
+            return atender_con_audio(media_url_0, incoming_msg, from_number, server_url)
 
     return atender(incoming_msg, from_number, server_url)
 
@@ -1258,6 +1337,51 @@ def atender_con_imagen(media_url, incoming_msg, from_number, server_url):
         except Exception as e:
             logger.error(f"Error procesando imagen de {from_number}: {e}", exc_info=True)
             salida.message("Disculpa, hubo un error procesando tu factura. Intenta de nuevo.")
+        with candado:
+            estado["listo"] = True
+            enviar_despues = estado["tarde"]
+        if enviar_despues:
+            logger.info(f"Respuesta tardía enviada por Twilio a {from_number}")
+            enviar_por_twilio(from_number, salida.textos)
+
+    hilo = threading.Thread(target=trabajar, daemon=True)
+    hilo.start()
+    hilo.join(ESPERA_MAX_SEGUNDOS)
+
+    resp = MessagingResponse()
+    with candado:
+        if estado["listo"]:
+            for texto in salida.textos:
+                resp.message(texto)
+            return str(resp)
+        estado["tarde"] = True
+    logger.info(f"Respuesta a {from_number} tarda más de {ESPERA_MAX_SEGUNDOS}s: se enviará por Twilio")
+    resp.message(MENSAJE_ESPERA)
+    return str(resp)
+
+
+def atender_con_audio(media_url, incoming_msg, from_number, server_url):
+    """Procesa un audio, lo transcribe con Whisper y procesa el texto"""
+    salida = Salida()
+    estado = {"listo": False, "tarde": False}
+    candado = threading.Lock()
+
+    def trabajar():
+        try:
+            # Transcribir audio
+            texto_audio = procesar_audio(media_url, from_number)
+            if not texto_audio:
+                salida.message("❌ No pude transcribir el audio. Intenta de nuevo.")
+                return
+
+            # Procesar el texto transcrito
+            salida.message(f"Entendí: {texto_audio}. Ya lo registré.")
+
+            # Procesar como mensaje de texto
+            procesar_mensaje(texto_audio, from_number, server_url, salida)
+        except Exception as e:
+            logger.error(f"Error procesando audio de {from_number}: {e}", exc_info=True)
+            salida.message("Disculpa, hubo un error procesando tu audio. Intenta de nuevo.")
         with candado:
             estado["listo"] = True
             enviar_despues = estado["tarde"]
