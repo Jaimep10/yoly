@@ -269,53 +269,116 @@ def procesar_audio_groq(ruta_tmp):
 
 def extraer_gastos(transcripcion):
     """
-    FUNCION SEGURA: Extrae SOLO números que aparecen en la transcripción real.
-    NUNCA inventa montos ni usa ejemplos hardcodeados.
+    Extrae total_enviado, categorías específicas y calcula reserva.
 
-    PASO 1: Extrae SOLO números que aparecen en texto
-    PASO 2: Si no hay números, retorna error pidiendo confirmación
-    PASO 3: Log para debug
-    PASO 4: Procesa solo números reales de transcripción
+    Detecta:
+    - total_enviado: "Envié 500" → 500
+    - Categorías: "renta", "comida", "estefanito", etc.
+    - Reserva: total_enviado - suma_desglose
+
+    Retorna estructura mejorada con validación.
     """
-    import re
-
     try:
-        # PASO 1: Extrae SOLO números que aparecen en el texto
-        # Busca números con o sin $ o punto decimal
-        numeros_en_texto = re.findall(r'\$?(\d+(?:\.\d+)?)', transcripcion)
+        transcripcion_lower = transcripcion.lower()
+        print(f"[EXTRAER_GASTOS] Transcripción: {transcripcion}")
 
-        # PASO 2: Si no hay números, NO sumes nada
-        if not numeros_en_texto:
-            return {"error": "No escuché montos precisos. ¿Puedes repetir los números?", "numeros": []}
+        # PASO 1: Detectar total_enviado
+        # Busca: "envié 500", "mandé 500", "total 500"
+        regex_total = r'(?:envié|mandé|total)\s+\$?(\d+(?:\.\d+)?)'
+        match_total = re.search(regex_total, transcripcion_lower)
+        total_enviado = None
+        if match_total:
+            total_enviado = float(match_total.group(1))
+            print(f"[EXTRAER_GASTOS] Total enviado detectado: {total_enviado}")
 
-        # PASO 3: Log para debug
-        print(f"[SEGURIDAD] TRANSCRIPCION ORIGINAL: {transcripcion}")
-        print(f"[SEGURIDAD] NUMEROS EXTRAIDOS: {numeros_en_texto}")
+        # PASO 2: Detectar categorías específicas
+        # Busca: "380 renta" o "renta 380" o "380 para renta"
+        desglose = {}
+        categorias = ['renta', 'comida', 'estefanito', 'transporte', 'utilidades', 'utilidad', 'internet', 'telefono', 'servicios', 'otros', 'otro']
 
-        # PASO 4: Procesa solo números reales de transcripción
-        numeros_float = []
-        for n in numeros_en_texto:
-            try:
-                numeros_float.append(float(n))
-            except ValueError:
-                continue
+        for categoria in categorias:
+            # Patrón 1: número seguido de categoría (ej: "380 renta")
+            patron1 = rf'(\d+(?:\.\d+)?)\s+{categoria}'
+            match1 = re.search(patron1, transcripcion_lower)
 
-        if not numeros_float:
-            return {"error": "No escuché montos válidos. ¿Puedes repetir?", "numeros": []}
+            # Patrón 2: categoría seguida de número (ej: "renta 380")
+            patron2 = rf'{categoria}\s+\$?(\d+(?:\.\d+)?)'
+            match2 = re.search(patron2, transcripcion_lower)
 
-        total = sum(numeros_float)
-        print(f"[SEGURIDAD] TOTAL CALCULADO: {total}")
+            # Patrón 3: número para categoría (ej: "380 para renta")
+            patron3 = rf'(\d+(?:\.\d+)?)\s+(?:para|de)\s+{categoria}'
+            match3 = re.search(patron3, transcripcion_lower)
 
-        return {
-            "total": round(total, 2),
-            "numeros": numeros_float,
-            "cantidad_items": len(numeros_float),
+            match = match1 or match2 or match3
+            if match:
+                try:
+                    # Obtener el número correcto según cuál match funcionó
+                    if match1:
+                        monto = float(match1.group(1))
+                    elif match2:
+                        monto = float(match2.group(1))
+                    else:
+                        monto = float(match3.group(1))
+
+                    # Normalizar nombre de categoría
+                    cat_normalizada = categoria
+                    if cat_normalizada not in desglose:  # No duplicar si ya lo encontramos
+                        desglose[cat_normalizada] = monto
+                        print(f"[EXTRAER_GASTOS] {cat_normalizada.upper()}: {monto}")
+                except (ValueError, IndexError):
+                    pass
+
+        # PASO 3: Calcular suma del desglose sin reserva
+        suma_desglose_sin_reserva = sum(desglose.values())
+        print(f"[EXTRAER_GASTOS] Suma desglose: {suma_desglose_sin_reserva}")
+
+        # PASO 4: Calcular reserva y validación
+        reserva = 0
+        diferencia = 0
+        alerta = None
+        valido = True
+
+        if total_enviado is not None:
+            diferencia = total_enviado - suma_desglose_sin_reserva
+            reserva = diferencia
+
+            if reserva < 0:
+                alerta = f"⚠️ Te pasaste ${abs(reserva)}. El desglose suma ${suma_desglose_sin_reserva} pero dijiste total ${total_enviado}."
+                valido = False
+                print(f"[EXTRAER_GASTOS] ALERTA: {alerta}")
+        else:
+            # Si no hay total_enviado, el total es el desglose y no hay reserva
+            total_enviado = suma_desglose_sin_reserva
+            reserva = 0
+            diferencia = 0
+            valido = True
+
+        # PASO 5: Retornar estructura mejorada
+        resultado = {
+            "total_enviado": round(total_enviado, 2),
+            "desglose": {k: round(v, 2) for k, v in desglose.items()},
+            "reserva": round(reserva, 2),
+            "diferencia": round(diferencia, 2),
+            "alerta": alerta,
+            "valido": valido,
+            "error": None if valido else alerta,
             "transcripcion_usada": transcripcion
         }
 
+        print(f"[EXTRAER_GASTOS] Resultado: {resultado}")
+        return resultado
+
     except Exception as e:
         logger.error(f"Error en extraer_gastos: {e}", exc_info=True)
-        return {"error": f"Error procesando transcripción: {str(e)}", "numeros": []}
+        return {
+            "error": f"Error procesando transcripción: {str(e)}",
+            "total_enviado": None,
+            "desglose": {},
+            "reserva": 0,
+            "diferencia": 0,
+            "alerta": None,
+            "valido": False
+        }
 
 def procesar_audio(media_url, telefono):
     """
@@ -1865,6 +1928,68 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     msg_lower = incoming_msg.lower()
 
     try:
+        # ==================== REGISTRO DE GASTOS CON DESGLOSE ====================
+
+        if any(keyword in msg_lower for keyword in ['envié', 'mandé', 'total']) and any(keyword in msg_lower for keyword in ['renta', 'comida', 'estefanito', 'transporte', 'pago']):
+            logger.info(f"Expense breakdown detected from {from_number}")
+            resultado = extraer_gastos(incoming_msg)
+
+            # Si hay error o no es válido, responder con alerta
+            if resultado.get("error") or not resultado.get("valido"):
+                resp.message(resultado.get("error") or resultado.get("alerta", "Error procesando gastos"))
+                return
+
+            # Construir resumen del desglose
+            total = resultado["total_enviado"]
+            desglose = resultado["desglose"]
+            reserva = resultado["reserva"]
+            alerta = resultado.get("alerta")
+
+            # Generar resumen detallado
+            resumen = f"✓ Total: ${total:.2f}\n\nDesglose:\n"
+            for categoria, monto in desglose.items():
+                resumen += f"  • {categoria.title()}: ${monto:.2f}\n"
+
+            if reserva > 0:
+                resumen += f"  • Reserva: ${reserva:.2f}\n"
+            elif reserva < 0:
+                resumen += f"  • Reserva: ${reserva:.2f} ⚠️\n"
+
+            resumen += f"\nTotal verificado: ${total:.2f}"
+
+            if alerta:
+                resumen += f"\n\n{alerta}"
+
+            resp.message(resumen)
+
+            # Guardar gasto en la BD
+            try:
+                gastos = cargar_gastos(from_number)
+                timestamp_iso = datetime.now().isoformat()
+                gasto_id = f"desglose_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+                gasto_nuevo = {
+                    "id": gasto_id,
+                    "fecha": datetime.now().strftime("%Y-%m-%d"),
+                    "timestamp": timestamp_iso,
+                    "descripcion": "Desglose de gastos",
+                    "monto": total,
+                    "categoria": "desglose",
+                    "total": total,
+                    "desglose_json": desglose,
+                    "reserva": reserva,
+                    "diferencia": resultado["diferencia"],
+                    "validacion_alerta": alerta
+                }
+
+                gastos.append(gasto_nuevo)
+                guardar_gastos(from_number, gastos)
+                logger.info(f"Expense breakdown saved for {from_number}: ${total}")
+            except Exception as e:
+                logger.error(f"Error saving expense breakdown: {e}", exc_info=True)
+
+            return
+
         # ==================== BORRAR GASTO ====================
 
         if any(keyword in msg_lower for keyword in ['borrar', 'eliminar', 'quitar', 'borra']):
