@@ -571,31 +571,25 @@ Sé específico en categoría: si es Home Depot o ferretería -> materiales. Si 
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
 
-        # Guardar en memoria si contiene información de deuda
-        palabras_deuda = ['deuda', 'alan', 'balance', 'adeudo', 'debo', 'pendiente', 'pago']
-        descripcion_lower = descripcion.lower()
-        categoria_lower = categoria.lower()
+        # Guardar en memoria datos del gasto para poder responder a balance
+        phone_clean = normalizar_telefono(telefono)
+        deuda_total = gasto.get('monto', monto)
+        total_pagado = gasto.get('total_pagado', 0) if 'total_pagado' in gasto else 0
 
-        es_deuda = any(palabra in descripcion_lower or palabra in categoria_lower
-                       for palabra in palabras_deuda)
-
-        if es_deuda:
-            phone_clean = normalizar_telefono(telefono)
-            deuda_total = gasto.get('monto', monto)
-            total_pagado = gasto.get('total_pagado', 0) if 'total_pagado' in gasto else 0
-
-            memoria_usuarios[phone_clean] = {
-                'tipo': 'deuda',
-                'deuda_total': deuda_total,
-                'total_pagado': total_pagado,
-                'fecha_inicio': fecha_hoy,
-                'fecha_final': fecha_hoy,
-                'balance': deuda_total - total_pagado,
-                'estado': 'guardado',
-                'descripcion': descripcion,
-                'gasto_id': gasto_id
-            }
-            guardar_memoria(memoria_usuarios)
+        # Guardar siempre en memoria para poder mostrar balance cuando se pregunta
+        memoria_usuarios[phone_clean] = {
+            'tipo': 'deuda',
+            'deuda_total': deuda_total,
+            'total_pagado': total_pagado,
+            'fecha_inicio': fecha_hoy,
+            'fecha_final': fecha_hoy,
+            'balance': deuda_total - total_pagado,
+            'estado': 'guardado',
+            'descripcion': descripcion,
+            'gasto_id': gasto_id,
+            'ultima_pregunta': 'balance'
+        }
+        guardar_memoria(memoria_usuarios)
 
         # Respuesta al usuario
         items = gasto.get('descripcion', '')
@@ -3099,6 +3093,31 @@ Link: {server_url}/dashboard/{phone_clean}"""
         # Check if user is confirming or rejecting a temporary expense
         confirmacion_palabras = ['si', 'yes', 'ok', 'vale', 'correcto', 'está bien', 'esta bien', 'ok!', 'si!', 'sí']
         rechazo_palabras = ['no', 'nope', 'incorrecto', 'de nuevo', 'de vueltas', 'otra vez']
+
+        # PRIORIDAD 1: Chequear si es respuesta a "¿Quieres el balance?"
+        if msg_lower.strip() in confirmacion_palabras and phone_clean in memoria_usuarios:
+            ultima_pregunta = memoria_usuarios[phone_clean].get("ultima_pregunta", "").lower()
+            if "balance" in ultima_pregunta:
+                # Es respuesta a balance - mostrar el balance
+                datos = memoria_usuarios[phone_clean]
+                if datos.get('tipo') == 'deuda':
+                    deuda = datos.get('deuda_total', 0)
+                    pagado = datos.get('total_pagado', 0)
+                    balance = datos.get('balance', 0)
+                    fecha = datos.get('fecha_final', '')
+
+                    respuesta_balance = f"""Perfecto.
+Deuda original: ${deuda:,.0f}
+Pagado: ${pagado:,.0f}
+Te falta: ${balance:,.0f}
+
+Link carpeta: {server_url}/dashboard/{phone_clean}/carpeta/maria_cristina"""
+
+                    resp.message(respuesta_balance)
+                    # Limpiar la pregunta para que no se repita
+                    memoria_usuarios[phone_clean]["ultima_pregunta"] = ""
+                    guardar_memoria(memoria_usuarios)
+                    return
 
         if msg_lower.strip() in confirmacion_palabras and from_number in temp_gastos:
             # User confirmed the expense!
