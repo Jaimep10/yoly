@@ -7,6 +7,7 @@ import io
 import re
 from datetime import datetime, timedelta
 from calendar import monthrange
+from difflib import SequenceMatcher
 from flask import Flask, request, jsonify, Response, render_template_string
 from twilio.twiml.messaging_response import MessagingResponse
 from twilio.rest import Client
@@ -174,6 +175,10 @@ temp_gastos = {}
 # ==================== TEMPORARY PRODUCTS FOR PRICE LIBRARY ====================
 # Global dict to store products extracted from tickets/receipts temporarily
 temp_productos = {}
+
+# ==================== USER CONVERSATION MEMORY BY PHONE ====================
+# Global dict to store conversation context per user (persists during session)
+memoria_usuario = {}
 
 # ==================== FINANCIAL CONTEXT PERSISTENCE ====================
 
@@ -542,6 +547,33 @@ Sé específico en categoría: si es Home Depot o ferretería -> materiales. Si 
         gastos = cargar_gastos(telefono)
         gastos.append(gasto_nuevo)
         guardar_gastos(telefono, gastos)
+
+        # Guardar en memoria si contiene información de deuda/balance
+        # Detectar palabras clave de deuda en descripción o categoría
+        palabras_deuda = ['deuda', 'alan', 'balance', 'adeudo', 'debo', 'pendiente', 'pago']
+        es_deuda = any(palabra in descripcion.lower() or palabra in categoria.lower()
+                       for palabra in palabras_deuda)
+
+        # También revisar el texto original que Claude extrajo
+        texto_original = json.dumps(gasto, ensure_ascii=False).lower()
+        si_menciona_pagado = 'pagado' in texto_original or 'pago' in texto_original or 'total_pagado' in texto_original
+
+        if es_deuda or si_menciona_pagado:
+            # Extraer información de deuda si la nota la contiene
+            deuda_total = gasto.get('monto', monto)
+            total_pagado = gasto.get('total_pagado', 0) if 'total_pagado' in gasto else 0
+
+            guardar_memoria(telefono, {
+                'tipo': 'deuda',
+                'deuda_total': deuda_total,
+                'total_pagado': total_pagado,
+                'fecha_inicio': fecha_hoy,
+                'fecha_final': fecha_hoy,
+                'balance': deuda_total - total_pagado,
+                'estado': 'guardado',
+                'descripcion': descripcion,
+                'gasto_id': gasto_id
+            })
 
         # Respuesta al usuario
         items = gasto.get('descripcion', '')
@@ -1709,6 +1741,75 @@ def normalizar_telefono(phone):
         return ""
     # Solo números
     return re.sub(r'[^0-9]', '', phone)
+
+# ==================== USER CONVERSATION MEMORY FUNCTIONS ====================
+
+def guardar_memoria(phone, datos):
+    """Guarda contexto del usuario por teléfono"""
+    phone_clean = normalizar_telefono(phone)
+    if not phone_clean:
+        return
+    # Mantiene datos anteriores y agrega/actualiza nuevos datos
+    memoria_usuario[phone_clean] = {
+        **memoria_usuario.get(phone_clean, {}),
+        **datos,
+        'timestamp': datetime.now().isoformat()
+    }
+    # También guardar en archivo para persistencia entre sesiones
+    ruta_datos = obtener_ruta_datos(phone_clean)
+    os.makedirs(ruta_datos, exist_ok=True)
+    ruta_memoria = f"{ruta_datos}/memoria.json"
+    try:
+        with open(ruta_memoria, 'w', encoding='utf-8') as f:
+            json.dump(memoria_usuario[phone_clean], f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"No se pudo guardar memoria persistente para {phone_clean}: {e}")
+
+def obtener_memoria(phone):
+    """Obtiene contexto del usuario por teléfono"""
+    phone_clean = normalizar_telefono(phone)
+    if not phone_clean:
+        return {}
+    # Primero intentar desde sesión
+    if phone_clean in memoria_usuario:
+        return memoria_usuario[phone_clean]
+    # Si no está en sesión, intentar cargar del archivo
+    try:
+        ruta_datos = obtener_ruta_datos(phone_clean)
+        ruta_memoria = f"{ruta_datos}/memoria.json"
+        if os.path.exists(ruta_memoria):
+            with open(ruta_memoria, 'r', encoding='utf-8') as f:
+                mem = json.load(f)
+                memoria_usuario[phone_clean] = mem
+                return mem
+    except Exception as e:
+        logger.warning(f"No se pudo cargar memoria para {phone_clean}: {e}")
+    return {}
+
+def buscar_similar(palabra, lista_palabras, threshold=0.7):
+    """Busca palabra similar en lista usando fuzzy matching"""
+    for item in lista_palabras:
+        ratio = SequenceMatcher(None, palabra.lower(), item.lower()).ratio()
+        if ratio > threshold:
+            return item
+    return None
+
+def detectar_consulta_balance(mensaje):
+    """Detecta variantes de pregunta por balance/deuda"""
+    keywords = ['balance', 'debo', 'alan', 'deuda', 'cuanto falta', 'cuanto debo',
+                'me falta', 'pendiente', 'adeudar', 'adeudo', 'sinpor', 'cuenta', 'estado']
+    msg_lower = mensaje.lower()
+    # Verificar palabras clave directas
+    if any(kw in msg_lower for kw in keywords):
+        return True
+    # Fuzzy matching para typos comunes
+    palabras_mensaje = msg_lower.split()
+    for palabra in palabras_mensaje:
+        if len(palabra) > 3:
+            similar = buscar_similar(palabra, keywords, threshold=0.65)
+            if similar:
+                return True
+    return False
 
 def generar_excel_gastos(phone):
     """Genera un archivo Excel con los gastos del usuario del mes actual"""
@@ -3016,6 +3117,22 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     global temp_gastos, temp_productos
     msg_lower = incoming_msg.lower()
 
+    # ==================== TYPO TOLERANCE (FUZZY MATCHING) ====================
+    # Corregir typos comunes antes de procesar
+    typo_corrections = {
+        'sinpor': 'si por',
+        'alan': 'balance',
+        'balanc': 'balance',
+        'deudaa': 'deuda',
+        'deudas': 'deuda',
+        'pendiente': 'deuda'
+    }
+
+    for typo, correccion in typo_corrections.items():
+        if typo in msg_lower:
+            msg_lower = msg_lower.replace(typo, correccion)
+            incoming_msg = incoming_msg.lower().replace(typo, correccion)
+
     try:
         # ==================== CONFIRMATION FLOW: SI/NO ====================
         # Check if user is confirming or rejecting a temporary expense
@@ -3444,6 +3561,58 @@ Dime cada dato claramente. NUNCA usaré números que no menciones explícitament
             except Exception as e:
                 logger.error(f"Error generando presupuesto: {e}", exc_info=True)
                 resp.message(f"❌ Error al generar presupuesto: {str(e)}")
+                return
+
+        # ==================== BALANCE/DEBT QUERY FROM MEMORY ====================
+
+        if detectar_consulta_balance(incoming_msg):
+            phone_clean = normalizar_telefono(from_number)
+            memoria = obtener_memoria(from_number)
+
+            if memoria and 'deuda_total' in memoria:
+                deuda = memoria.get('deuda_total', 0)
+                pagado = memoria.get('total_pagado', 0)
+                balance = deuda - pagado
+                fecha_inicio = memoria.get('fecha_inicio', '')
+                fecha_final = memoria.get('fecha_final', '')
+
+                respuesta = f"""💳 Según lo que registramos:
+Deuda original: ${deuda:.2f}
+Pagado (desde {fecha_inicio} al {fecha_final}): ${pagado:.2f}
+Te falta: ${abs(balance):.2f}"""
+
+                if balance <= 0:
+                    respuesta += " ✅ (¡Pagaste de más!)"
+
+                respuesta += f"\n\n📊 Dashboard: {server_url}/dashboard/{phone_clean}"
+
+                resp.message(respuesta)
+                logger.info(f"Balance query responded from memory for {from_number}")
+                return
+            else:
+                # No memory of debt, but user asked about balance
+                # Check current expenses for this month
+                gastos = cargar_gastos(phone_clean)
+                if gastos:
+                    hoy = datetime.now()
+                    mes_actual = hoy.month
+                    anio_actual = hoy.year
+
+                    gastos_mes = [g for g in gastos if 'fecha' in g]
+                    gastos_mes = [g for g in gastos_mes if datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual
+                                  and datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
+
+                    if gastos_mes:
+                        total_gastos = sum(g.get('monto', 0) for g in gastos_mes)
+                        respuesta = f"💰 Este mes has registrado: ${total_gastos:.2f} en gastos\n\n"
+                        respuesta += f"📊 Ver detalle: {server_url}/dashboard/{phone_clean}"
+                        resp.message(respuesta)
+                        logger.info(f"Monthly expenses shown for {from_number}")
+                        return
+
+                # No hay datos disponibles
+                resp.message("No tengo registro de una deuda. ¿Quieres enviar una foto de la nota o descripción?")
+                logger.info(f"No balance data found for {from_number}")
                 return
 
         # ==================== DEFAULT RESPONSE ====================
