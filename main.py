@@ -167,80 +167,73 @@ def guardar_contexto_financiero(contexto):
         return False
 
 def extraer_ingresos(texto):
-    """Extrae ingresos mensuales del texto del usuario"""
+    """Extrae ingresos mensuales del texto del usuario sumando TODAS las fuentes.
+
+    Patrón 1: "X horas al mes y gano Y la hora" → horas * tarifa
+    Patrón 2: "X a la semana" → monto * 4.333
+    Patrón 3: "X al mes" → monto directo
+    """
     import re
 
     texto_lower = texto.lower()
-    ingresos = 0
-    numeros_capturados = set()  # Para evitar duplicados
+    ingresos_totales = 0
+    posiciones_capturadas = set()
 
-    # Palabras clave para ingresos
-    palabras_ingresos = ['gano', 'trabajo', 'horas', 'sueldo', 'negocio', 'otro trabajo', 'ingreso', 'ganancias']
-
-    # Verificar si hay palabras clave de ingresos
+    # Palabras clave para verificar si hay contexto de ingresos
+    palabras_ingresos = ['gano', 'trabajo', 'horas', 'sueldo', 'negocio', 'ingreso', 'ganancias']
     tiene_ingreso = any(palabra in texto_lower for palabra in palabras_ingresos)
 
     if not tiene_ingreso:
         return 0
 
-    # Patrón 1: "X dolares la hora" o "gano X por hora"
-    # Requiere "dolares" o estar después de "gano"/"sueldo" para evitar capturar "6 horas diarias"
-    patron_horas = r'(?:gano|sueldo|ganancia|ingreso)?\s*(\d+(?:[\.,]\d+)?)\s*(?:dolares|dólares|pesos)\s*(?:la\s*)?(?:hora|horas|hr|hrs|/hora)'
-    matches_horas = re.finditer(patron_horas, texto_lower)
-
-    for match in matches_horas:
+    # PATRÓN 1: "X horas al mes y gano Y la hora"
+    # Extrae: horas * tarifa (SIN multiplicación por 120)
+    patron_horas_mensuales = r'(\d+(?:[\.,]\d+)?)\s*(?:horas?)\s*(?:al\s*)?(?:mes|mes).*?(?:gano|pago|cobro)?\s*(\d+(?:[\.,]\d+)?)\s*(?:la\s*)?(?:hora|horas?)'
+    matches_h = re.finditer(patron_horas_mensuales, texto_lower)
+    for match in matches_h:
         try:
-            num_str = match.group(1).replace(',', '.')
-            numero = float(num_str)
-            # Calcular mensual: 6 horas/día * 5 días/semana * 4 semanas
-            numero = numero * 6 * 5 * 4
-            numeros_capturados.add(match.start())
-            ingresos += numero
+            horas_str = match.group(1).replace(',', '.')
+            tarifa_str = match.group(2).replace(',', '.')
+            horas = float(horas_str)
+            tarifa = float(tarifa_str)
+            ingreso = horas * tarifa
+            ingresos_totales += ingreso
+            posiciones_capturadas.add(match.start())
+        except (ValueError, AttributeError):
+            continue
+
+    # PATRÓN 2: "X a la semana" o "X semanal" o "X por semana"
+    patron_semanal = r'(\d+(?:[\.,]\d+)?)\s*(?:dolares|dólares|pesos)?\s*(?:a\s*la\s*semana|semanal|por\s*semana)'
+    matches_s = re.finditer(patron_semanal, texto_lower)
+    for match in matches_s:
+        # Evitar capturar si ya fue capturado
+        if match.start() in posiciones_capturadas:
+            continue
+        try:
+            monto_str = match.group(1).replace(',', '.')
+            monto = float(monto_str)
+            ingreso = monto * 4.333  # Promedio de semanas por mes
+            ingresos_totales += ingreso
+            posiciones_capturadas.add(match.start())
         except ValueError:
             continue
 
-    # Patrón 2: "X semanal" o "X por semana"
-    patron_semanal = r'(\d+(?:[\.,]\d+)?)\s*(?:dolares|dólares|pesos)?\s*(?:semanal|semana|por\s*semana|a\s*la\s*semana)'
-    matches_semanal = re.finditer(patron_semanal, texto_lower)
-
-    for match in matches_semanal:
+    # PATRÓN 3: "X al mes" o "gano X al mes" (contexto mensual claro)
+    patron_mensual = r'(?:gano|pago|cobro|ingreso|sueldo)?\s*(\d+(?:[\.,]\d+)?)\s*(?:dolares|dólares|pesos)?\s*(?:al\s*)?mes(?:\b|[,.!?])'
+    matches_m = re.finditer(patron_mensual, texto_lower)
+    for match in matches_m:
+        # Evitar capturar si ya fue capturado
+        if match.start() in posiciones_capturadas:
+            continue
         try:
-            num_str = match.group(1).replace(',', '.')
-            numero = float(num_str)
-            numero = numero * 4.33  # Semanas por mes
-            numeros_capturados.add(match.start())
-            ingresos += numero
+            monto_str = match.group(1).replace(',', '.')
+            monto = float(monto_str)
+            ingresos_totales += monto
+            posiciones_capturadas.add(match.start())
         except ValueError:
             continue
 
-    # Patrón 3: "sueldo X" o "gano X" - SOLO si no fue capturado ya
-    patron_sueldo = r'(?:sueldo|gano|salario|ganancias|ingreso)\s+(?:de\s+)?(?:dolares|dólares|pesos)?\s*(\d+(?:[\.,]\d+)?)'
-    matches_sueldo = re.finditer(patron_sueldo, texto_lower)
-
-    for match in matches_sueldo:
-        # Saltar si este número ya fue capturado por otro patrón
-        if match.start(1) in numeros_capturados:  # start(1) es la posición del primer grupo capturado
-            continue
-
-        try:
-            num_str = match.group(1).replace(',', '.')
-            numero = float(num_str)
-
-            # Verificar si está en contexto mensual o semanal
-            # Si ya fue capturado como horas o semanal, no agregar de nuevo
-            texto_contexto = texto_lower[max(0, match.start()-30):min(len(texto_lower), match.end()+30)]
-            if 'semanal' in texto_contexto or 'semana' in texto_contexto:
-                numero = numero * 4.33
-            elif 'hora' not in texto_contexto:
-                # Asumir mensual si no hay contexto especial
-                pass
-
-            numeros_capturados.add(match.start(1))
-            ingresos += numero
-        except ValueError:
-            continue
-
-    return ingresos
+    return ingresos_totales
 
 def extraer_gastos(texto):
     """Extrae gastos del texto del usuario"""
