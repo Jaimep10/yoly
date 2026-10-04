@@ -1700,10 +1700,11 @@ def generar_presupuesto(datos):
 # ==================== DASHBOARD FUNCTIONS ====================
 
 def normalizar_telefono(phone):
-    """Normaliza el número de teléfono removiendo +, espacios, y guiones"""
+    """Normaliza el número de teléfono removiendo caracteres no numéricos"""
     if not phone:
         return ""
-    return phone.replace('+', '').replace(' ', '').replace('-', '').strip()
+    # Solo números
+    return re.sub(r'[^0-9]', '', phone)
 
 def generar_excel_gastos(phone):
     """Genera un archivo Excel con los gastos del usuario del mes actual"""
@@ -1862,26 +1863,37 @@ def download_informe_metas():
 def dashboard(phone):
     """Dashboard con vista de gastos y botones de descarga - Tailwind CSS + PWA"""
     try:
-        # Normalizar teléfono
-        phone_clean = normalizar_telefono(phone)
-        phone_display = phone_clean[-4:] if phone_clean else "?????"
+        # Limpia phone: solo números
+        phone_clean = re.sub(r'[^0-9]', '', phone)
+        phone_last10 = phone_clean[-10:] if len(phone_clean) >= 10 else phone_clean
+        phone_display = phone_last10[-4:] if phone_last10 else "?????"
 
-        # Intentar cargar gastos con teléfono normalizado
-        gastos = cargar_gastos(phone_clean)
+        logger.info(f"Dashboard request: phone={phone}, phone_clean={phone_clean}, phone_last10={phone_last10}, phone_display={phone_display}")
 
-        # Si no encuentra gastos, buscar en carpetas existentes normalizando
+        # Busca en gastos.json con formato normalizado
+        ruta_datos = f"/home/claude/yoly/data/{phone_clean}"
+        gastos = None
+
+        if os.path.exists(f"{ruta_datos}/gastos.json"):
+            gastos = cargar_gastos(phone_clean)
+
+        # Si no encuentra, intenta buscar por últimos 10 dígitos
         if not gastos:
-            ruta_datos = obtener_ruta_datos(phone_clean)
-            if not os.path.exists(ruta_datos):
-                # Buscar en /home/claude/yoly/data/ por variaciones
-                data_dir = '/home/claude/yoly/data'
-                if os.path.exists(data_dir):
-                    for folder in os.listdir(data_dir):
-                        if normalizar_telefono(folder) == phone_clean:
-                            gastos = cargar_gastos(folder)
-                            if gastos:
-                                phone_clean = folder
+            data_dir = '/home/claude/yoly/data'
+            found = False
+            if os.path.exists(data_dir):
+                for folder in os.listdir(data_dir):
+                    folder_clean = re.sub(r'[^0-9]', '', folder)
+                    folder_last10 = folder_clean[-10:] if len(folder_clean) >= 10 else folder_clean
+                    if folder_last10 == phone_last10:  # últimos 10 dígitos match
+                        gastos = cargar_gastos(folder)
+                        if gastos:
+                            phone_clean = folder_clean
+                            found = True
                             break
+
+            if not gastos:
+                gastos = []
 
         if not gastos:
             return render_template_string("""
@@ -1906,7 +1918,7 @@ def dashboard(phone):
         <div class="bg-white rounded-2xl shadow-xl p-8 text-center">
             <div class="text-5xl mb-4">📭</div>
             <h1 class="text-3xl font-bold text-gray-800 mb-2">Aún no hay gastos</h1>
-            <p class="text-gray-600 text-lg mb-6">Hola {{ phone_display }}! Comienza a registrar tus gastos para ver tu panel aquí.</p>
+            <p class="text-gray-600 text-lg mb-6">¡Hola {{ phone_display }}! Comienza a registrar tus gastos para ver tu panel aquí.</p>
 
             <div class="bg-blue-50 border-l-4 border-blue-500 p-4 mb-6 rounded">
                 <p class="text-blue-800">
@@ -1924,6 +1936,8 @@ def dashboard(phone):
     </div>
 
     <script>
+        console.log('Phone:', '{{ phone_clean }}');
+        console.log('Empty dashboard loaded');
         if ('serviceWorker' in navigator) {
             navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW registration failed'));
         }
@@ -2005,7 +2019,13 @@ def dashboard(phone):
             </div>
             """
 
-        html = f"""
+        # Format values for template
+        hoy_str = hoy.strftime('%B %Y')
+        gastos_count = len(gastos_mes)
+        promedio = total_mes/len(gastos_mes) if gastos_mes else 0
+        categorias_count = len(por_categoria)
+
+        html_template = """
 <!DOCTYPE html>
 <html lang="es">
 <head>
@@ -2018,12 +2038,12 @@ def dashboard(phone):
     <title>Yoly - Panel de Finanzas</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        @keyframes slideDown {{ from {{ opacity: 0; transform: translateY(-20px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-        @keyframes fadeIn {{ from {{ opacity: 0; transform: translateY(20px); }} to {{ opacity: 1; transform: translateY(0); }} }}
-        .slideDown {{ animation: slideDown 0.4s ease-out; }}
-        .fadeIn {{ animation: fadeIn 0.6s ease-out forwards; }}
-        .card-item {{ animation-delay: calc(var(--index) * 100ms); }}
-        table {{ font-size: 0.875rem; }}
+        @keyframes slideDown { from { opacity: 0; transform: translateY(-20px); } to { opacity: 1; transform: translateY(0); } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(20px); } to { opacity: 1; transform: translateY(0); } }
+        .slideDown { animation: slideDown 0.4s ease-out; }
+        .fadeIn { animation: fadeIn 0.6s ease-out forwards; }
+        .card-item { animation-delay: calc(var(--index) * 100ms); }
+        table { font-size: 0.875rem; }
     </style>
 </head>
 <body class="bg-gradient-to-br from-blue-50 via-white to-indigo-50 min-h-screen">
@@ -2031,7 +2051,7 @@ def dashboard(phone):
     <div class="bg-gradient-to-r from-blue-600 to-indigo-600 text-white py-6 slideDown">
         <div class="container mx-auto px-4 max-w-6xl">
             <h1 class="text-3xl font-bold mb-1">💰 Yoly - Panel de Finanzas</h1>
-            <p class="text-blue-100">{hoy.strftime('%B %Y')} | {phone_display}</p>
+            <p class="text-blue-100">{{ hoy_str }} | {{ phone_display }}</p>
         </div>
     </div>
 
@@ -2040,25 +2060,25 @@ def dashboard(phone):
         <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-8 fadeIn">
             <div class="bg-white rounded-lg shadow-md p-6 border-l-4 border-blue-500">
                 <p class="text-gray-600 text-sm font-medium mb-2">Total del Mes</p>
-                <div class="text-3xl font-bold text-blue-600">${total_mes:.2f}</div>
-                <p class="text-xs text-gray-500 mt-2">{len(gastos_mes)} transacciones</p>
+                <div class="text-3xl font-bold text-blue-600">${{ total_mes|round(2) }}</div>
+                <p class="text-xs text-gray-500 mt-2">{{ gastos_count }} transacciones</p>
             </div>
             <div class="bg-white rounded-lg shadow-md p-6 border-l-4 border-green-500">
                 <p class="text-gray-600 text-sm font-medium mb-2">Promedio por Transacción</p>
-                <div class="text-3xl font-bold text-green-600">${total_mes/len(gastos_mes):.2f if gastos_mes else 0:.2f}</div>
+                <div class="text-3xl font-bold text-green-600">${{ promedio|round(2) }}</div>
             </div>
             <div class="bg-white rounded-lg shadow-md p-6 border-l-4 border-purple-500">
                 <p class="text-gray-600 text-sm font-medium mb-2">Categorías</p>
-                <div class="text-3xl font-bold text-purple-600">{len(por_categoria)}</div>
+                <div class="text-3xl font-bold text-purple-600">{{ categorias_count }}</div>
             </div>
         </div>
 
         <!-- Action Buttons -->
         <div class="flex flex-wrap gap-3 mb-8 fadeIn" style="animation-delay: 200ms;">
-            <a href="/dashboard/{phone_clean}/excel" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+            <a href="/dashboard/{{ phone_clean }}/excel" class="flex-1 md:flex-none bg-green-500 hover:bg-green-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
                 📊 Descargar Excel
             </a>
-            <a href="/dashboard/{phone_clean}/pdf" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
+            <a href="/dashboard/{{ phone_clean }}/pdf" class="flex-1 md:flex-none bg-red-500 hover:bg-red-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105 inline-block text-center">
                 📄 Descargar PDF
             </a>
             <button onclick="compartir()" class="flex-1 md:flex-none bg-blue-500 hover:bg-blue-600 text-white font-bold py-3 px-6 rounded-lg transition transform hover:scale-105">
@@ -2070,7 +2090,7 @@ def dashboard(phone):
         <div class="mb-8">
             <h2 class="text-2xl font-bold text-gray-800 mb-4">Gastos por Categoría</h2>
             <div class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4 fadeIn" style="animation-delay: 300ms;">
-                {carpetas_html}
+                {{ carpetas_html|safe }}
             </div>
         </div>
 
@@ -2080,7 +2100,7 @@ def dashboard(phone):
                 <h2 class="text-xl font-bold text-gray-800">Detalle de Transacciones</h2>
             </div>
             <div class="overflow-x-auto">
-                {tabla_html}
+                {{ tabla_html|safe }}
             </div>
         </div>
 
@@ -2092,40 +2112,54 @@ def dashboard(phone):
     </div>
 
     <script>
+        // Debug logging
+        console.log('Phone:', '{{ phone_clean }}');
+        console.log('Gastos:', {{ gastos_count }});
+        console.log('Total:', {{ total_mes|round(2) }});
+
         // PWA Registration
-        if ('serviceWorker' in navigator) {{
+        if ('serviceWorker' in navigator) {
             navigator.serviceWorker.register('/sw.js').catch(err => console.log('SW registration failed'));
-        }}
+        }
 
         // localStorage
-        if (localStorage) {{
-            localStorage.setItem('yoly_phone', '{phone_clean}');
+        if (localStorage) {
+            localStorage.setItem('yoly_phone', '{{ phone_clean }}');
             localStorage.setItem('yoly_dashboard_visited', new Date().toISOString());
-        }}
+        }
 
         // Share functionality
-        function compartir() {{
-            const text = 'Mi panel de finanzas en Yoly: {phone_display}';
-            if (navigator.share) {{
-                navigator.share({{
+        function compartir() {
+            const text = 'Mi panel de finanzas en Yoly: •••{{ phone_display }}';
+            if (navigator.share) {
+                navigator.share({
                     title: 'Yoly - Panel de Finanzas',
                     text: text
-                }}).catch(err => alert('Error al compartir'));
-            }} else {{
+                }).catch(err => alert('Error al compartir'));
+            } else {
                 alert('Link del panel: ' + window.location.href);
-            }}
-        }}
+            }
+        }
 
         // Detect PWA
-        if (window.matchMedia('(display-mode: standalone)').matches) {{
+        if (window.matchMedia('(display-mode: standalone)').matches) {
             console.log('Yoly PWA activa');
-        }}
+        }
     </script>
 </body>
 </html>
         """
 
-        return html
+        return render_template_string(html_template,
+            phone_clean=phone_clean,
+            phone_display=phone_display,
+            hoy_str=hoy_str,
+            total_mes=total_mes,
+            gastos_count=gastos_count,
+            promedio=promedio,
+            categorias_count=categorias_count,
+            carpetas_html=carpetas_html,
+            tabla_html=tabla_html)
     except Exception as e:
         logger.error(f"Error en dashboard: {e}", exc_info=True)
         return f"Error al cargar el dashboard: {str(e)}", 500
