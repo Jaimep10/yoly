@@ -289,19 +289,44 @@ def fecha_valida(fecha):
     except ValueError:
         return False
 
+METODOS_PAGO = [
+    ('transferencia', ['transferencia', 'transf', 'trans', 't']),
+    ('efectivo', ['efectivo', 'efec', 'efect', 'e']),
+    ('cheque', ['cheque', 'chq', 'ch']),
+    ('deposito', ['deposito', 'depósito', 'dep']),
+    ('zelle', ['zelle']),
+]
+
+def normalizar_metodo(metodo):
+    """'T', 'transf', 'Efec' -> 'transferencia', 'efectivo'; vacío -> 'no especificado'"""
+    texto = str(metodo or '').strip().lower().rstrip('.')
+    for nombre, claves in METODOS_PAGO:
+        if texto in claves or any(texto.startswith(c) for c in claves if len(c) > 2):
+            return nombre
+    return texto if texto and texto not in ('null', 'none', 'n/a') else 'no especificado'
+
 def normalizar_pagos(pagos_raw):
-    """Acepta [200, 120] o [{"fecha": "2026-01-03", "monto": 200}] y devuelve [{"fecha", "monto"}]"""
+    """Acepta [200, 120] o [{"fecha", "monto", "metodo", "nota"}] y devuelve [{"fecha", "monto", "metodo", "nota"}]"""
     pagos = []
     for p in pagos_raw if isinstance(pagos_raw, list) else []:
         if isinstance(p, dict):
             monto = a_numero(p.get('monto'))
-            fecha = p.get('fecha')
+            fecha, metodo, nota = p.get('fecha'), p.get('metodo'), p.get('nota')
         else:
-            monto, fecha = a_numero(p), None
+            monto, fecha, metodo, nota = a_numero(p), None, None, None
         if monto is None or monto <= 0:
             continue
-        pagos.append({"fecha": fecha if fecha and fecha_valida(fecha) else "", "monto": monto})
+        pagos.append({
+            "fecha": fecha if fecha and fecha_valida(fecha) else "",
+            "monto": monto,
+            "metodo": normalizar_metodo(metodo),
+            "nota": str(nota or '').strip(),
+        })
     return pagos
+
+def fecha_corta(fecha):
+    """'2026-01-03' -> '03-01-26'"""
+    return datetime.strptime(fecha, '%Y-%m-%d').strftime('%d-%m-%y') if fecha else 'sin fecha'
 
 def armar_cobro(datos):
     """Recalcula en Python pagado, saldo, saldo restante por pago y frecuencia"""
@@ -313,7 +338,8 @@ def armar_cobro(datos):
     filas = []
     for p in pagos:
         saldo_restante -= p['monto']
-        filas.append({"fecha": p['fecha'], "monto": p['monto'], "saldo": saldo_restante})
+        filas.append({"fecha": p['fecha'], "fecha_corta": fecha_corta(p['fecha']), "monto": p['monto'],
+                      "metodo": p['metodo'], "nota": p['nota'], "saldo": saldo_restante})
 
     fechas = sorted(datetime.strptime(p['fecha'], '%Y-%m-%d') for p in pagos if p['fecha'])
     frecuencia = None
@@ -620,7 +646,7 @@ def procesar_foto_inteligente(media_url, telefono):
         # CRÍTICO: Vision SOLO extrae números en JSON, NO suma
         response = client.messages.create(
             model=MODELO_CLAUDE,
-            max_tokens=500,
+            max_tokens=1500,
             messages=[{
                 "role": "user",
                 "content": [
@@ -634,23 +660,30 @@ def procesar_foto_inteligente(media_url, telefono):
                     },
                     {
                         "type": "text",
-                        "text": """Analiza esta factura/recibo/ticket/comprobante de pagos. Extrae SOLO un JSON válido, sin explicaciones, sin calcular:
+                        "text": """Eres OCR de libretita de cobros y facturas. Extrae TODO lo que veas en la imagen.
+
+Devuelve SOLO JSON valido, sin explicaciones:
+
 {
-  "pagos": [{"fecha": "YYYY-MM-DD", "monto": número}, ...] en el mismo orden de la imagen,
-  "deuda_total": número total adeudado (si aparece),
-  "cliente": "nombre de la persona o razón social",
-  "fecha": "YYYY-MM-DD si aparece",
-  "tipo_documento": "factura|recibo_envio|ticket|comprobante",
+  "cliente": "Maria Cristina",
+  "deuda_total": 3000,
+  "pagos": [
+    {"fecha": "2026-01-03", "monto": 200, "metodo": "efectivo", "nota": ""},
+    {"fecha": "2026-01-15", "monto": 120, "metodo": "transferencia", "nota": ""}
+  ],
   "descripcion": "resumen breve de qué es"
 }
 
-INSTRUCCIONES CRÍTICAS:
-1. NUNCA calcules sumas. Si ves "200 + 120 + 130", devuelve 3 pagos separados
-2. "pagos": siempre es un ARRAY con un objeto por cada pago individual. "fecha" es la fecha escrita junto a ese pago (formato día/mes de Ecuador); si no hay fecha para ese pago, omite "fecha"
-3. "deuda_total": número total del documento (si aparece en la imagen)
-4. NUNCA inventes números que no estén en la imagen
-5. NO incluyas campos vacíos, ommitelos
-6. Python sumará los pagos, tu SOLO extrae números en array"""
+Reglas:
+- pagos: un objeto por cada pago individual, en el mismo orden de la imagen.
+- fecha: extrae de la libretita "01-3-26" -> "2026-01-03" (formato YYYY-MM-DD). Si no hay fecha, usa null pero NO inventes.
+- monto: numero sin simbolo.
+- metodo: busca palabras clave en la misma linea: "transf", "transferencia", "T", "efectivo", "efec", "E", "cheque", "chq", "deposito", "zelle". Si dice "200 T" es transferencia. Si solo dice "200", metodo = "no especificado".
+- nota: si hay nota como "banco X" guardala en nota.
+- deuda_total: solo si aparece en la imagen.
+- Si es una factura o ticket normal con un solo total, pon ese total como un solo pago.
+
+No sumes. Solo extrae. NUNCA inventes numeros que no esten en la imagen."""
                     }
                 ]
             }]
@@ -1935,11 +1968,17 @@ def generar_excel_gastos(phone):
         if cobro:
             ws = wb.active
             ws.title = "Pagos"
-            encabezado(ws, ["#", "Fecha", "Monto", "Saldo Restante"])
-            for idx, fila in enumerate(cobro['filas'], 1):
-                ws.append([idx, fila['fecha'] or "sin fecha", fila['monto'], fila['saldo']])
-            ws.append(["", "TOTAL PAGADO", cobro['pagado'], cobro['saldo']])
-            ws[ws.max_row][1].font = Font(bold=True)
+            encabezado(ws, ["Fecha", "Monto", "Metodo", "Nota", "Saldo"])
+            gris = Font(color="9CA3AF", italic=True)
+            for fila in cobro['filas']:
+                fecha = datetime.strptime(fila['fecha'], '%Y-%m-%d') if fila['fecha'] else "sin fecha"
+                ws.append([fecha, fila['monto'], fila['metodo'], fila['nota'], fila['saldo']])
+                if fila['fecha']:
+                    ws.cell(row=ws.max_row, column=1).number_format = 'DD-MM-YY'
+                if fila['metodo'] == 'no especificado':
+                    ws.cell(row=ws.max_row, column=3).font = gris
+            ws.append(["TOTAL PAGADO", cobro['pagado'], "", "", cobro['saldo']])
+            ws[ws.max_row][0].font = Font(bold=True)
 
             resumen = wb.create_sheet("Resumen")
             encabezado(resumen, ["Concepto", "Valor"])
@@ -2031,12 +2070,15 @@ def generar_pdf_dashboard(phone):
             story.append(Spacer(1, 0.3*inch))
 
             story.append(Paragraph(f"Historial de Pagos ({len(cobro['pagos'])})", h2))
-            data = [['#', 'Fecha', 'Pago', 'Saldo Restante']]
+            data = [['Pago #', 'Fecha', 'Monto', 'Metodo', 'Saldo Restante']]
             for idx, fila in enumerate(cobro['filas'], 1):
-                data.append([str(idx), fila['fecha'] or 'sin fecha', f"${fila['monto']:,.2f}", f"${fila['saldo']:,.2f}"])
-            data.append(['', 'TOTAL', f"${cobro['pagado']:,.2f}", f"${cobro['saldo']:,.2f}"])
-            tabla = Table(data, colWidths=[0.6*inch, 1.6*inch, 1.6*inch, 1.8*inch])
+                data.append([str(idx), fila['fecha_corta'], f"${fila['monto']:,.2f}", fila['metodo'].capitalize(), f"${fila['saldo']:,.2f}"])
+            data.append(['', 'TOTAL', f"${cobro['pagado']:,.2f}", '', f"${cobro['saldo']:,.2f}"])
+            tabla = Table(data, colWidths=[0.7*inch, 1.1*inch, 1.3*inch, 1.6*inch, 1.5*inch])
             estilo = estilo_tabla('#059669', '#f0fdf4')
+            for idx, fila in enumerate(cobro['filas'], 1):
+                if fila['metodo'] == 'no especificado':
+                    estilo.add('TEXTCOLOR', (3, idx), (3, idx), colors.HexColor('#9ca3af'))
             estilo.add('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold')
             estilo.add('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#e5e7eb'))
             tabla.setStyle(estilo)
@@ -2159,31 +2201,31 @@ DASHBOARD_COBRO_HTML = """
                 <table class="w-full border-collapse text-sm">
                     <thead>
                         <tr class="bg-gray-100 border-b-2 border-gray-300">
-                            <th class="text-left px-4 py-3 font-semibold text-gray-700">#</th>
                             <th class="text-left px-4 py-3 font-semibold text-gray-700">Fecha</th>
-                            <th class="text-right px-4 py-3 font-semibold text-gray-700">Pago</th>
+                            <th class="text-right px-4 py-3 font-semibold text-gray-700">Monto</th>
+                            <th class="text-left px-4 py-3 font-semibold text-gray-700">Metodo</th>
                             <th class="text-right px-4 py-3 font-semibold text-gray-700">Saldo Restante</th>
                         </tr>
                     </thead>
                     <tbody>
                         <tr class="bg-blue-50 border-b">
-                            <td class="px-4 py-3"></td>
                             <td class="px-4 py-3 text-gray-700">Deuda inicial</td>
+                            <td class="px-4 py-3"></td>
                             <td class="px-4 py-3"></td>
                             <td class="px-4 py-3 text-right font-semibold">${{ "{:,.2f}".format(cobro.deuda) }}</td>
                         </tr>
                         {% for f in cobro.filas %}
                         <tr class="{{ 'bg-white' if loop.index is odd else 'bg-gray-50' }} border-b">
-                            <td class="px-4 py-3 text-gray-500">{{ loop.index }}</td>
-                            <td class="px-4 py-3 text-gray-700">{{ f.fecha or 'sin fecha' }}</td>
+                            <td class="px-4 py-3 text-gray-700">{{ f.fecha_corta }}</td>
                             <td class="px-4 py-3 text-right font-semibold text-green-700">${{ "{:,.2f}".format(f.monto) }}</td>
+                            <td class="px-4 py-3 {{ 'text-gray-400 italic' if f.metodo == 'no especificado' else 'text-gray-700' }}">{{ f.metodo|capitalize }}{% if f.nota %} <span class="text-xs text-gray-500">({{ f.nota }})</span>{% endif %}</td>
                             <td class="px-4 py-3 text-right font-semibold {{ 'text-red-600' if f.saldo > 0 else 'text-green-600' }}">${{ "{:,.2f}".format(f.saldo) }}</td>
                         </tr>
                         {% endfor %}
                         <tr class="bg-gray-200 font-bold">
-                            <td class="px-4 py-3"></td>
                             <td class="px-4 py-3">TOTAL PAGADO</td>
                             <td class="px-4 py-3 text-right">${{ "{:,.2f}".format(cobro.pagado) }}</td>
+                            <td class="px-4 py-3"></td>
                             <td class="px-4 py-3 text-right {{ 'text-red-600' if cobro.saldo > 0 else 'text-green-600' }}">${{ "{:,.2f}".format(cobro.saldo) }}</td>
                         </tr>
                     </tbody>
@@ -2239,7 +2281,7 @@ def dashboard(phone):
                 phone_clean=phone_clean,
                 phone_display=phone_display,
                 hoy_str=datetime.now().strftime('%d/%m/%Y'),
-                grafico_labels=[f['fecha'] or f"Pago {i}" for i, f in enumerate(cobro['filas'], 1)],
+                grafico_labels=[f['fecha_corta'] if f['fecha'] else f"Pago {i}" for i, f in enumerate(cobro['filas'], 1)],
                 grafico_pagos=[f['monto'] for f in cobro['filas']],
                 grafico_saldos=[f['saldo'] for f in cobro['filas']])
 
