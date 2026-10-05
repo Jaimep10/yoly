@@ -15,6 +15,7 @@ from agents import classifier as agent_classifier
 from agents import reporter as agent_reporter
 from agents.calculator import Calculadora
 from agents.classifier import Portero
+from agents.guide import Guía
 from agents.reporter import Contadora
 from agents.vision import Ojo
 
@@ -95,6 +96,7 @@ class OrquestadorYoly:
         self.ojo = Ojo()
         self.calculadora = Calculadora()
         self.contadora = Contadora()
+        self.guia = Guía()
         self.herramientas = herramientas
 
     def handle_whatsapp(self, phone, images, texto="", info=None, ctx=None, fechas_foto=None):
@@ -102,11 +104,16 @@ class OrquestadorYoly:
         phone: quien escribe. images: lista de fotos (webp) del mismo mensaje, 1 o varias. texto: lo que escribió.
         fechas_foto: fecha EXIF de cada foto (o None), respaldo si la factura no trae fecha impresa.
         Devuelve el texto de la respuesta para WhatsApp.
+        0. Guía: si es una pregunta sin fotos, responde directamente.
         1. Portero: qué es, cuántas fotos, si es repetida.
         2. Ojo: lee cada foto (fecha, monto, método, cliente).
         3. Calculadora: suma en Python, saldo = deuda - pagado, duplicados por hash.
         4. Contadora: respuesta WA + tarjetas del dashboard (+ PDF y Excel en las descargas) y guarda.
         """
+        # FIRST: Check if it's a question (no images)
+        if not images and self.guia.es_pregunta(texto):
+            return self.guia.responder(texto, phone, {})
+
         ctx = ctx or self.herramientas(phone)
         return self._procesar(list(images), texto or "", ctx, info, fechas_foto)
 
