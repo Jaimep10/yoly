@@ -198,3 +198,12 @@ def test_analisis_financiero_no_mezcla_usuarios(entorno):
     main.client.messages.create.return_value.content = [MagicMock(text='{"ingresos": 0, "gastos": {}}')]
     _, ingresos, gastos, _ = main.procesar_analisis_financiero("hola", "whatsapp:+593990000000")
     assert (ingresos, gastos) == (0, 0)
+
+
+def test_metas_son_de_cada_usuario_y_no_hay_metas_de_prueba(entorno):
+    # Antes un goals.json del repo mostraba a todos "Pagar todas las deudas $200/$1300", "Fondo de emergencia"...
+    respuesta = enviar("ver metas")
+    assert "No tienes metas" in respuesta and "1300" not in respuesta and "Fondo de emergencia" not in respuesta
+    main.registrar_meta("Moto", 2000, "2027-06-01", "savings", 100, telefono=TEL)
+    assert "Moto" in enviar("ver metas")
+    assert "No tienes metas" in enviar("ver metas", tel="whatsapp:+593990000000")

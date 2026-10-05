@@ -86,7 +86,11 @@ def test_ya_no_existe_el_informe_de_gastos_de_ejemplo():
     assert main.app.test_client().get("/download/informe_gastos.pdf").status_code == 404
 
 
-def test_download_informe_metas_entrega_pdf():
-    r = main.app.test_client().get("/download/informe_metas.pdf")
+def test_download_informe_metas_entrega_pdf(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(main, "obtener_cuenta_activa", lambda *a, **k: "principal")
+    ok, _ = main.registrar_meta("Ahorro", 1000, "2027-01-01", "savings", 250, telefono="593991234567")
+    assert ok
+    r = main.app.test_client().get("/download/informe_metas/593991234567.pdf")
     assert r.status_code == 200 and r.data.startswith(b"%PDF-")
     assert int(r.headers["Content-Length"]) == len(r.data) > 1000

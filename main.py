@@ -206,7 +206,7 @@ else:
 
 print("[STARTUP] Yoly Bot initialization complete")
 
-GOALS_FILE = 'goals.json'
+GOALS_FILE = 'metas.json'
 FINANCIAL_CONTEXT_FILE = 'financial_context.json'
 
 # ==================== TEMPORARY EXPENSES FOR CONFIRMATION FLOW ====================
@@ -1466,33 +1466,45 @@ def generar_pdf_corte(gastos, fecha_inicio, fecha_fin, total):
 
 # ==================== GOAL MANAGEMENT FUNCTIONS ====================
 
-def cargar_metas():
-    """Carga las metas desde el archivo JSON"""
-    if os.path.exists(GOALS_FILE):
+def archivo_metas(telefono):
+    """Metas de UN usuario (data/{tel}/{cuenta}/metas.json). Antes había un goals.json único en el repo
+    con metas de prueba ($1300 deudas, $3000 fondo de emergencia...) que veía cualquier usuario."""
+    if not telefono:
+        return None
+    cuenta = obtener_cuenta_activa(normalizar_telefono(telefono))
+    return f"{obtener_ruta_datos(telefono, cuenta)}/{GOALS_FILE}"
+
+def cargar_metas(telefono=None):
+    """Carga las metas del usuario; sin teléfono no hay metas (nunca las de otra persona)"""
+    archivo = archivo_metas(telefono)
+    if archivo and os.path.exists(archivo):
         try:
-            with open(GOALS_FILE, 'r', encoding='utf-8') as f:
+            with open(archivo, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             print(f"Error cargando metas: {e}")
             return []
     return []
 
-def guardar_metas(metas):
-    """Guarda las metas en el archivo JSON"""
+def guardar_metas(metas, telefono=None):
+    """Guarda las metas del usuario"""
+    archivo = archivo_metas(telefono)
+    if not archivo:
+        return False
     try:
-        with open(GOALS_FILE, 'w', encoding='utf-8') as f:
+        with open(archivo, 'w', encoding='utf-8') as f:
             json.dump(metas, f, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
         print(f"Error guardando metas: {e}")
         return False
 
-def registrar_meta(nombre, monto_objetivo, fecha_limite, categoria, monto_actual=0):
+def registrar_meta(nombre, monto_objetivo, fecha_limite, categoria, monto_actual=0, telefono=None):
     """
     Registra una nueva meta financiera
     Categorías: 'debt_payoff', 'savings', 'investment'
     """
-    metas = cargar_metas()
+    metas = cargar_metas(telefono)
 
     # Verificar si ya existe una meta con el mismo nombre
     for meta in metas:
@@ -1510,13 +1522,13 @@ def registrar_meta(nombre, monto_objetivo, fecha_limite, categoria, monto_actual
     }
 
     metas.append(nueva_meta)
-    if guardar_metas(metas):
+    if guardar_metas(metas, telefono):
         return True, f"Meta '{nombre}' registrada exitosamente"
     return False, "Error al registrar la meta"
 
-def obtener_metas():
-    """Obtiene todas las metas con información de progreso"""
-    metas = cargar_metas()
+def obtener_metas(telefono=None):
+    """Obtiene todas las metas del usuario con información de progreso"""
+    metas = cargar_metas(telefono)
     metas_con_progreso = []
 
     for meta in metas:
@@ -1539,9 +1551,9 @@ def obtener_metas():
 
     return metas_con_progreso
 
-def actualizar_progreso_meta(nombre, cantidad):
+def actualizar_progreso_meta(nombre, cantidad, telefono=None):
     """Actualiza el progreso de una meta"""
-    metas = cargar_metas()
+    metas = cargar_metas(telefono)
 
     for meta in metas:
         if meta['nombre'].lower() == nombre.lower():
@@ -1552,7 +1564,7 @@ def actualizar_progreso_meta(nombre, cantidad):
                 'cantidad': cantidad
             })
 
-            if guardar_metas(metas):
+            if guardar_metas(metas, telefono):
                 return True, f"Progreso actualizado: ${cantidad:.2f} agregado a '{nombre}'"
             return False, "Error al actualizar la meta"
 
@@ -1633,9 +1645,9 @@ def procesar_analisis_financiero(texto_usuario, telefono):
 
     return analisis, ingresos_totales, gastos_totales, superavit
 
-def analizar_metas_y_dar_consejos():
+def analizar_metas_y_dar_consejos(telefono=None):
     """Usa Claude API para analizar metas y dar consejos personalizados"""
-    metas = obtener_metas()
+    metas = obtener_metas(telefono)
 
     if not metas:
         return "No tienes metas registradas. ¡Crea algunas para empezar!"
@@ -1671,9 +1683,9 @@ Responde siempre en español, de forma amable y motivadora.""",
         print(f"Error analizando metas: {e}")
         return "Error al analizar tus metas. Intenta de nuevo más tarde."
 
-def generar_proyecciones(meses=12):
+def generar_proyecciones(meses=12, telefono=None):
     """Genera proyecciones financieras de 6 y 12 meses"""
-    metas = obtener_metas()
+    metas = obtener_metas(telefono)
 
     if not metas:
         return {}
@@ -1734,16 +1746,17 @@ def generar_proyecciones(meses=12):
 
     return proyecciones
 
-def generar_informe_metas():
-    """Genera un PDF con progreso de metas financieras"""
-    metas = obtener_metas()
+def generar_informe_metas(telefono=None):
+    """Genera un PDF con progreso de las metas del usuario"""
+    metas = obtener_metas(telefono)
 
     if not metas:
         return None
 
-    pdf_path = '/tmp/informe_metas.pdf'
+    phone_clean = normalizar_telefono(telefono)
+    pdf_path = f'/tmp/informe_metas_{phone_clean}.pdf'
     tmp_path = ruta_temporal(pdf_path)
-    chart_path = '/tmp/metas_chart.png'
+    chart_path = f'/tmp/metas_chart_{phone_clean}.png'
 
     # Preparar datos para gráfico
     nombres_metas = [m['nombre'][:15] for m in metas]  # Limitar nombre a 15 caracteres
@@ -2217,10 +2230,10 @@ def download_presupuesto():
     """Sirve el PDF de análisis de presupuesto"""
     return servir_pdf('/tmp/presupuesto_analisis.pdf', 'presupuesto_analisis.pdf')
 
-@app.route("/download/informe_metas.pdf", methods=["GET"])
-def download_informe_metas():
-    """Sirve el PDF de informe de metas"""
-    pdf_path = generar_informe_metas()
+@app.route("/download/informe_metas/<phone>.pdf", methods=["GET"])
+def download_informe_metas(phone):
+    """Sirve el PDF de informe de metas del usuario"""
+    pdf_path = generar_informe_metas(phone)
     if not pdf_path:
         return "Informe de metas no disponible", 404
     return servir_pdf(pdf_path, 'informe_metas.pdf')
@@ -3995,7 +4008,7 @@ Te falta: ${cobro['saldo']:,.0f}
         # Ver metas o solicitar análisis de metas
         if any(keyword in msg_lower for keyword in ['metas', 'objetivos', 'mis objetivos', 'ver metas', 'estado metas']):
             logger.info(f"Goals request detected for {from_number}")
-            metas = obtener_metas()
+            metas = obtener_metas(from_number)
             if not metas:
                 logger.info("No goals found for user")
                 resp.message("No tienes metas registradas. Puedo ayudarte a crearlas. ¿Cuál es tu objetivo financiero?")
@@ -4019,14 +4032,14 @@ Te falta: ${cobro['saldo']:,.0f}
         # Solicitar consejos y análisis de metas
         if any(keyword in msg_lower for keyword in ['consejo', 'consejos metas', 'analiza metas', 'tips', 'motivación']):
             logger.info(f"Financial advice request from {from_number}")
-            consejo = analizar_metas_y_dar_consejos()
+            consejo = analizar_metas_y_dar_consejos(from_number)
             responder(resp, consejo)
             return
 
         # Ver progreso de una meta específica
         if 'progreso' in msg_lower or 'avance' in msg_lower:
             logger.info(f"Progress check requested by {from_number}")
-            metas = obtener_metas()
+            metas = obtener_metas(from_number)
             if not metas:
                 resp.message("No tienes metas. Crea una para empezar.")
                 return
@@ -4044,9 +4057,9 @@ Te falta: ${cobro['saldo']:,.0f}
         if 'informe metas' in msg_lower or 'reporte metas' in msg_lower:
             logger.info(f"Goals report request from {from_number}")
             try:
-                pdf_path = generar_informe_metas()
+                pdf_path = generar_informe_metas(from_number)
                 if pdf_path and os.path.exists(pdf_path):
-                    pdf_url = f"{server_url}/download/informe_metas.pdf"
+                    pdf_url = f"{server_url}/download/informe_metas/{phone_clean}.pdf"
                     logger.info(f"Goals report generated: {pdf_url}")
 
                     twilio_client.messages.create(
@@ -4083,7 +4096,7 @@ Dime cada dato claramente. NUNCA usaré números que no menciones explícitament
         # Actualizar progreso de meta
         if 'actualizar' in msg_lower or 'ahorré' in msg_lower or 'pagué' in msg_lower:
             logger.info(f"Goal progress update request from {from_number}")
-            metas = obtener_metas()
+            metas = obtener_metas(from_number)
             if not metas:
                 resp.message("No tienes metas. Crea una primero.")
                 return
