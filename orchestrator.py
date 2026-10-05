@@ -112,8 +112,12 @@ class OrquestadorYoly:
         3. Calculadora: suma en Python, saldo = deuda - pagado, duplicados por hash.
         4. Contadora: respuesta WA + tarjetas del dashboard (+ PDF y Excel en las descargas) y guarda.
         """
+        # LOGGING: AISLAR POR wa_id Y cuenta
+        logger.info(f"[{phone}][{cuenta}] handle_whatsapp iniciado - {'pregunta' if not images else f'{len(images)} foto(s)'}")
+
         # FIRST: Check if it's a question (no images)
         if not images and self.guia.es_pregunta(texto):
+            logger.info(f"[{phone}][{cuenta}] Pregunta detectada: '{texto[:50]}'")
             return self.guia.responder(texto, phone, {}, cuenta=cuenta)
 
         ctx = ctx or self.herramientas(phone, cuenta)

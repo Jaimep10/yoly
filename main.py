@@ -207,11 +207,15 @@ FINANCIAL_CONTEXT_FILE = 'financial_context.json'
 
 # ==================== TEMPORARY EXPENSES FOR CONFIRMATION FLOW ====================
 # Global dict to store expenses temporarily until user confirms with SI/NO
-temp_gastos = {}
+def _make_temp_key(phone_clean, cuenta="principal"):
+    """Crea una llave única para aislar datos temporales por teléfono y cuenta."""
+    return f"{phone_clean}:{cuenta}"
+
+temp_gastos = {}  # Aislar por (phone_clean, cuenta)
 
 # ==================== TEMPORARY PRODUCTS FOR PRICE LIBRARY ====================
 # Global dict to store products extracted from tickets/receipts temporarily
-temp_productos = {}
+temp_productos = {}  # Aislar por (phone_clean, cuenta)
 
 # ==================== USER MEMORY PERSISTENCE ====================
 # Global dict to store user memory by phone number (para backward compatibility)
@@ -724,12 +728,18 @@ def contexto_agentes(telefono, cuenta="principal"):
 
 orquestador = OrquestadorYoly(herramientas=contexto_agentes)
 
-def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None):
+def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None, cuenta=None):
     """
     Descarga las fotos de Twilio, las pasa a WEBP y las manda por los 4 agentes (OrquestadorYoly en orchestrator.py):
     Portero (tipo y repetidas) -> Ojo (Vision) -> Calculadora (sumas en Python) -> Contadora (respuesta).
+
+    cuenta: si no se proporciona, se obtiene de la memoria del usuario.
     """
     try:
+        phone_clean = normalizar_telefono(telefono)
+        if cuenta is None:
+            cuenta = obtener_cuenta_activa(phone_clean)
+
         imagenes, fechas_foto, fallidas = [], [], []
         for numero, media_url in enumerate(media_urls, 1):
             imagen_bytes = descargar_media_twilio(media_url)
@@ -740,12 +750,12 @@ def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None):
             else:
                 logger.warning(f"Foto {numero} de {len(media_urls)} no se pudo bajar/convertir: {media_url}")
                 fallidas.append(numero)
-        logger.info(f"Fotos bajadas: {len(imagenes)} de {len(media_urls)} para {telefono}")
+        logger.info(f"[{phone_clean}][{cuenta}] Fotos bajadas: {len(imagenes)} de {len(media_urls)}")
         if not imagenes:
             if len(media_urls) > 1:
                 return "❌ No pude descargar las fotos. Intenta de nuevo."
             return "❌ No pude descargar la imagen. Intenta de nuevo."
-        texto = orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info, fechas_foto=fechas_foto)
+        texto = orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info, fechas_foto=fechas_foto, cuenta=cuenta)
         if fallidas:
             nums = ", ".join(str(n) for n in fallidas)
             texto = f"❌ No pude descargar la foto {nums}. Mándala otra vez.\n\n" + texto
@@ -3248,26 +3258,32 @@ def procesar_lote_fotos(lote):
     """Procesa un lote cerrado de fotos (máx MAX_FOTOS) y manda la respuesta por Twilio."""
     from_number, urls = lote["telefono"], lote["urls"]
     texto = " ".join(lote["textos"])
+    phone_clean = normalizar_telefono(from_number)
+    cuenta = obtener_cuenta_activa(phone_clean)  # AISLAR: obtener cuenta actual
     salida = Salida()
     total = len(urls) + lote["sobrantes"]
     if lote["sobrantes"]:
         salida.message(f"⚠️ Me mandaste {total} fotos y leo máximo {MAX_FOTOS} por vez. Leí las primeras "
                        f"{MAX_FOTOS}; mándame las otras {lote['sobrantes']} en otro mensaje.")
     try:
-        procesar_imagenes(urls, texto, from_number, salida)
+        procesar_imagenes(urls, texto, from_number, salida, cuenta=cuenta)
     except Exception as e:
-        logger.error(f"[LOTE {lote['id']}] Error procesando imagen de {from_number}: {e}", exc_info=True)
+        logger.error(f"[LOTE {lote['id']}] [{phone_clean}][{cuenta}] Error procesando imagen: {e}", exc_info=True)
         salida.message("Disculpa, hubo un error procesando tu factura. Intenta de nuevo.")
-    logger.info(f"[LOTE {lote['id']}] listo, enviando {len(salida.textos)} mensaje(s) a {from_number}")
+    logger.info(f"[LOTE {lote['id']}] [{phone_clean}][{cuenta}] listo, enviando {len(salida.textos)} mensaje(s)")
     enviar_por_twilio(from_number, salida.textos)
 
 
 lotes_fotos = LoteFotos(procesar_lote_fotos)
 
 
-def procesar_imagenes(media_urls, incoming_msg, from_number, salida):
+def procesar_imagenes(media_urls, incoming_msg, from_number, salida, cuenta=None):
     """Una o varias imágenes (factura/recibo/libretita/transferencia) con los 4 agentes"""
     global temp_productos
+    phone_clean = normalizar_telefono(from_number)
+    if cuenta is None:
+        cuenta = obtener_cuenta_activa(phone_clean)
+
     media_url = media_urls[0]
     msg_lower = incoming_msg.lower() if incoming_msg else ""
 
@@ -3286,8 +3302,9 @@ def procesar_imagenes(media_urls, incoming_msg, from_number, salida):
             salida.message("No pude leer los precios de la imagen. Asegúrate que sea un ticket o factura clara con precios visibles.")
             return
 
-        # Almacenar temporalmente para confirmación
-        temp_productos[from_number] = productos_dict
+        # Almacenar temporalmente para confirmación - AISLAR POR (phone_clean, cuenta)
+        temp_key = _make_temp_key(phone_clean, cuenta)
+        temp_productos[temp_key] = productos_dict
 
         # Mostrar resumen
         tienda = productos_dict.get('tienda', 'desconocida')
@@ -3308,7 +3325,7 @@ def procesar_imagenes(media_urls, incoming_msg, from_number, salida):
     # Si no es precio, usar el flujo normal de gastos
     # Procesar la imagen con visión
     info_foto = {}
-    resultado = procesar_fotos_whatsapp(media_urls, from_number, incoming_msg or "", info_foto)
+    resultado = procesar_fotos_whatsapp(media_urls, from_number, incoming_msg or "", info_foto, cuenta=cuenta)
     salida.message(resultado)
 
     # Si hay texto adicional, validar antes de reclasificar. Solo si la foto se guardó como
@@ -3600,6 +3617,25 @@ def es_afirmativo(msg_lower):
         return False
     return palabras[0] in {sin_acentos(p) for p in PALABRAS_AFIRMATIVAS}
 
+def obtener_cuenta_activa(phone_clean, cuenta_default="principal"):
+    """Obtiene la cuenta activa del usuario desde memoria. Por defecto 'principal'."""
+    ultimos10 = phone_clean[-10:]
+
+    # Buscar en memoria global
+    for clave, datos in memoria_usuarios.items():
+        if normalizar_telefono(clave)[-10:] == ultimos10 and isinstance(datos, dict):
+            cuenta = datos.get('cuenta_activa') or cuenta_default
+            return cuenta
+
+    # Fallback a archivo si memoria está vacía
+    memoria_archivo = cargar_memoria(phone_clean)
+    for clave, datos in memoria_archivo.items():
+        if normalizar_telefono(clave)[-10:] == ultimos10 and isinstance(datos, dict):
+            cuenta = datos.get('cuenta_activa') or cuenta_default
+            return cuenta
+
+    return cuenta_default
+
 def obtener_ultima_pregunta(phone_clean, cuenta="principal"):
     """Lee la última pregunta pendiente (memoria en RAM y, si no está, el archivo).
     Busca por los últimos 10 dígitos porque la clave puede venir con o sin prefijo."""
@@ -3659,6 +3695,8 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     global temp_gastos, temp_productos, memoria_usuarios
     msg_lower = incoming_msg.lower()
     phone_clean = normalizar_telefono(from_number)
+    cuenta = obtener_cuenta_activa(phone_clean)  # AISLAR: obtener cuenta actual
+    temp_key = _make_temp_key(phone_clean, cuenta)  # Llave para aislar temp data
 
     try:
         # ==================== RESUMEN POR PERÍODO ====================
@@ -3706,7 +3744,7 @@ Link: {server_url}/dashboard/{phone_clean}"""
         # Acepta "sí.", "si porfa", "dale", "mándala", "si quiero la tabla"... (antes solo "si" exacto,
         # y lo demás caía a Claude que respondía "¿qué necesitas?").
         # Si pide PDF o Excel, lo atiende el bloque de descargas de más abajo.
-        hay_confirmacion_pendiente = from_number in temp_gastos or from_number in temp_productos
+        hay_confirmacion_pendiente = temp_key in temp_gastos or temp_key in temp_productos
 
         # Respuesta con número a "¿Te mando tabla? 1 Sí / 2 No". No depende de la memoria
         # (que se pierde si Render reinicia): "1" siempre manda el link.
@@ -3754,11 +3792,10 @@ Te falta: ${cobro['saldo']:,.0f}
             resp.message("Listo 👍 Cuando quieras la tabla, escríbeme 1 o \"tabla\".")
             return
 
-        if msg_lower.strip() in confirmacion_palabras and from_number in temp_gastos:
+        if msg_lower.strip() in confirmacion_palabras and temp_key in temp_gastos:
             # User confirmed the expense!
-            gasto_temp = temp_gastos[from_number]
-            phone_clean = normalizar_telefono(from_number)
-            gastos = cargar_gastos(phone_clean)
+            gasto_temp = temp_gastos[temp_key]
+            gastos = cargar_gastos(phone_clean, cuenta)
             timestamp_iso = datetime.now().isoformat()
             gasto_id = f"desglose_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -3782,8 +3819,8 @@ Te falta: ${cobro['saldo']:,.0f}
             }
 
             gastos.append(gasto_nuevo)
-            guardar_gastos(phone_clean, gastos)
-            del temp_gastos[from_number]
+            guardar_gastos(phone_clean, gastos, cuenta)
+            del temp_gastos[temp_key]
 
             logger.info(f"Expense breakdown confirmed and saved for {from_number}: ${total}")
 
@@ -3807,29 +3844,28 @@ Te falta: ${cobro['saldo']:,.0f}
             resp.message(auto_respuesta)
             return
 
-        elif msg_lower.strip() in rechazo_palabras and from_number in temp_gastos:
+        elif msg_lower.strip() in rechazo_palabras and temp_key in temp_gastos:
             # User rejected the expense
-            del temp_gastos[from_number]
+            del temp_gastos[temp_key]
             resp.message("❌ Listo, cancelado. Dime de nuevo cómo es. Ejemplo: 'Envié 500, renta 380, comida 120'")
             return
 
         # ==================== CONFIRMATION FLOW FOR PRICE LIBRARY: SI/NO ====================
         # Check if user is confirming products from ticket photo
-        if msg_lower.strip() in confirmacion_palabras and from_number in temp_productos:
+        if msg_lower.strip() in confirmacion_palabras and temp_key in temp_productos:
             # User confirmed the products!
-            prods_temp = temp_productos[from_number]
-            phone_clean = normalizar_telefono(from_number)
+            prods_temp = temp_productos[temp_key]
 
-            del temp_productos[from_number]
+            del temp_productos[temp_key]
             texto = registrar_precios_factura(from_number, prods_temp.get('tienda'), prods_temp.get('ciudad'),
                                               prods_temp.get('productos', []))
             resp.message((texto or "No encontré productos con precio claro en ese ticket.") +
                          f"\n\n📊 Tus precios: {server_url}/dashboard/{phone_clean}/precios")
             return
 
-        elif msg_lower.strip() in rechazo_palabras and from_number in temp_productos:
+        elif msg_lower.strip() in rechazo_palabras and temp_key in temp_productos:
             # User rejected the products
-            del temp_productos[from_number]
+            del temp_productos[temp_key]
             resp.message("❌ Listo, cancelado. Envía otra foto del ticket.")
             return
 
@@ -3909,9 +3945,10 @@ Te falta: ${cobro['saldo']:,.0f}
             reserva = resultado["reserva"]
             alerta = resultado.get("alerta")
 
-            # STORE TEMPORARILY - Don't save yet!
-            temp_gastos[from_number] = resultado
-            logger.info(f"Expense breakdown stored temporarily for {from_number}: ${total}")
+            # STORE TEMPORARILY - Don't save yet! AISLAR POR (phone_clean, cuenta)
+            temp_key_local = _make_temp_key(phone_clean, obtener_cuenta_activa(phone_clean))
+            temp_gastos[temp_key_local] = resultado
+            logger.info(f"[{phone_clean}][{obtener_cuenta_activa(phone_clean)}] Expense breakdown stored temporarily: ${total}")
 
             # Ask for confirmation
             resumen = f"Entendí esto:\n📤 Total: ${total:.2f}\n\nDesglose:\n"
