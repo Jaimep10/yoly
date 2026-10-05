@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 import main
+from agents import reporter as agent_reporter
 import reportes
 
 TEL = "whatsapp:+593991234567"
@@ -18,7 +19,11 @@ HOY = date(2026, 10, 4)
 @pytest.fixture
 def entorno(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(main, "guardar_memoria", lambda m: None)
+    guardar_real = main.guardar_memoria
+    # Solo la memoria por cuenta (dentro de tmp_path); la global vive en /app/data
+    monkeypatch.setattr(main, "guardar_memoria",
+                        lambda m, phone_clean="", cuenta="principal":
+                        guardar_real(m, phone_clean, cuenta) if phone_clean else None)
     monkeypatch.setattr(main, "memoria_usuarios", {})
     monkeypatch.setattr(main, "temp_gastos", {})
     monkeypatch.setattr(main, "temp_productos", {})
@@ -90,26 +95,29 @@ def test_resumen_del_1_al_20_de_junio_solo_cuenta_esas_fechas(entorno):
 
     texto = enviar("Resumen del 1 al 20 de junio")
 
-    assert "Resumen del 1 al 20 de junio" in texto
+    assert "Transacciones del 1 al 20 de junio" in texto
+    assert "Supermaxi" in texto and "Arriendo" in texto and "Venta" in texto
+    assert "Fuera del rango" not in texto
     assert "Ingresos: $1,000.00" in texto
-    assert "Gastos: $530.00" in texto          # 50 + 380 + 30 + 60 + 10 de reserva
-    assert "Balance: +$470.00" in texto
-    assert "renta: $380.00 (72%)" in texto
-    assert "comida: $110.00" in texto          # 50 + 60 del desglose
-    assert "/download/periodo/593991234567/pdf?desde=2026-06-01&hasta=2026-06-20" in texto
-    assert "/download/periodo/593991234567/excel?desde=2026-06-01&hasta=2026-06-20" in texto
+    assert "Egresos: $530.00" in texto          # 50 + 380 + 30 + 60 + 10 de reserva
+    assert "Balance: $470.00" in texto
+    assert texto.endswith(agent_reporter.PREGUNTA_REPORTE)
+    assert "/download/" not in texto           # nada de PDF/Excel hasta que conteste 1 o 2
+    assert "/download/periodo/593991234567/pdf?desde=2026-06-01&hasta=2026-06-20" in enviar("1")
+    enviar("Resumen del 1 al 20 de junio")
+    assert "/download/periodo/593991234567/excel?desde=2026-06-01&hasta=2026-06-20" in enviar("2")
     main.client.messages.create.assert_not_called()
 
 
 def test_resumen_sin_datos_lo_dice(entorno):
-    assert "no tengo gastos ni ingresos" in enviar("resumen de junio")
+    assert enviar("resumen de junio") == agent_reporter.SIN_TRANSACCIONES
 
 
 def test_balance_de_un_mes_no_se_queda_en_la_deuda(entorno):
     main.guardar_cobro(PHONE, {"tipo": "cobro_deuda", "cliente": "Alan", "deuda": 1000, "pagado": 300, "saldo": 700,
                                "pagos": [{"fecha": "2026-09-01", "monto": 300}]})
     main.guardar_gastos(TEL, [{"fecha": "2026-09-03", "descripcion": "Luz", "categoria": "servicios", "monto": 40}])
-    assert "Resumen del septiembre" in enviar("balance de septiembre")
+    assert "Transacciones del septiembre" in enviar("balance de septiembre")
     assert "Te falta: $700" in enviar("balance")
 
 

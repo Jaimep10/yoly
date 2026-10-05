@@ -949,16 +949,55 @@ def resumen_periodo_usuario(telefono, inicio, fin, cuenta=None):
 
 
 def responder_resumen_periodo(telefono, periodo, server_url, cuenta=None):
-    """Texto de WhatsApp con totales, barras por categoría y links a PDF, Excel y panel del período."""
+    """La Contadora (agents/reporter): tabla con los movimientos reales del período, totales ya
+    calculados y SIEMPRE la pregunta 1 PDF / 2 Excel / 3 Solo verlo aquí. Los links al PDF o Excel
+    no se mandan hasta que conteste 1 o 2 (ver responder_opcion_reporte)."""
     phone_clean = normalizar_telefono(telefono)
+    if cuenta is None:
+        cuenta = obtener_cuenta_activa(phone_clean)
     resumen, sin_fecha = resumen_periodo_usuario(telefono, periodo['inicio'], periodo['fin'], cuenta)
-    texto = reportes.texto_resumen(resumen, periodo, sin_fecha)
+    texto = agent_reporter.mensaje_reporte(resumen, periodo['etiqueta'], sin_fecha)
     if resumen['movimientos']:
-        q = f"desde={periodo['inicio'].isoformat()}&hasta={periodo['fin'].isoformat()}"
-        texto += (f"\n\n📄 PDF con gráfico: {server_url}/download/periodo/{phone_clean}/pdf?{q}"
-                  f"\n📊 Excel: {server_url}/download/periodo/{phone_clean}/excel?{q}"
-                  f"\n🌐 Panel: {server_url}/dashboard/{phone_clean}/periodo?{q}")
+        marcar_pregunta_reporte(phone_clean, cuenta, periodo)
     return texto
+
+
+def marcar_pregunta_reporte(phone_clean, cuenta, periodo):
+    """Guarda que quedó pendiente "¿Cómo quieres el reporte?" y de qué período era."""
+    memoria = cargar_memoria(phone_clean, cuenta)
+    datos = memoria.setdefault(phone_clean, {})
+    datos['ultima_pregunta'] = 'reporte'
+    datos['reporte_desde'] = periodo['inicio'].isoformat()
+    datos['reporte_hasta'] = periodo['fin'].isoformat()
+    guardar_memoria(memoria, phone_clean, cuenta)
+
+
+def reporte_pendiente(phone_clean, cuenta):
+    """(desde, hasta) del reporte cuya pregunta 1/2/3 sigue sin respuesta, o None."""
+    datos = cargar_memoria(phone_clean, cuenta).get(phone_clean) or {}
+    if datos.get('ultima_pregunta') == 'reporte' and datos.get('reporte_desde') and datos.get('reporte_hasta'):
+        return datos['reporte_desde'], datos['reporte_hasta']
+    return None
+
+
+def cerrar_pregunta_reporte(phone_clean, cuenta):
+    memoria = cargar_memoria(phone_clean, cuenta)
+    datos = memoria.get(phone_clean)
+    if isinstance(datos, dict):
+        datos['ultima_pregunta'] = ''
+        datos.pop('reporte_desde', None)
+        datos.pop('reporte_hasta', None)
+        guardar_memoria(memoria, phone_clean, cuenta)
+
+
+def responder_opcion_reporte(opcion, phone_clean, desde, hasta, server_url):
+    """1 → link al PDF, 2 → link al Excel, 3 o "nada" → termina ahí (no se arma ningún archivo)."""
+    if opcion == 'ver':
+        return "Listo 👍 Lo dejamos aquí. Si luego quieres el PDF o el Excel, pídeme el reporte otra vez."
+    q = f"desde={desde}&hasta={hasta}"
+    if opcion == 'pdf':
+        return f"📄 Tu PDF: {server_url}/download/periodo/{phone_clean}/pdf?{q}"
+    return f"📊 Tu Excel: {server_url}/download/periodo/{phone_clean}/excel?{q}"
 
 
 def guardar_movimiento_texto(telefono, movimiento, cuenta="principal"):
@@ -3718,6 +3757,14 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     temp_key = _make_temp_key(phone_clean, cuenta)  # Llave para aislar temp data
 
     try:
+        # ==================== RESPUESTA A "¿Cómo quieres el reporte? 1/2/3" ====================
+        pendiente = reporte_pendiente(phone_clean, cuenta)
+        opcion_rep = agent_reporter.opcion_reporte(incoming_msg) if pendiente else None
+        if opcion_rep:
+            cerrar_pregunta_reporte(phone_clean, cuenta)
+            resp.message(responder_opcion_reporte(opcion_rep, phone_clean, *pendiente, server_url))
+            return
+
         # ==================== RESUMEN POR PERÍODO ====================
         # "resumen del 1 al 20 de junio", "gastos de junio", "balance de septiembre", "informe de gastos"
         # Va antes del balance para que "balance de septiembre" no se quede en la deuda.

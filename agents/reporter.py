@@ -13,6 +13,76 @@ from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, Tabl
 PREGUNTA_TABLA = "¿Te mando tabla al dashboard?\nResponde con el número:\n1️⃣ Sí\n2️⃣ No"
 MAX_FILAS_WHATSAPP = 15
 
+# ==================== REPORTE DE TRANSACCIONES (ingresos y egresos) ====================
+# Reglas de la Contadora:
+# - Solo muestra lo que está guardado en data/{tel}/{cuenta}/ (gastos.json e ingresos.json). Nada inventado.
+# - Sin movimientos: SIN_TRANSACCIONES y ninguna tabla.
+# - No suma: los totales llegan ya hechos por reportes.resumir (Python).
+# - Después de la tabla SIEMPRE va PREGUNTA_REPORTE; el PDF/Excel solo se arma si contesta 1 o 2.
+SIN_TRANSACCIONES = "No hay transacciones aún"
+PREGUNTA_REPORTE = ("¿Cómo quieres el reporte?\n"
+                    "1. PDF\n"
+                    "2. Excel\n"
+                    "3. Solo verlo aquí\n\n"
+                    "Responde con 1, 2 o 3")
+MAX_FILAS_REPORTE = 40
+TIPO_CORTO = {"ingreso": "Ingreso", "gasto": "Egreso", "por_revisar": "¿?"}
+
+
+def _dinero(valor):
+    return f"-${abs(valor):,.2f}" if valor < 0 else f"${valor:,.2f}"
+
+
+def tabla_transacciones(movimientos, max_filas=MAX_FILAS_REPORTE):
+    """Tabla monoespaciada: Fecha | Tipo | Monto | Proveedor, una fila por movimiento guardado."""
+    lineas = ["Fecha  Tipo     Monto       Proveedor"]
+    for m in movimientos[:max_filas]:
+        proveedor = (m.get('proveedor') or m.get('descripcion') or '—').strip()[:22]
+        lineas.append(f"{m['fecha'].strftime('%d/%m')}  {TIPO_CORTO.get(m['tipo'], m['tipo']):<8} "
+                      f"{_dinero(m['monto']):<11} {proveedor}".rstrip())
+    texto = "```\n" + "\n".join(lineas) + "\n```"
+    if len(movimientos) > max_filas:
+        texto += f"\n…y {len(movimientos) - max_filas} movimientos más (van completos en el PDF y el Excel)."
+    return texto
+
+
+def mensaje_reporte(resumen, etiqueta, sin_fecha=0):
+    """Mensaje de WhatsApp del reporte: tabla con los movimientos reales, totales ya calculados
+    y la pregunta 1/2/3. Sin movimientos: solo SIN_TRANSACCIONES (sin tabla ni pregunta)."""
+    if not resumen['movimientos']:
+        texto = SIN_TRANSACCIONES
+        if sin_fecha:
+            texto += f"\n({sin_fecha} registros no tienen fecha y no los pude ubicar en el {etiqueta}.)"
+        return texto
+    lineas = [
+        f"📊 *Transacciones del {etiqueta}*",
+        tabla_transacciones(resumen['movimientos']),
+        f"💰 Ingresos: {_dinero(resumen['total_ingresos'])}",
+        f"💸 Egresos: {_dinero(resumen['total_gastos'])}",
+        f"⚖️ Balance: {_dinero(resumen['balance'])}",
+    ]
+    if resumen.get('por_revisar'):
+        lineas.append(f"❓ {resumen['por_revisar']} sin clasificar (marcados para revisar).")
+    if resumen.get('sin_direccion'):
+        lineas.append(f"❓ {resumen['sin_direccion']} movimiento(s) con ¿? no entraron en los totales: "
+                      "no sé si fueron ingreso o egreso.")
+    if sin_fecha:
+        lineas.append(f"⚠️ {sin_fecha} registros sin fecha no entraron.")
+    return "\n".join(lineas) + "\n\n" + PREGUNTA_REPORTE
+
+
+def opcion_reporte(texto):
+    """Respuesta a PREGUNTA_REPORTE: 'pdf', 'excel', 'ver' (3 o "nada") o None si no es una respuesta."""
+    t = (texto or '').lower().strip().rstrip('.!)').replace('\ufe0f', '').replace('\u20e3', '').strip()
+    if t in ('1', 'uno', 'opcion 1', 'opción 1', 'pdf'):
+        return 'pdf'
+    if t in ('2', 'dos', 'opcion 2', 'opción 2', 'excel'):
+        return 'excel'
+    if t in ('3', 'tres', 'opcion 3', 'opción 3', 'nada', 'ninguno', 'solo verlo', 'solo verlo aquí',
+             'solo verlo aqui', 'aquí', 'aqui'):
+        return 'ver'
+    return None
+
 
 def titulo_cobro(cobro):
     return f"Estado de Cuenta {cobro['cliente']} - Deuda ${cobro['deuda']:,.0f} - Saldo ${cobro['saldo']:,.0f}"
