@@ -3600,10 +3600,20 @@ def es_afirmativo(msg_lower):
         return False
     return palabras[0] in {sin_acentos(p) for p in PALABRAS_AFIRMATIVAS}
 
-def obtener_ultima_pregunta(phone_clean):
+def obtener_ultima_pregunta(phone_clean, cuenta="principal"):
     """Lee la última pregunta pendiente (memoria en RAM y, si no está, el archivo).
     Busca por los últimos 10 dígitos porque la clave puede venir con o sin prefijo."""
     ultimos10 = phone_clean[-10:]
+
+    # Primero en memoria per-cuenta
+    memoria_cuenta = cargar_memoria(phone_clean, cuenta)
+    for clave, datos in memoria_cuenta.items():
+        if normalizar_telefono(clave)[-10:] == ultimos10 and isinstance(datos, dict):
+            pregunta = (datos.get('ultima_pregunta') or '').lower()
+            if pregunta:
+                return pregunta
+
+    # Fallback: memoria global
     for memoria in (memoria_usuarios, cargar_memoria()):
         for clave, datos in memoria.items():
             if normalizar_telefono(clave)[-10:] == ultimos10 and isinstance(datos, dict):
