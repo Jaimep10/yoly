@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="robots" content="noindex">
+<meta name="theme-color" content="#3B82F6">
+<title>Yoly - Mis gastos</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'%3E%3Crect fill='%233B82F6' width='192' height='192' rx='40'/%3E%3Ctext x='50%25' y='54%25' dominant-baseline='middle' text-anchor='middle' font-size='120' fill='white' font-family='Arial' font-weight='bold'%3EY%3C/text%3E%3C/svg%3E">
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif; background: #EEF2FF; color: #1F2937; }
+  header { background: #3B82F6; color: #fff; padding: 16px; display: flex; align-items: center; gap: 12px; }
+  .logo { width: 44px; height: 44px; border-radius: 12px; background: #fff; color: #3B82F6; font-weight: bold;
+          font-size: 28px; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 2px 0 0; font-size: 13px; opacity: .85; }
+  main { max-width: 960px; margin: 0 auto; padding: 16px; }
+  .totales { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin-bottom: 16px; }
+  .total { background: #fff; border-radius: 12px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  .total span { display: block; font-size: 12px; color: #6B7280; }
+  .total b { font-size: 20px; }
+  .ingresos b { color: #2E7D32; } .gastos b { color: #D32F2F; }
+  .barra { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+  .barra input { flex: 1; min-width: 160px; padding: 10px; border: 1px solid #D1D5DB; border-radius: 8px; font-size: 15px; }
+  .btn { border: 0; border-radius: 8px; padding: 8px 12px; font-size: 14px; cursor: pointer; text-decoration: none; display: inline-block; }
+  .btn-excel { background: #2E7D32; color: #fff; padding: 10px 14px; }
+  .btn-editar { background: #E0E7FF; color: #3730A3; }
+  .btn-borrar { background: #FEE2E2; color: #B91C1C; }
+  .btn-guardar { background: #3B82F6; color: #fff; }
+  .btn-cancelar { background: #E5E7EB; color: #374151; }
+  .tabla { background: #fff; border-radius: 12px; overflow-x: auto; box-shadow: 0 1px 3px rgba(0,0,0,.08); }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { background: #F3F4F6; text-align: left; padding: 10px; cursor: pointer; user-select: none; white-space: nowrap; }
+  td { padding: 10px; border-top: 1px solid #F3F4F6; vertical-align: middle; }
+  td.monto, th.monto { text-align: right; white-space: nowrap; }
+  td.acciones { white-space: nowrap; text-align: right; }
+  td input { width: 100%; min-width: 80px; padding: 6px; border: 1px solid #93C5FD; border-radius: 6px; font-size: 14px; }
+  .vacio { padding: 24px; text-align: center; color: #6B7280; }
+  .aviso { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); background: #111827; color: #fff;
+           padding: 10px 16px; border-radius: 8px; font-size: 14px; display: none; }
+  .error-link { background: #fff; border-radius: 12px; padding: 24px; text-align: center; margin-top: 24px; }
+  @media (max-width: 600px) {
+    .totales { grid-template-columns: 1fr 1fr 1fr; gap: 6px; }
+    .total b { font-size: 15px; }
+    td, th { padding: 8px 6px; font-size: 13px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">Y</div>
+  <div>
+    <h1>YOLY ASISTENTE CONTABLE</h1>
+    <p>{% if not invalido %}Mis gastos · ****{{ tel_corto }}{% else %}Reporte{% endif %}</p>
+  </div>
+</header>
+<main>
+{% if invalido %}
+  <div class="error-link">
+    <p style="font-size:40px;margin:0">🔒</p>
+    <h2>Este link no es válido</h2>
+    <p>Pídele a Yoly por WhatsApp un link nuevo para ver y editar tus gastos.</p>
+  </div>
+{% else %}
+  <section class="totales">
+    <div class="total ingresos"><span>Ingresos</span><b id="t-ingresos">$0.00</b></div>
+    <div class="total gastos"><span>Gastos</span><b id="t-gastos">$0.00</b></div>
+    <div class="total saldo"><span>Saldo</span><b id="t-saldo">$0.00</b></div>
+  </section>
+
+  <div class="barra">
+    <input id="buscar" type="search" placeholder="Buscar por descripción, categoría o fecha">
+    <a class="btn btn-excel" id="excel" href="#">⬇ Excel</a>
+  </div>
+
+  <div class="tabla">
+    <table>
+      <thead>
+        <tr>
+          <th data-col="fecha">Fecha ↕</th>
+          <th data-col="descripcion">Descripción ↕</th>
+          <th data-col="monto" class="monto">Monto ↕</th>
+          <th data-col="categoria">Categoría ↕</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody id="filas"><tr><td colspan="5" class="vacio">Cargando…</td></tr></tbody>
+    </table>
+  </div>
+{% endif %}
+</main>
+<div class="aviso" id="aviso"></div>
+
+{% if not invalido %}
+<script>
+const WA_ID = {{ wa_id|tojson }};
+const TOKEN = {{ token|tojson }};
+const CUENTA = {{ cuenta|tojson }};
+const auth = `t=${encodeURIComponent(TOKEN)}&cuenta=${encodeURIComponent(CUENTA)}`;
+let gastos = [];
+let orden = { col: 'fecha', asc: false };
+
+const dinero = n => '$' + Number(n || 0).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function avisar(texto) {
+  const a = document.getElementById('aviso');
+  a.textContent = texto; a.style.display = 'block';
+  clearTimeout(a._t); a._t = setTimeout(() => a.style.display = 'none', 2500);
+}
+
+function pintarTotales(t) {
+  document.getElementById('t-ingresos').textContent = dinero(t.ingresos);
+  document.getElementById('t-gastos').textContent = dinero(t.gastos);
+  document.getElementById('t-saldo').textContent = dinero(t.saldo);
+}
+
+function pintar() {
+  const q = document.getElementById('buscar').value.trim().toLowerCase();
+  const visibles = gastos
+    .filter(g => !q || [g.fecha, g.descripcion, g.categoria, String(g.monto)].join(' ').toLowerCase().includes(q))
+    .sort((a, b) => {
+      const x = a[orden.col], y = b[orden.col];
+      const r = typeof x === 'number' ? x - y : String(x).localeCompare(String(y));
+      return orden.asc ? r : -r;
+    });
+  const tbody = document.getElementById('filas');
+  if (!visibles.length) {
+    tbody.innerHTML = `<tr><td colspan="5" class="vacio">${gastos.length ? 'Nada coincide con la búsqueda' : 'Aún no tienes gastos 📭'}</td></tr>`;
+    return;
+  }
+  tbody.innerHTML = visibles.map(g => `
+    <tr data-id="${esc(g.id)}">
+      <td>${esc(g.fecha)}</td>
+      <td>${esc(g.descripcion)}</td>
+      <td class="monto">${dinero(g.monto)}</td>
+      <td>${esc(g.categoria)}</td>
+      <td class="acciones">
+        <button class="btn btn-editar" data-accion="editar">Editar</button>
+        <button class="btn btn-borrar" data-accion="borrar">Borrar</button>
+      </td>
+    </tr>`).join('');
+}
+
+async function llamar(metodo, url, cuerpo) {
+  const r = await fetch(url, {
+    method: metodo,
+    headers: cuerpo ? { 'Content-Type': 'application/json' } : {},
+    body: cuerpo ? JSON.stringify(cuerpo) : undefined,
+  });
+  const datos = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(datos.error || 'No se pudo completar');
+  return datos;
+}
+
+async function cargar() {
+  try {
+    const datos = await llamar('GET', `/api/gastos/${encodeURIComponent(WA_ID)}?${auth}`);
+    gastos = datos.gastos;
+    pintarTotales(datos.totales);
+    pintar();
+  } catch (e) {
+    document.getElementById('filas').innerHTML = `<tr><td colspan="5" class="vacio">${esc(e.message)}</td></tr>`;
+  }
+}
+
+const urlGasto = id => `/api/gastos/${encodeURIComponent(id)}?wa_id=${encodeURIComponent(WA_ID)}&${auth}`;
+
+function editarFila(tr, g) {
+  tr.children[2].innerHTML = `<input type="number" step="0.01" min="0.01" inputmode="decimal" value="${g.monto}">`;
+  tr.children[3].innerHTML = `<input type="text" maxlength="40" value="${esc(g.categoria)}">`;
+  tr.children[4].innerHTML = `<button class="btn btn-guardar" data-accion="guardar">Guardar</button>
+                              <button class="btn btn-cancelar" data-accion="cancelar">✕</button>`;
+  tr.children[2].querySelector('input').focus();
+}
+
+document.getElementById('filas').addEventListener('click', async ev => {
+  const boton = ev.target.closest('button');
+  if (!boton) return;
+  const tr = boton.closest('tr');
+  const id = tr.dataset.id;
+  const g = gastos.find(x => x.id === id);
+  if (!g) return;
+  const accion = boton.dataset.accion;
+
+  if (accion === 'editar') return editarFila(tr, g);
+  if (accion === 'cancelar') return pintar();
+
+  boton.disabled = true;
+  try {
+    if (accion === 'borrar') {
+      if (!confirm(`¿Borrar "${g.descripcion || 'este gasto'}" de ${dinero(g.monto)}?`)) { boton.disabled = false; return; }
+      const datos = await llamar('DELETE', urlGasto(id));
+      gastos = gastos.filter(x => x.id !== id);
+      pintarTotales(datos.totales);
+      pintar();
+      avisar('Gasto borrado ✅');
+    } else if (accion === 'guardar') {
+      const monto = tr.children[2].querySelector('input').value;
+      const categoria = tr.children[3].querySelector('input').value;
+      const datos = await llamar('PUT', urlGasto(id), { monto, categoria });
+      Object.assign(g, datos.gasto);
+      pintarTotales(datos.totales);
+      pintar();
+      avisar('Gasto actualizado ✅');
+    }
+  } catch (e) {
+    boton.disabled = false;
+    avisar(e.message);
+  }
+});
+
+document.querySelectorAll('th[data-col]').forEach(th => th.addEventListener('click', () => {
+  orden = { col: th.dataset.col, asc: orden.col === th.dataset.col ? !orden.asc : true };
+  pintar();
+}));
+document.getElementById('buscar').addEventListener('input', pintar);
+document.getElementById('excel').href = `/reporte/${encodeURIComponent(WA_ID)}/excel?${auth}`;
+cargar();
+</script>
+{% endif %}
+</body>
+</html>

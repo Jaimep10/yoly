@@ -48,6 +48,10 @@ except ImportError:
 
 app = Flask(__name__)
 
+# Reporte web editable por cliente: /reporte/{wa_id} y /api/gastos (app/web/reporte.py)
+from app.web import reporte as reporte_web
+app.register_blueprint(reporte_web.crear_blueprint(lambda: DATA_DIR))
+
 # Logging configuration
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -2989,29 +2993,6 @@ def dashboard_carpetas(phone, cuenta="principal"):
         return "Error al cargar las carpetas", 500
 
 
-@app.route("/api/gastos/<phone>", methods=["GET"])
-def api_gastos(phone):
-    """API endpoint para obtener gastos en JSON"""
-    try:
-        gastos = cargar_gastos(phone)
-        if not gastos:
-            return jsonify([]), 200
-
-        # Filtrar gastos del mes actual si se solicita
-        filtro = request.args.get('filtro', 'todos')
-        if filtro == 'mes':
-            hoy = datetime.now()
-            mes_actual = hoy.month
-            anio_actual = hoy.year
-            gastos = [g for g in gastos if 'fecha' in g and
-                     datetime.strptime(g['fecha'], '%Y-%m-%d').month == mes_actual and
-                     datetime.strptime(g['fecha'], '%Y-%m-%d').year == anio_actual]
-
-        return jsonify(gastos), 200
-    except Exception as e:
-        logger.error(f"Error en API gastos: {e}", exc_info=True)
-        return jsonify({"error": str(e)}), 500
-
 @app.route("/manifest.json", methods=["GET"])
 def manifest():
     """PWA Manifest para instalación como app"""
@@ -3672,6 +3653,8 @@ def tiene_datos(phone_clean):
         return False
 
 def mensaje_link_dashboard(server_url, phone_clean):
+    link_editar = reporte_web.link_reporte(server_url, phone_clean)
+    editar = f"\n\n✏️ Editar o borrar tus gastos:\n{link_editar}" if link_editar else ""
     return f"""✅ Perfecto, aquí está tu panel:
 {server_url}/dashboard/{phone_clean}
 
@@ -3679,7 +3662,7 @@ def mensaje_link_dashboard(server_url, phone_clean):
 - Excel con todos tus pagos
 - PDF con el reporte financiero
 
-Los datos están listos para descargar."""
+Los datos están listos para descargar.{editar}"""
 
 def opcion_numero(msg_lower):
     """Devuelve 1 o 2 si el usuario contestó con el número de la opción ("1", "1.", "1️⃣", "uno")."""

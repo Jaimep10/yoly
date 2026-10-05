@@ -6,6 +6,19 @@ from app.generators import excel_pro
 logger = logging.getLogger(__name__)
 
 
+def generar_excel(wa_id, gastos, ingresos=None, cuenta="principal"):
+    """
+    Excel del reporte web con fórmulas: Ingresos, Gastos y Saldo se calculan en la hoja
+    (=SUM(...) y =B4-B5), no son valores fijos.
+
+    Returns:
+        Workbook (openpyxl) con hojas RESUMEN, GASTOS e INGRESOS
+    """
+    wb = excel_pro.crear_excel_formulas(wa_id, cuenta, gastos, ingresos)
+    logger.info(f"[{wa_id}][{cuenta}] Excel con fórmulas: {len(gastos or [])} gastos, {len(ingresos or [])} ingresos")
+    return wb
+
+
 def generar(tipo, wa_id, cuenta):
     """
     Genera un reporte del tipo solicitado.
