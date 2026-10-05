@@ -64,12 +64,12 @@ Sé conciso y amigable."""
 
         menu = f"""📊 *Reporte de {cuenta_activa}{saldo_texto}*
 
-¿Qué deseas hacer?
+¿Quieres el reporte?
 
-1️⃣ Ver resumen mensual
-2️⃣ Descargar PDF
-3️⃣ Descargar Excel
-4️⃣ Ver últimos gastos
+1️⃣ Ver en web
+2️⃣ PDF
+3️⃣ Excel
+4️⃣ Solo guardar
 
 Escribe el número (1, 2, 3, 4) o *pdf* / *excel*"""
 
