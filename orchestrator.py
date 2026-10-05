@@ -61,8 +61,9 @@ class Contexto:
     cliente: Any                                   # cliente de Anthropic
     modelo: str
     phone_clean: str
+    cuenta: str                                    # nombre de la cuenta: principal, negocio, personal
     guardar_imagen: Callable[[bytes], str]         # guarda la foto y devuelve su ruta
-    guardar_cobro: Callable[[str, dict], None]     # escribe en memoria_global.json
+    guardar_cobro: Callable[[str, dict], None]     # escribe en memoria_{phone}_{cuenta}.json
     cobro_actual: Callable[[], Optional[dict]]     # cobro ya guardado del usuario (o None)
     guardar_gasto: Callable[..., str]              # (vision, pagos, total, ruta) -> texto
     guardar_transferencia: Callable[..., str]      # (vision, pagos, total, ruta, texto_usuario) -> texto
@@ -99,9 +100,10 @@ class OrquestadorYoly:
         self.guia = Guía()
         self.herramientas = herramientas
 
-    def handle_whatsapp(self, phone, images, texto="", info=None, ctx=None, fechas_foto=None):
+    def handle_whatsapp(self, phone, images, texto="", info=None, ctx=None, fechas_foto=None, cuenta="principal"):
         """
         phone: quien escribe. images: lista de fotos (webp) del mismo mensaje, 1 o varias. texto: lo que escribió.
+        cuenta: cuenta del usuario (default "principal"). Hasta 3 cuentas por teléfono: principal, negocio, personal.
         fechas_foto: fecha EXIF de cada foto (o None), respaldo si la factura no trae fecha impresa.
         Devuelve el texto de la respuesta para WhatsApp.
         0. Guía: si es una pregunta sin fotos, responde directamente.
@@ -112,9 +114,9 @@ class OrquestadorYoly:
         """
         # FIRST: Check if it's a question (no images)
         if not images and self.guia.es_pregunta(texto):
-            return self.guia.responder(texto, phone, {})
+            return self.guia.responder(texto, phone, {}, cuenta=cuenta)
 
-        ctx = ctx or self.herramientas(phone)
+        ctx = ctx or self.herramientas(phone, cuenta)
         return self._procesar(list(images), texto or "", ctx, info, fechas_foto)
 
     def _procesar(self, imagenes, texto_usuario, ctx, info=None, fechas_foto=None):

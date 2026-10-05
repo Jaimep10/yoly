@@ -214,12 +214,20 @@ temp_gastos = {}
 temp_productos = {}
 
 # ==================== USER MEMORY PERSISTENCE ====================
-# Global dict to store user memory by phone number
+# Global dict to store user memory by phone number (para backward compatibility)
+# Nueva estructura: memoria por cuenta en data/{phone}/{cuenta}/memoria_{phone}_{cuenta}.json
 memoria_usuarios = {}
 
-def cargar_memoria():
-    """Carga memoria global existente desde archivo si existe"""
-    memoria_archivo = '/app/data/memoria_global.json'
+def cargar_memoria(phone_clean="", cuenta="principal"):
+    """Carga memoria existente: por cuenta si phone_clean dado, sino global (backward compat)"""
+    if phone_clean:
+        # New per-account memory
+        ruta = obtener_ruta_datos(phone_clean, cuenta)
+        memoria_archivo = f'{ruta}/memoria_{phone_clean}_{cuenta}.json'
+    else:
+        # Old global memory (for backward compatibility)
+        memoria_archivo = '/app/data/memoria_global.json'
+
     if os.path.exists(memoria_archivo):
         try:
             with open(memoria_archivo, 'r', encoding='utf-8') as f:
@@ -228,9 +236,16 @@ def cargar_memoria():
             return {}
     return {}
 
-def guardar_memoria(memoria):
-    """Guarda memoria global en archivo"""
-    memoria_archivo = '/app/data/memoria_global.json'
+def guardar_memoria(memoria, phone_clean="", cuenta="principal"):
+    """Guarda memoria: por cuenta si phone_clean dado, sino global (backward compat)"""
+    if phone_clean:
+        # New per-account memory
+        ruta = obtener_ruta_datos(phone_clean, cuenta)
+        memoria_archivo = f'{ruta}/memoria_{phone_clean}_{cuenta}.json'
+    else:
+        # Old global memory (for backward compatibility)
+        memoria_archivo = '/app/data/memoria_global.json'
+
     try:
         os.makedirs(os.path.dirname(memoria_archivo), exist_ok=True)
         with candado_archivos:
@@ -238,7 +253,7 @@ def guardar_memoria(memoria):
     except Exception as e:
         logger.warning(f"Error guardando memoria: {e}")
 
-# Carga memoria al inicio
+# Carga memoria global al inicio (backward compatibility)
 memoria_usuarios = cargar_memoria()
 
 # ==================== FINANCIAL CONTEXT PERSISTENCE ====================
@@ -268,15 +283,15 @@ def guardar_contexto_financiero(contexto):
 
 DATA_DIR = '/home/claude/yoly/data'
 
-def obtener_ruta_datos(telefono):
-    """Obtiene la ruta de la carpeta de datos del usuario"""
-    ruta = f'{DATA_DIR}/{telefono}'
+def obtener_ruta_datos(telefono, cuenta="principal"):
+    """Obtiene la ruta de la carpeta de datos del usuario (por defecto cuenta 'principal')"""
+    ruta = f'{DATA_DIR}/{telefono}/{cuenta}'
     os.makedirs(ruta, exist_ok=True)
     return ruta
 
-def cargar_gastos(telefono):
+def cargar_gastos(telefono, cuenta="principal"):
     """Carga los gastos guardados del usuario"""
-    ruta = obtener_ruta_datos(telefono)
+    ruta = obtener_ruta_datos(telefono, cuenta)
     archivo = f'{ruta}/gastos.json'
     if os.path.exists(archivo):
         try:
@@ -287,9 +302,9 @@ def cargar_gastos(telefono):
             return []
     return []
 
-def guardar_gastos(telefono, gastos):
+def guardar_gastos(telefono, gastos, cuenta="principal"):
     """Guarda los gastos del usuario"""
-    ruta = obtener_ruta_datos(telefono)
+    ruta = obtener_ruta_datos(telefono, cuenta)
     archivo = f'{ruta}/gastos.json'
     try:
         escribir_json(archivo, gastos, ensure_ascii=False, indent=2)
@@ -305,14 +320,15 @@ def guardar_gastos(telefono, gastos):
 from agents.calculator import (a_numero, fecha_valida, normalizar_fecha, METODOS_PAGO, normalizar_metodo,
                               normalizar_pagos, fecha_corta, armar_cobro)
 
-def guardar_cobro(phone_clean, datos):
-    """Guarda el cobro en memoria_global.json y en data/{telefono}/cobro_deuda.json"""
-    memoria_usuarios[phone_clean] = datos
-    guardar_memoria(memoria_usuarios)
+def guardar_cobro(phone_clean, datos, cuenta="principal"):
+    """Guarda el cobro en memoria_{phone}_{cuenta}.json y en data/{telefono}/{cuenta}/cobro_deuda.json"""
     try:
-        ruta = f'{DATA_DIR}/{phone_clean}'
-        os.makedirs(ruta, exist_ok=True)
+        ruta = obtener_ruta_datos(phone_clean, cuenta)
         escribir_json(f'{ruta}/cobro_deuda.json', datos, ensure_ascii=False, indent=2)
+        # También guardar en memoria de esta cuenta
+        memoria = cargar_memoria(phone_clean, cuenta)
+        memoria[phone_clean] = datos
+        guardar_memoria(memoria, phone_clean, cuenta)
     except Exception as e:
         logger.warning(f"Error guardando cobro_deuda.json: {e}")
 
@@ -320,44 +336,55 @@ def es_registro_pagos(gasto):
     """Registros viejos donde la foto de pagos se guardó como 1 solo gasto"""
     return isinstance(gasto.get('pagos'), list) and (len(gasto['pagos']) > 1 or gasto.get('cliente'))
 
-def obtener_cobro(phone):
-    """Busca el cobro de deuda del usuario por sus últimos 10 dígitos (memoria, archivo o registro viejo)"""
+def obtener_cobro(phone, cuenta="principal"):
+    """Busca el cobro de deuda del usuario en la cuenta especificada (memoria, archivo o registro viejo)"""
     digitos = normalizar_telefono(phone)
+
+    # Primero buscar en la cuenta actual
+    memoria = cargar_memoria(digitos, cuenta)
+    if memoria.get(digitos, {}).get('tipo') in ('cobro_deuda', 'deuda') and memoria.get(digitos, {}).get('pagos'):
+        return armar_cobro(memoria.get(digitos))
+
+    # Luego en el archivo de la cuenta actual
+    ruta = obtener_ruta_datos(digitos, cuenta)
+    archivo = f'{ruta}/cobro_deuda.json'
+    if os.path.exists(archivo):
+        try:
+            with open(archivo, 'r', encoding='utf-8') as f:
+                return armar_cobro(json.load(f))
+        except Exception as e:
+            logger.warning(f"Error leyendo {archivo}: {e}")
+
+    # Backward compatibility: buscar en archivos viejos sin cuenta
     ultimos10 = digitos[-10:]
-    if not ultimos10:
-        return None
-
-    candidatos = [digitos] + [k for k in memoria_usuarios if normalizar_telefono(k)[-10:] == ultimos10]
-    for clave in candidatos:
-        datos = memoria_usuarios.get(clave) or {}
-        if datos.get('tipo') in ('cobro_deuda', 'deuda') and datos.get('pagos'):
-            return armar_cobro(datos)
-
-    if os.path.isdir(DATA_DIR):
+    if ultimos10 and os.path.isdir(DATA_DIR):
         for carpeta in os.listdir(DATA_DIR):
             if normalizar_telefono(carpeta)[-10:] != ultimos10:
                 continue
-            archivo = f'{DATA_DIR}/{carpeta}/cobro_deuda.json'
-            if os.path.exists(archivo):
+            # Buscar en estructura vieja (sin /cuenta/)
+            archivo_viejo = f'{DATA_DIR}/{carpeta}/cobro_deuda.json'
+            if os.path.exists(archivo_viejo):
                 try:
-                    with open(archivo, 'r', encoding='utf-8') as f:
+                    with open(archivo_viejo, 'r', encoding='utf-8') as f:
                         return armar_cobro(json.load(f))
                 except Exception as e:
-                    logger.warning(f"Error leyendo {archivo}: {e}")
+                    logger.warning(f"Error leyendo {archivo_viejo}: {e}")
+
+            # Buscar en gastos viejos
             for gasto in reversed(cargar_gastos(carpeta)):
                 if es_registro_pagos(gasto):
                     return armar_cobro({"cliente": gasto.get('cliente'), "deuda": gasto.get('monto'),
                                         "pagos": gasto.get('pagos'), "fecha": gasto.get('fecha', '')})
     return None
 
-def cargar_gastos_usuario(phone):
+def cargar_gastos_usuario(phone, cuenta="principal"):
     """Gastos del usuario buscando la carpeta por últimos 10 dígitos (whatsapp:+593... o 593...)"""
     ultimos10 = normalizar_telefono(phone)[-10:]
     gastos = []
     if ultimos10 and os.path.isdir(DATA_DIR):
         for carpeta in sorted(os.listdir(DATA_DIR)):
             if normalizar_telefono(carpeta)[-10:] == ultimos10:
-                gastos.extend(cargar_gastos(carpeta))
+                gastos.extend(cargar_gastos(carpeta, cuenta))
     return [g for g in gastos if not es_registro_pagos(g)]
 
 def descargar_media_twilio(media_url):
@@ -570,9 +597,9 @@ def procesar_audio(media_url, telefono):
         logger.error(f"Error procesando audio: {e}", exc_info=True)
         return None
 
-def huellas_vistas(telefono):
+def huellas_vistas(telefono, cuenta="principal"):
     """Huellas de las fotos que ya se procesaron (para que el Portero detecte repetidas)."""
-    archivo = f"{obtener_ruta_datos(telefono)}/imagenes_vistas.json"
+    archivo = f"{obtener_ruta_datos(telefono, cuenta)}/imagenes_vistas.json"
     if os.path.exists(archivo):
         try:
             with open(archivo, 'r', encoding='utf-8') as f:
@@ -581,18 +608,18 @@ def huellas_vistas(telefono):
             return []
     return []
 
-def marcar_vistas(telefono, huellas):
+def marcar_vistas(telefono, huellas, cuenta="principal"):
     try:
         with candado_archivos:
-            vistas = huellas_vistas(telefono)
+            vistas = huellas_vistas(telefono, cuenta)
             vistas.extend(h for h in huellas if h not in vistas)
-            escribir_json(f"{obtener_ruta_datos(telefono)}/imagenes_vistas.json", vistas[-500:])
+            escribir_json(f"{obtener_ruta_datos(telefono, cuenta)}/imagenes_vistas.json", vistas[-500:])
     except Exception as e:
         logger.warning(f"No pude guardar las huellas de fotos: {e}")
 
-def guardar_imagen_factura(telefono, webp_bytes):
-    """Guarda la foto en data/{telefono}/facturas/ y devuelve la ruta"""
-    ruta_facturas = f"{obtener_ruta_datos(telefono)}/facturas"
+def guardar_imagen_factura(telefono, webp_bytes, cuenta="principal"):
+    """Guarda la foto en data/{telefono}/{cuenta}/facturas/ y devuelve la ruta"""
+    ruta_facturas = f"{obtener_ruta_datos(telefono, cuenta)}/facturas"
     os.makedirs(ruta_facturas, exist_ok=True)
     ahora = datetime.now()
     ruta_archivo = f"{ruta_facturas}/{ahora.strftime('%Y-%m-%d')}_{ahora.strftime('%Y%m%d_%H%M%S_%f')}.webp"
@@ -626,7 +653,7 @@ def texto_fecha(fecha, origen):
         return f"📅 Fecha: {bonita} (aproximada: no vi la fecha impresa, usé hoy; revísala)"
     return f"📅 Fecha: {bonita}"
 
-def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo):
+def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo, cuenta="principal"):
     """Factura/recibo normal: un solo gasto. Si es factura de compra, también alimenta el comparador."""
     cliente = vision_response.get('cliente') or 'Cliente'
     descripcion = vision_response.get('descripcion') or 'Gasto'
@@ -648,15 +675,15 @@ def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo
         "fecha_aproximada": origen_fecha != "factura",
     }
     with candado_archivos:
-        gastos = cargar_gastos(telefono)
+        gastos = cargar_gastos(telefono, cuenta)
         gastos.append(gasto_nuevo)
-        guardar_gastos(telefono, gastos)
+        guardar_gastos(telefono, gastos, cuenta)
 
     respuesta = f"Leí {cliente}: ${pagado:,.0f}.\n{texto_fecha(fecha_gasto, origen_fecha)}"
     if es_compra:
         try:
             reportes.guardar_en_carpeta(DATA_DIR, telefono, reportes.CARPETA_COMPRAS,
-                                        dict(gasto_nuevo, movimiento="gasto", tienda=vision_response.get('tienda')))
+                                        dict(gasto_nuevo, movimiento="gasto", tienda=vision_response.get('tienda')), cuenta)
         except Exception as e:
             logger.warning(f"No pude guardar la compra en su carpeta: {e}")
         # Factura de compra: sus productos alimentan el comparador de precios de la ciudad
@@ -670,26 +697,28 @@ def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo
             logger.error(f"Error guardando precios de la factura: {e}", exc_info=True)
     return respuesta
 
-def contexto_agentes(telefono):
+def contexto_agentes(telefono, cuenta="principal"):
     """Lo que el orquestador (orchestrator.py) necesita de main para guardar cada cosa en su lugar."""
     phone_clean = normalizar_telefono(telefono)
 
     def marcar_pregunta_tabla():
-        memoria_usuarios.setdefault(phone_clean, {})['ultima_pregunta'] = 'dashboard'
-        guardar_memoria(memoria_usuarios)
+        memoria = cargar_memoria(phone_clean, cuenta)
+        memoria.setdefault(phone_clean, {})['ultima_pregunta'] = 'dashboard'
+        guardar_memoria(memoria, phone_clean, cuenta)
 
     return Contexto(
         cliente=client,
         modelo=MODELO_CLAUDE,
         phone_clean=phone_clean,
-        guardar_imagen=lambda webp: guardar_imagen_factura(telefono, webp),
-        guardar_cobro=guardar_cobro,
-        cobro_actual=lambda: obtener_cobro(phone_clean),
-        guardar_gasto=lambda vision, pagos, total, ruta: guardar_gasto_factura(telefono, vision, pagos, total, ruta),
+        cuenta=cuenta,
+        guardar_imagen=lambda webp: guardar_imagen_factura(telefono, webp, cuenta),
+        guardar_cobro=lambda pc, datos: guardar_cobro(pc, datos, cuenta),
+        cobro_actual=lambda: obtener_cobro(phone_clean, cuenta),
+        guardar_gasto=lambda vision, pagos, total, ruta: guardar_gasto_factura(telefono, vision, pagos, total, ruta, cuenta),
         guardar_transferencia=lambda vision, pagos, total, ruta, texto: guardar_transferencia(
-            telefono, vision, pagos, total, ruta, texto),
-        huellas_vistas=lambda: huellas_vistas(telefono),
-        marcar_vistas=lambda huellas: marcar_vistas(telefono, huellas),
+            telefono, vision, pagos, total, ruta, texto, cuenta),
+        huellas_vistas=lambda: huellas_vistas(telefono, cuenta),
+        marcar_vistas=lambda huellas: marcar_vistas(telefono, huellas, cuenta),
         marcar_pregunta_tabla=marcar_pregunta_tabla,
     )
 
@@ -741,10 +770,10 @@ NOMBRES_CARPETA = {"sueldo": "Sueldos", "renta": "Renta", "deuda": "Deudas", "se
                    "ingreso": "Ingresos", "compras": "Compras", "por_revisar": "Por revisar"}
 
 
-def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo, texto_usuario=""):
+def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo, texto_usuario="", cuenta="principal"):
     """
     Clasifica una transferencia por su concepto (sueldo, renta, deuda, servicios, ingreso) y la guarda en
-    data/{telefono}/{carpeta}/transacciones.json, y también en gastos.json o ingresos.json para los reportes.
+    data/{telefono}/{cuenta}/{carpeta}/transacciones.json, y también en gastos.json o ingresos.json para los reportes.
     Si el concepto no dice qué es, va a "por_revisar" y se le pregunta al usuario (no adivinamos).
     """
     concepto = vision_response.get('concepto') or ''
@@ -778,11 +807,11 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
         "fecha_origen": origen_fecha,
         "fecha_aproximada": not fecha_leida,
     }
-    reportes.guardar_en_carpeta(DATA_DIR, telefono, carpeta, transaccion)
+    reportes.guardar_en_carpeta(DATA_DIR, telefono, carpeta, transaccion, cuenta)
 
     # La misma transacción en la lista que usan los reportes (gastos.json o ingresos.json)
     if movimiento == 'ingreso':
-        archivo = f"{obtener_ruta_datos(telefono)}/ingresos.json"
+        archivo = f"{obtener_ruta_datos(telefono, cuenta)}/ingresos.json"
         ingresos = []
         if os.path.exists(archivo):
             try:
@@ -794,9 +823,9 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
         with open(archivo, 'w', encoding='utf-8') as f:
             json.dump(ingresos, f, ensure_ascii=False, indent=2)
     else:
-        gastos = cargar_gastos(telefono)
+        gastos = cargar_gastos(telefono, cuenta)
         gastos.append(transaccion)
-        guardar_gastos(telefono, gastos)
+        guardar_gastos(telefono, gastos, cuenta)
 
     flecha = "recibiste de" if movimiento == 'ingreso' else "enviaste a"
     lineas = [f"🏦 Transferencia: ${monto:,.2f}" + (f" ({flecha} {persona})" if persona else "")]
@@ -815,9 +844,9 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
     return "\n".join(lineas)
 
 
-def mover_transferencia(telefono, carpeta, server_url):
+def mover_transferencia(telefono, carpeta, server_url, cuenta="principal"):
     """Respuesta a "es renta" / "ponlo en sueldo": mueve la última transferencia a esa carpeta."""
-    resultado = reportes.mover_transaccion(DATA_DIR, telefono, carpeta)
+    resultado = reportes.mover_transaccion(DATA_DIR, telefono, carpeta, cuenta)
     if not resultado:
         return None
     t, anterior = resultado
@@ -849,16 +878,16 @@ def pedido_resumen_periodo(texto):
     return periodo
 
 
-def resumen_periodo_usuario(telefono, inicio, fin):
-    gastos, ingresos = reportes.cargar_movimientos(DATA_DIR, telefono)
+def resumen_periodo_usuario(telefono, inicio, fin, cuenta="principal"):
+    gastos, ingresos = reportes.cargar_movimientos(DATA_DIR, telefono, cuenta)
     movs, sin_fecha = reportes.movimientos_periodo(gastos, ingresos, inicio, fin)
     return reportes.resumir(movs), sin_fecha
 
 
-def responder_resumen_periodo(telefono, periodo, server_url):
+def responder_resumen_periodo(telefono, periodo, server_url, cuenta="principal"):
     """Texto de WhatsApp con totales, barras por categoría y links a PDF, Excel y panel del período."""
     phone_clean = normalizar_telefono(telefono)
-    resumen, sin_fecha = resumen_periodo_usuario(telefono, periodo['inicio'], periodo['fin'])
+    resumen, sin_fecha = resumen_periodo_usuario(telefono, periodo['inicio'], periodo['fin'], cuenta)
     texto = reportes.texto_resumen(resumen, periodo, sin_fecha)
     if resumen['movimientos']:
         q = f"desde={periodo['inicio'].isoformat()}&hasta={periodo['fin'].isoformat()}"
@@ -2895,11 +2924,11 @@ def descargar_pdf_periodo(phone):
 
 
 @app.route("/dashboard/<phone>/carpetas", methods=["GET"])
-def dashboard_carpetas(phone):
+def dashboard_carpetas(phone, cuenta="principal"):
     """Carpetas por tipo (sueldo, renta, deuda, servicios, ingreso, compras, por revisar) con sus transacciones."""
     try:
         phone_clean = normalizar_telefono(phone)
-        carpetas = reportes.cargar_carpetas(DATA_DIR, phone_clean)
+        carpetas = reportes.cargar_carpetas(DATA_DIR, phone_clean, cuenta)
         elegida = request.args.get('carpeta')
         base = f"/dashboard/{quote_plus(phone_clean)}"
         partes = [f"""<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8">

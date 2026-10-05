@@ -220,8 +220,8 @@ def clasificar_transferencia(concepto, direccion=None, texto_usuario=''):
     return {"carpeta": carpeta, "movimiento": 'ingreso' if recibida else 'gasto'}
 
 
-def ruta_carpeta(data_dir, telefono, carpeta):
-    ruta = os.path.join(data_dir, telefono, carpeta)
+def ruta_carpeta(data_dir, telefono, carpeta, cuenta="principal"):
+    ruta = os.path.join(data_dir, telefono, cuenta, carpeta)
     os.makedirs(ruta, exist_ok=True)
     return os.path.join(ruta, 'transacciones.json')
 
@@ -243,28 +243,34 @@ def _escribir(archivo, datos):
         json.dump(datos, f, ensure_ascii=False, indent=2)
 
 
-def guardar_en_carpeta(data_dir, telefono, carpeta, transaccion):
-    """Agrega la transacción a data/{telefono}/{carpeta}/transacciones.json"""
-    archivo = ruta_carpeta(data_dir, telefono, carpeta)
+def guardar_en_carpeta(data_dir, telefono, carpeta, transaccion, cuenta="principal"):
+    """Agrega la transacción a data/{telefono}/{cuenta}/{carpeta}/transacciones.json"""
+    archivo = ruta_carpeta(data_dir, telefono, carpeta, cuenta)
     datos = _leer(archivo)
     datos.append(dict(transaccion, carpeta=carpeta))
     _escribir(archivo, datos)
     return archivo
 
 
-def _carpetas_usuario(data_dir, telefono):
-    """Carpetas de datos del usuario por últimos 10 dígitos (whatsapp:+593... o 593...)."""
+def _carpetas_usuario(data_dir, telefono, cuenta="principal"):
+    """Carpetas de datos del usuario por últimos 10 dígitos, dentro de la cuenta especificada."""
     ultimos10 = re.sub(r'[^0-9]', '', telefono or '')[-10:]
     if not ultimos10 or not os.path.isdir(data_dir):
         return []
-    return [os.path.join(data_dir, c) for c in sorted(os.listdir(data_dir))
-            if re.sub(r'[^0-9]', '', c)[-10:] == ultimos10 and os.path.isdir(os.path.join(data_dir, c))]
+    # Buscar data_dir/{phone}/{cuenta}/
+    resultado = []
+    for c in sorted(os.listdir(data_dir)):
+        if re.sub(r'[^0-9]', '', c)[-10:] == ultimos10:
+            cuenta_path = os.path.join(data_dir, c, cuenta)
+            if os.path.isdir(cuenta_path):
+                resultado.append(cuenta_path)
+    return resultado
 
 
-def cargar_carpetas(data_dir, telefono):
+def cargar_carpetas(data_dir, telefono, cuenta="principal"):
     """{carpeta: [transacciones]} solo con las carpetas que tienen algo."""
     resultado = {}
-    for base in _carpetas_usuario(data_dir, telefono):
+    for base in _carpetas_usuario(data_dir, telefono, cuenta):
         for carpeta in TODAS_CARPETAS:
             datos = _leer(os.path.join(base, carpeta, 'transacciones.json'))
             if datos:
@@ -274,19 +280,19 @@ def cargar_carpetas(data_dir, telefono):
     return resultado
 
 
-def cargar_movimientos(data_dir, telefono):
+def cargar_movimientos(data_dir, telefono, cuenta="principal"):
     """(gastos, ingresos) del usuario, de todas sus carpetas (gastos.json e ingresos.json)."""
     gastos, ingresos = [], []
-    for base in _carpetas_usuario(data_dir, telefono):
+    for base in _carpetas_usuario(data_dir, telefono, cuenta):
         gastos.extend(_leer(os.path.join(base, 'gastos.json')))
         ingresos.extend(_leer(os.path.join(base, 'ingresos.json')))
     return gastos, ingresos
 
 
-def ultima_transferencia(data_dir, telefono):
+def ultima_transferencia(data_dir, telefono, cuenta="principal"):
     """(base, carpeta, transacción) de la última transferencia guardada; prefiere las por revisar."""
     candidatos = []
-    for base in _carpetas_usuario(data_dir, telefono):
+    for base in _carpetas_usuario(data_dir, telefono, cuenta):
         for carpeta in TODAS_CARPETAS:
             if carpeta == CARPETA_COMPRAS:
                 continue
@@ -298,12 +304,12 @@ def ultima_transferencia(data_dir, telefono):
     return base, carpeta, t
 
 
-def mover_transaccion(data_dir, telefono, nueva_carpeta):
+def mover_transaccion(data_dir, telefono, nueva_carpeta, cuenta="principal"):
     """
     Mueve la última transferencia (la por revisar primero) a otra carpeta y actualiza su
     categoría en gastos.json / ingresos.json. Devuelve (transacción, carpeta_anterior) o None.
     """
-    encontrada = ultima_transferencia(data_dir, telefono)
+    encontrada = ultima_transferencia(data_dir, telefono, cuenta)
     if not encontrada:
         return None
     base, carpeta, t = encontrada
@@ -315,7 +321,7 @@ def mover_transaccion(data_dir, telefono, nueva_carpeta):
     _escribir(destino, _leer(destino) + [dict(t, carpeta=nueva_carpeta, revisar=False)])
 
     # La lista de gastos/ingresos (de donde salen los reportes) se mantiene igual a la carpeta
-    for base_lista in _carpetas_usuario(data_dir, telefono):
+    for base_lista in _carpetas_usuario(data_dir, telefono, cuenta):
         for nombre in ('gastos.json', 'ingresos.json'):
             archivo = os.path.join(base_lista, nombre)
             lista = _leer(archivo)

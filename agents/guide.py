@@ -23,8 +23,8 @@ class Guía:
         ]
         return any(p in texto_lower for p in palabras_clave)
 
-    def responder(self, texto, phone, memoria, modelo="claude-3-5-sonnet-20241022"):
-        """Generate guide response for user question."""
+    def responder(self, texto, phone, memoria, modelo="claude-3-5-sonnet-20241022", cuenta="principal"):
+        """Generate guide response for user question. Cuenta parameter for future account-aware responses."""
         # Use Claude to understand the question and provide step-by-step guidance
         # Return WhatsApp-formatted response with emojis and numbered steps
         prompt = f"""Eres el agente Guía de Yoly, un bot contable de WhatsApp.
