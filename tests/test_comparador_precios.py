@@ -15,7 +15,21 @@ OTRO = "whatsapp:+593987654321"
 @pytest.fixture
 def entorno(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(main, "guardar_memoria", lambda m: None)
+
+    # Mock memory with proper per-account tracking
+    memoria_store = {}
+    def mock_guardar_memoria(m, phone="", cuenta="principal"):
+        if phone:
+            key = f"{phone}_{cuenta}"
+            memoria_store[key] = m
+    def mock_cargar_memoria(phone="", cuenta="principal"):
+        if phone:
+            key = f"{phone}_{cuenta}"
+            return memoria_store.get(key, {})
+        return {}
+
+    monkeypatch.setattr(main, "guardar_memoria", mock_guardar_memoria)
+    monkeypatch.setattr(main, "cargar_memoria", mock_cargar_memoria)
     monkeypatch.setattr(main, "memoria_usuarios", {})
     monkeypatch.setattr(main, "temp_gastos", {})
     monkeypatch.setattr(main, "temp_productos", {})

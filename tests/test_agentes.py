@@ -142,7 +142,21 @@ def test_contadora_no_guarda_duplicados():
 @pytest.fixture
 def entorno(tmp_path, monkeypatch):
     monkeypatch.setattr(main, "DATA_DIR", str(tmp_path))
-    monkeypatch.setattr(main, "guardar_memoria", lambda m: None)
+
+    # Mock memory with proper per-account tracking
+    memoria_store = {}
+    def mock_guardar_memoria(m, phone="", cuenta="principal"):
+        if phone:
+            key = f"{phone}_{cuenta}"
+            memoria_store[key] = m
+    def mock_cargar_memoria(phone="", cuenta="principal"):
+        if phone:
+            key = f"{phone}_{cuenta}"
+            return memoria_store.get(key, {})
+        return {}
+
+    monkeypatch.setattr(main, "guardar_memoria", mock_guardar_memoria)
+    monkeypatch.setattr(main, "cargar_memoria", mock_cargar_memoria)
     monkeypatch.setattr(main, "memoria_usuarios", {})
     fotos = {"https://m/1": b"pagina1", "https://m/2": b"pagina2"}
     monkeypatch.setattr(main, "descargar_media_twilio", lambda url: fotos[url])
@@ -236,7 +250,7 @@ def test_una_foto_que_no_contesta_no_traba_las_demas(monkeypatch):
 
     claude.messages.create.side_effect = crear
     ctx = main.Contexto(
-        cliente=claude, modelo="m", phone_clean=PHONE, guardar_imagen=lambda img: "/tmp/foto.webp",
+        cliente=claude, modelo="m", phone_clean=PHONE, cuenta="principal", guardar_imagen=lambda img: "/tmp/foto.webp",
         guardar_cobro=None, cobro_actual=lambda: None,
         guardar_gasto=lambda v, p, t, r: gastos.append(t) or f"Leí ${t}", guardar_transferencia=None,
         huellas_vistas=lambda: [], marcar_vistas=lambda h: None, marcar_pregunta_tabla=lambda: None)
@@ -279,8 +293,8 @@ def test_orquestador_jefe_usa_los_4_agentes():
     claude.messages.create.side_effect = [respuesta_claude({"tipos": ["libretita_deuda"]}), respuesta_claude(LIBRETA)]
     guardados, vistas = [], []
     ctx = main.Contexto(
-        cliente=claude, modelo="m", phone_clean=PHONE, guardar_imagen=lambda img: "/tmp/foto.webp",
-        guardar_cobro=lambda p, d: guardados.append(d), cobro_actual=lambda: None,
+        cliente=claude, modelo="m", phone_clean=PHONE, cuenta="principal", guardar_imagen=lambda img: "/tmp/foto.webp",
+        guardar_cobro=lambda p, d, cuenta="principal": guardados.append(d), cobro_actual=lambda: None,
         guardar_gasto=None, guardar_transferencia=None, huellas_vistas=lambda: vistas,
         marcar_vistas=vistas.extend, marcar_pregunta_tabla=lambda: None)
     jefe = OrquestadorYoly()
