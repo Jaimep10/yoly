@@ -107,6 +107,7 @@ class OrquestadorYoly:
         fechas_foto: fecha EXIF de cada foto (o None), respaldo si la factura no trae fecha impresa.
         Devuelve el texto de la respuesta para WhatsApp.
         0. Guía: si es una pregunta sin fotos, responde directamente.
+        0b. Menú: si es una respuesta a menú guiado (1, 2, 3, 4, pdf, excel).
         1. Portero: qué es, cuántas fotos, si es repetida.
         2. Ojo: lee cada foto (fecha, monto, método, cliente).
         3. Calculadora: suma en Python, saldo = deuda - pagado, duplicados por hash.
@@ -119,6 +120,16 @@ class OrquestadorYoly:
         if not images and self.guia.es_pregunta(texto):
             logger.info(f"[{phone}][{cuenta}] Pregunta detectada: '{texto[:50]}'")
             return self.guia.responder(texto, phone, {}, cuenta=cuenta)
+
+        # SECOND: Check if it's a menu response (1, 2, 3, 4, pdf, excel)
+        if not images and texto.strip().lower() in ["1", "2", "3", "4", "pdf", "excel"]:
+            logger.info(f"[{phone}][{cuenta}] Respuesta a menú detectada: '{texto}'")
+            resultado_menu = self.guia.parse_respuesta_menu(phone, texto, cuenta)
+            if resultado_menu["tipo"]:
+                # Aquí se generaría PDF/Excel o resumen según la opción
+                # Por ahora, retornar mensaje indicativo
+                accion = resultado_menu.get("accion", "")
+                return f"📋 {accion} para {cuenta}\n\n(Funcionalidad en desarrollo: {accion})"
 
         ctx = ctx or self.herramientas(phone, cuenta)
         return self._procesar(list(images), texto or "", ctx, info, fechas_foto)
