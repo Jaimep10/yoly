@@ -266,21 +266,28 @@ memoria_usuarios = cargar_memoria()
 
 # ==================== FINANCIAL CONTEXT PERSISTENCE ====================
 
-def cargar_contexto_financiero():
-    """Carga el contexto financiero acumulado"""
-    if os.path.exists(FINANCIAL_CONTEXT_FILE):
+def archivo_contexto_financiero(telefono=None, cuenta="principal"):
+    """Un archivo por usuario y cuenta: antes era uno solo para todos y se mezclaban los números de la gente."""
+    if not telefono:
+        return FINANCIAL_CONTEXT_FILE
+    return f"{obtener_ruta_datos(telefono, cuenta)}/{FINANCIAL_CONTEXT_FILE}"
+
+def cargar_contexto_financiero(telefono=None, cuenta="principal"):
+    """Carga el contexto financiero acumulado del usuario"""
+    archivo = archivo_contexto_financiero(telefono, cuenta)
+    if os.path.exists(archivo):
         try:
-            with open(FINANCIAL_CONTEXT_FILE, 'r', encoding='utf-8') as f:
+            with open(archivo, 'r', encoding='utf-8') as f:
                 return json.load(f)
         except Exception as e:
             print(f"Error cargando contexto financiero: {e}")
             return {'ingresos_mensuales': 0, 'gastos': {}}
     return {'ingresos_mensuales': 0, 'gastos': {}}
 
-def guardar_contexto_financiero(contexto):
-    """Guarda el contexto financiero acumulado"""
+def guardar_contexto_financiero(contexto, telefono=None, cuenta="principal"):
+    """Guarda el contexto financiero acumulado del usuario"""
     try:
-        with open(FINANCIAL_CONTEXT_FILE, 'w', encoding='utf-8') as f:
+        with open(archivo_contexto_financiero(telefono, cuenta), 'w', encoding='utf-8') as f:
             json.dump(contexto, f, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
@@ -661,8 +668,37 @@ def texto_fecha(fecha, origen):
         return f"📅 Fecha: {bonita} (aproximada: no vi la fecha impresa, usé hoy; revísala)"
     return f"📅 Fecha: {bonita}"
 
-def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo, cuenta="principal"):
-    """Factura/recibo normal: un solo gasto. Si es factura de compra, también alimenta el comparador."""
+def guardar_ingreso_factura(telefono, vision_response, pagos, monto, ruta_archivo, texto_usuario, cuenta="principal"):
+    """Factura/recibo que el usuario dice que es una venta o un cobro: va a ingresos.json, no a gastos."""
+    quien = vision_response.get('cliente') or vision_response.get('tienda') or ''
+    descripcion = vision_response.get('descripcion') or 'Ingreso'
+    fecha, origen_fecha = fecha_documento(vision_response, pagos)
+    ingreso = {
+        "id": f"ing_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+        "fecha": fecha,
+        "timestamp": datetime.now().isoformat(),
+        "descripcion": descripcion,
+        "categoria": "ventas" if re.search(r'\b(vend|venta)', reportes.sin_acentos(texto_usuario).lower()) else "ingreso",
+        "movimiento": "ingreso",
+        "monto": monto,
+        "cliente": quien,
+        "factura_path": ruta_archivo,
+        "fecha_origen": origen_fecha,
+        "fecha_aproximada": origen_fecha != "factura",
+    }
+    with candado_archivos:
+        archivo = f"{obtener_ruta_datos(telefono, cuenta)}/ingresos.json"
+        ingresos = reportes._leer(archivo)
+        ingresos.append(ingreso)
+        escribir_json(archivo, ingresos)
+    return (f"💰 Lo anoté como INGRESO (tú escribiste que es una venta/cobro): ${monto:,.2f}"
+            + (f" de {quien}" if quien else "") + f".\n{texto_fecha(fecha, origen_fecha)}")
+
+def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo, cuenta="principal", texto_usuario=""):
+    """Factura/recibo normal: un solo gasto. Si es factura de compra, también alimenta el comparador.
+    Si el usuario escribió junto a la foto que es una venta o un cobro ("me pagaron", "venta"), es un ingreso."""
+    if reportes.direccion_por_texto(texto_usuario) == 'recibida':
+        return guardar_ingreso_factura(telefono, vision_response, pagos, pagado, ruta_archivo, texto_usuario, cuenta)
     cliente = vision_response.get('cliente') or 'Cliente'
     descripcion = vision_response.get('descripcion') or 'Gasto'
     es_compra = vision_response.get('tipo') == 'factura_compra'
@@ -705,7 +741,7 @@ def guardar_gasto_factura(telefono, vision_response, pagos, pagado, ruta_archivo
             logger.error(f"Error guardando precios de la factura: {e}", exc_info=True)
     return respuesta
 
-def contexto_agentes(telefono, cuenta="principal"):
+def contexto_agentes(telefono, cuenta="principal", texto_usuario=""):
     """Lo que el orquestador (orchestrator.py) necesita de main para guardar cada cosa en su lugar."""
     phone_clean = normalizar_telefono(telefono)
 
@@ -722,7 +758,8 @@ def contexto_agentes(telefono, cuenta="principal"):
         guardar_imagen=lambda webp: guardar_imagen_factura(telefono, webp, cuenta),
         guardar_cobro=lambda pc, datos: guardar_cobro(pc, datos, cuenta),
         cobro_actual=lambda: obtener_cobro(phone_clean, cuenta),
-        guardar_gasto=lambda vision, pagos, total, ruta: guardar_gasto_factura(telefono, vision, pagos, total, ruta, cuenta),
+        guardar_gasto=lambda vision, pagos, total, ruta: guardar_gasto_factura(telefono, vision, pagos, total, ruta, cuenta,
+                                                                                texto_usuario),
         guardar_transferencia=lambda vision, pagos, total, ruta, texto: guardar_transferencia(
             telefono, vision, pagos, total, ruta, texto, cuenta),
         huellas_vistas=lambda: huellas_vistas(telefono, cuenta),
@@ -759,7 +796,8 @@ def procesar_fotos_whatsapp(media_urls, telefono, texto_usuario="", info=None, c
             if len(media_urls) > 1:
                 return "❌ No pude descargar las fotos. Intenta de nuevo."
             return "❌ No pude descargar la imagen. Intenta de nuevo."
-        texto = orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info, fechas_foto=fechas_foto, cuenta=cuenta)
+        texto = orquestador.handle_whatsapp(telefono, imagenes, texto_usuario, info, fechas_foto=fechas_foto, cuenta=cuenta,
+                                            ctx=contexto_agentes(telefono, cuenta, texto_usuario))
         if fallidas:
             nums = ", ".join(str(n) for n in fallidas)
             texto = f"❌ No pude descargar la foto {nums}. Mándala otra vez.\n\n" + texto
@@ -802,7 +840,8 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
     descripcion = concepto or vision_response.get('descripcion') or 'Transferencia'
     if persona and persona.lower() not in descripcion.lower():
         descripcion = f"{descripcion} - {persona}"
-    revisar = carpeta == reportes.CARPETA_REVISAR or not fecha_leida
+    sin_direccion = bool(clase.get('direccion_desconocida'))
+    revisar = carpeta == reportes.CARPETA_REVISAR or not fecha_leida or sin_direccion
 
     transaccion = {
         "id": f"transf_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
@@ -818,6 +857,7 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
         "referencia": vision_response.get('referencia') or '',
         "factura_path": ruta_archivo,
         "revisar": revisar,
+        "direccion_desconocida": sin_direccion,
         "fecha_origen": origen_fecha,
         "fecha_aproximada": not fecha_leida,
     }
@@ -841,19 +881,25 @@ def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo,
         gastos.append(transaccion)
         guardar_gastos(telefono, gastos, cuenta)
 
-    flecha = "recibiste de" if movimiento == 'ingreso' else "enviaste a"
+    if sin_direccion:
+        flecha = "con"
+    else:
+        flecha = "recibiste de" if movimiento == 'ingreso' else "enviaste a"
     lineas = [f"🏦 Transferencia: ${monto:,.2f}" + (f" ({flecha} {persona})" if persona else "")]
     if concepto:
         lineas.append(f"Concepto: {concepto}")
     lineas.append(texto_fecha(fecha, origen_fecha))
-    if carpeta == reportes.CARPETA_REVISAR:
+    if sin_direccion:
+        lineas.append("")
+        lineas.append("❓ En la foto no se ve si este dinero ENTRÓ o SALIÓ, así que no lo sumé ni a ingresos ni a gastos.")
+        lineas.append("Respóndeme \"es ingreso\" si lo recibiste, o \"es renta\" / \"es sueldo\" / \"es deuda\" / "
+                      "\"es servicios\" si lo pagaste.")
+    elif carpeta == reportes.CARPETA_REVISAR:
         lineas.append("")
         lineas.append("❓ No sé si es sueldo, renta, deuda o servicios, así que la guardé en *Por revisar*.")
         lineas.append("Respóndeme por ejemplo \"es renta\" o \"es sueldo\" y la muevo.")
     else:
         lineas.append(f"{reportes.EMOJI_CARPETA.get(carpeta, '📁')} La guardé en la carpeta *{NOMBRES_CARPETA[carpeta]}*.")
-        if not direccion:
-            lineas.append("(No se ve si la enviaste o la recibiste; la tomé como dinero que enviaste.)")
         lineas.append("Si no es eso, dime por ejemplo \"es deuda\" y la cambio.")
     return "\n".join(lineas)
 
@@ -892,13 +938,17 @@ def pedido_resumen_periodo(texto):
     return periodo
 
 
-def resumen_periodo_usuario(telefono, inicio, fin, cuenta="principal"):
+def resumen_periodo_usuario(telefono, inicio, fin, cuenta=None):
+    """Ingresos y gastos guardados entre dos fechas. Sin cuenta: la cuenta activa del usuario
+    (antes siempre "principal", y quien guardaba en "negocio" veía reportes vacíos o de otra cuenta)."""
+    if cuenta is None:
+        cuenta = obtener_cuenta_activa(normalizar_telefono(telefono))
     gastos, ingresos = reportes.cargar_movimientos(DATA_DIR, telefono, cuenta)
     movs, sin_fecha = reportes.movimientos_periodo(gastos, ingresos, inicio, fin)
     return reportes.resumir(movs), sin_fecha
 
 
-def responder_resumen_periodo(telefono, periodo, server_url, cuenta="principal"):
+def responder_resumen_periodo(telefono, periodo, server_url, cuenta=None):
     """Texto de WhatsApp con totales, barras por categoría y links a PDF, Excel y panel del período."""
     phone_clean = normalizar_telefono(telefono)
     resumen, sin_fecha = resumen_periodo_usuario(telefono, periodo['inicio'], periodo['fin'], cuenta)
@@ -909,6 +959,68 @@ def responder_resumen_periodo(telefono, periodo, server_url, cuenta="principal")
                   f"\n📊 Excel: {server_url}/download/periodo/{phone_clean}/excel?{q}"
                   f"\n🌐 Panel: {server_url}/dashboard/{phone_clean}/periodo?{q}")
     return texto
+
+
+def guardar_movimiento_texto(telefono, movimiento, cuenta="principal"):
+    """Guarda en ingresos.json o gastos.json lo que el usuario escribió y le repite exactamente qué anotó."""
+    es_ingreso = movimiento['tipo'] == 'ingreso'
+    registro = {
+        "id": f"txt_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}",
+        "fecha": movimiento['fecha'],
+        "timestamp": datetime.now().isoformat(),
+        "descripcion": movimiento['descripcion'],
+        "categoria": movimiento['categoria'],
+        "movimiento": movimiento['tipo'],
+        "monto": movimiento['monto'],
+        "origen": "mensaje",
+    }
+    with candado_archivos:
+        archivo = f"{obtener_ruta_datos(telefono, cuenta)}/{'ingresos' if es_ingreso else 'gastos'}.json"
+        lista = reportes._leer(archivo)
+        lista.append(registro)
+        escribir_json(archivo, lista)
+    fecha = datetime.strptime(movimiento['fecha'], '%Y-%m-%d').strftime('%d/%m/%Y')
+    titulo = "💰 Anoté un INGRESO" if es_ingreso else "💸 Anoté un GASTO"
+    return (f"{titulo} de ${movimiento['monto']:,.2f}\n"
+            f"📁 Categoría: {movimiento['categoria'].replace('_', ' ')}\n📅 Fecha: {fecha}\n\n"
+            "Si algo está mal, dímelo y lo corrijo.")
+
+
+# Respuesta libre: aquí Claude NO ve los datos del usuario, así que no puede dar ni confirmar números.
+SISTEMA_CHARLA = """Eres Yoly, una asistente contable amable que responde corto y en español.
+En esta conversación NO tienes acceso a los ingresos, gastos, facturas ni saldos del usuario.
+Reglas que nunca rompes:
+- NUNCA des montos, totales, saldos, porcentajes ni fechas de movimientos del usuario: no los conoces.
+- NUNCA digas que guardaste, anotaste, registraste, borraste o enviaste algo (PDF, Excel, link): tú no lo hiciste.
+- Si pregunta por sus números o reportes, dile que escriba "resumen de este mes" o "excel".
+- Si quiere anotar algo, dile que escriba un movimiento por mensaje, por ejemplo "me pagaron 300" (ingreso)
+  o "pagué 50 de luz" (gasto), o que mande la foto de la factura.
+- Un ingreso es dinero que ENTRA (ventas, sueldo que recibe, cobros). Un gasto o egreso es dinero que SALE."""
+
+
+def enlace_descarga_mes(phone_clean, server_url, formato):
+    """(url, qué contiene) del PDF/Excel del mes con ingresos, gastos y semanas; si no hay movimientos
+    pero sí una libretita de deuda, su estado de cuenta; (None, None) si no hay nada guardado."""
+    periodo = reportes.parsear_periodo('este mes')
+    resumen, _ = resumen_periodo_usuario(phone_clean, periodo['inicio'], periodo['fin'])
+    if resumen['movimientos']:
+        q = f"desde={periodo['inicio'].isoformat()}&hasta={periodo['fin'].isoformat()}"
+        return (f"{server_url}/download/periodo/{phone_clean}/{formato}?{q}",
+                f"del {periodo['etiqueta']} ({resumen['num_ingresos']} ingresos y {resumen['num_gastos']} gastos)")
+    if obtener_cobro(phone_clean):
+        return f"{server_url}/download/{formato}/{phone_clean}", "con el estado de cuenta de tu deuda"
+    return None, None
+
+
+def mensaje_descarga(phone_clean, server_url, formato):
+    """Respuesta a "excel" / "pdf": el link real, o decir que no hay datos (nunca un archivo inventado)."""
+    nombre = "PDF" if formato == 'pdf' else "Excel"
+    url, contenido = enlace_descarga_mes(phone_clean, server_url, formato)
+    if not url:
+        return (f"Todavía no tengo ingresos ni gastos guardados este mes, así que no armé el {nombre} "
+                "(no voy a llenarlo con datos inventados).\n"
+                "Mándame fotos de tus facturas o escribe por ejemplo \"me pagaron 300\" o \"pagué 50 de luz\".")
+    return f"📊 Tu {nombre} {contenido}:\n{url}"
 
 
 def reclasificar_gasto(texto, telefono, historial=None):
@@ -1452,7 +1564,8 @@ def procesar_analisis_financiero(texto_usuario, telefono):
     Mantiene contexto acumulado en archivos JSON.
     """
     # Cargar contexto anterior
-    contexto = cargar_contexto_financiero()
+    cuenta = obtener_cuenta_activa(normalizar_telefono(telefono))
+    contexto = cargar_contexto_financiero(telefono, cuenta)
     ingresos_previos = contexto.get('ingresos_mensuales', 0)
     gastos_previos = contexto.get('gastos', {})
 
@@ -1460,7 +1573,9 @@ def procesar_analisis_financiero(texto_usuario, telefono):
     response = client.messages.create(
         model=MODELO_CLAUDE,
         max_tokens=500,
-        system="Extrae ingresos y gastos del mensaje. Devuelve JSON: {\"ingresos\": número, \"gastos\": {\"categoria\": monto}}",
+        system=("Extrae ingresos y gastos del mensaje. Devuelve JSON: {\"ingresos\": número, \"gastos\": {\"categoria\": monto}}. "
+                "Usa SOLO números que el usuario escribió en el mensaje. Si no dice un ingreso, ingresos = 0. "
+                "Si no dice gastos, gastos = {}. No estimes ni completes nada."),
         messages=[{"role": "user", "content": texto_usuario}]
     )
 
@@ -1493,7 +1608,7 @@ def procesar_analisis_financiero(texto_usuario, telefono):
             gastos_previos[categoria] = cantidad
 
     contexto['gastos'] = gastos_previos
-    guardar_contexto_financiero(contexto)
+    guardar_contexto_financiero(contexto, telefono, cuenta)
 
     # Calcular totales
     ingresos_totales = contexto['ingresos_mensuales']
@@ -1694,64 +1809,6 @@ def generar_informe_metas():
     # Agregar gráfico
     c.showPage()
     c.drawImage(chart_path, 30, height - 400, width=530, height=320)
-
-    c.save()
-    publicar_pdf(tmp_path, pdf_path)
-    return pdf_path
-
-def generar_informe_gastos():
-    """Genera un PDF con gráfico de gastos de ejemplo"""
-    pdf_path = '/tmp/informe_gastos.pdf'
-    tmp_path = ruta_temporal(pdf_path)
-    chart_path = '/tmp/gastos_chart.png'
-
-    # Datos de ejemplo
-    categories = ["Alimentos", "Transporte", "Entretenimiento", "Servicios"]
-    amounts = [150.00, 80.00, 50.00, 120.00]
-
-    # Generar gráfico con matplotlib
-    plt.figure(figsize=(8, 6))
-    colors_list = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A']
-    plt.pie(amounts, labels=categories, autopct='%1.1f%%', startangle=140, colors=colors_list)
-    plt.title('Informe de Gastos Mensuales', fontsize=14, fontweight='bold')
-    plt.savefig(chart_path, dpi=100, bbox_inches='tight')
-    plt.close()
-
-    # Crear PDF con reportlab
-    c = canvas.Canvas(tmp_path, pagesize=letter)
-    width, height = letter
-
-    # Título
-    c.setFont("Helvetica-Bold", 16)
-    c.drawString(50, height - 50, "Informe de Gastos")
-
-    # Subtítulo
-    c.setFont("Helvetica", 12)
-    c.drawString(50, height - 80, "Resumen de gastos mensuales")
-
-    # Tabla de datos
-    c.setFont("Helvetica-Bold", 11)
-    y_pos = height - 120
-    c.drawString(50, y_pos, "Categoría")
-    c.drawString(250, y_pos, "Monto")
-    c.drawString(400, y_pos, "Porcentaje")
-
-    c.setFont("Helvetica", 10)
-    total = sum(amounts)
-    y_pos -= 20
-    for category, amount in zip(categories, amounts):
-        percentage = (amount / total) * 100
-        c.drawString(50, y_pos, category)
-        c.drawString(250, y_pos, f"${amount:.2f}")
-        c.drawString(400, y_pos, f"{percentage:.1f}%")
-        y_pos -= 20
-
-    c.setFont("Helvetica-Bold", 11)
-    c.drawString(50, y_pos - 10, "Total")
-    c.drawString(250, y_pos - 10, f"${total:.2f}")
-
-    # Agregar gráfico
-    c.drawImage(chart_path, 50, 50, width=400, height=300)
 
     c.save()
     publicar_pdf(tmp_path, pdf_path)
@@ -2099,27 +2156,12 @@ def generar_excel_gastos(phone):
                 f.write(agent_reporter.excel_cobro(cobro))
             return excel_path
 
-        from openpyxl.styles import Font, PatternFill
-        gastos_mes = gastos_del_mes(phone_clean)
-        if not gastos_mes:
+        # Sin libretita: Excel del mes con ingresos Y gastos (antes solo gastos y de la cuenta principal)
+        periodo = reportes.parsear_periodo('este mes')
+        resumen, _ = resumen_periodo_usuario(phone_clean, periodo['inicio'], periodo['fin'])
+        if not resumen['movimientos']:
             return None
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Transacciones"
-        ws.append(["Fecha", "Descripción", "Categoría", "Monto"])
-        for celda in ws[ws.max_row]:
-            celda.font = Font(bold=True, color="FFFFFF")
-            celda.fill = PatternFill("solid", fgColor="1E40AF")
-        for g in gastos_mes:
-            ws.append([g.get('fecha', ''), g.get('descripcion', ''), g.get('categoria', 'otro'), g.get('monto', 0)])
-        ws.append(["", "", "TOTAL", sum(g.get('monto', 0) for g in gastos_mes)])
-        for col in ws.columns:
-            ws.column_dimensions[col[0].column_letter].width = max(12, max(len(str(c.value or '')) for c in col) + 2)
-        for fila in ws.iter_rows(min_row=2):
-            for celda in fila:
-                if isinstance(celda.value, (int, float)) and celda.column_letter != 'A':
-                    celda.number_format = '"$"#,##0.00'
-        wb.save(excel_path)
+        reportes.generar_excel(resumen, periodo, excel_path)
         return excel_path
     except Exception as e:
         logger.error(f"Error generando Excel: {e}", exc_info=True)
@@ -2130,10 +2172,6 @@ def generar_pdf_dashboard(phone):
     try:
         phone_clean = normalizar_telefono(phone)
         cobro = obtener_cobro(phone_clean)
-        gastos_mes = [] if cobro else gastos_del_mes(phone_clean)
-        if not cobro and not gastos_mes:
-            return None
-
         hoy = datetime.now()
         pdf_path = f"/tmp/gastos_{phone_clean}_{hoy.strftime('%Y%m%d')}.pdf"
         tmp_path = ruta_temporal(pdf_path)
@@ -2143,22 +2181,12 @@ def generar_pdf_dashboard(phone):
             publicar_pdf(tmp_path, pdf_path)
             return pdf_path
 
-        doc = SimpleDocTemplate(tmp_path, pagesize=letter)
-        styles = getSampleStyleSheet()
-        title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=15,
-                                     textColor=colors.HexColor('#1e40af'), spaceAfter=6)
-        story = [Paragraph("Reporte de Gastos del Mes", title_style),
-                 Paragraph(f"Fecha: {hoy.strftime('%d/%m/%Y')}", styles['Normal']),
-                 Spacer(1, 0.3*inch)]
-        data = [['Fecha', 'Descripción', 'Categoría', 'Monto']]
-        for g in gastos_mes:
-            data.append([g.get('fecha', ''), g.get('descripcion', '')[:30], g.get('categoria', 'otro'), f"${g.get('monto', 0):,.2f}"])
-        data.append(['', '', 'TOTAL', f"${sum(g.get('monto', 0) for g in gastos_mes):,.2f}"])
-        tabla = Table(data)
-        tabla.setStyle(estilo_tabla('#1e40af', '#f3f4f6'))
-        story.append(tabla)
-
-        doc.build(story)
+        # Sin libretita: PDF del mes con ingresos Y gastos, por categoría y por semana
+        periodo = reportes.parsear_periodo('este mes')
+        resumen, _ = resumen_periodo_usuario(phone_clean, periodo['inicio'], periodo['fin'])
+        if not resumen['movimientos']:
+            return None
+        reportes.generar_pdf(resumen, periodo, tmp_path)
         publicar_pdf(tmp_path, pdf_path)
         return pdf_path
     except Exception as e:
@@ -2183,11 +2211,6 @@ def health():
         "service": "Yoly Bot",
         "timestamp": datetime.now().isoformat()
     }), 200
-
-@app.route("/download/informe_gastos.pdf", methods=["GET"])
-def download_informe():
-    """Sirve el PDF de informe de gastos"""
-    return servir_pdf('/tmp/informe_gastos.pdf', 'informe_gastos.pdf')
 
 @app.route("/download/presupuesto_analisis.pdf", methods=["GET"])
 def download_presupuesto():
@@ -3866,34 +3889,15 @@ Te falta: ${cobro['saldo']:,.0f}
 
             # Generar respuesta rápida
             phone_clean = normalizar_telefono(from_number)
-            if 'pdf' in msg_lower:
-                try:
-                    pdf_path = generar_pdf_dashboard(phone_clean)
-                    if pdf_path and os.path.exists(pdf_path):
-                        pdf_url = f"{server_url}/download/pdf/{phone_clean}"
-                        twilio_client.messages.create(
-                            from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
-                            to=from_number,
-                            body="📄 Aquí está tu PDF del mes:",
-                            media_url=[pdf_url]
-                        )
-                        resp.message("PDF descargado ✓")
-                        return
-                except Exception as e:
-                    logger.error(f"Error generando PDF: {e}")
-
-            if 'excel' in msg_lower:
-                if not HAS_OPENPYXL:
+            # PDF o Excel: siempre se contesta aquí. Antes, si no había datos o fallaba, el mensaje
+            # caía a Claude, que respondía "aquí está tu Excel" sin que existiera ninguno.
+            if 'pdf' in msg_lower or 'excel' in msg_lower:
+                formato = 'pdf' if 'pdf' in msg_lower else 'excel'
+                if formato == 'excel' and not HAS_OPENPYXL:
                     resp.message("Excel no está disponible en este momento. Usa el PDF en su lugar.")
                     return
-                try:
-                    excel_path = generar_excel_gastos(phone_clean)
-                    if excel_path and os.path.exists(excel_path):
-                        excel_url = f"{server_url}/download/excel/{phone_clean}"
-                        resp.message(f"Tu Excel está listo: {excel_url}")
-                        return
-                except Exception as e:
-                    logger.error(f"Error generando Excel: {e}")
+                resp.message(mensaje_descarga(phone_clean, server_url, formato))
+                return
 
             # Si pide link, dashboard, panel o descargar
             if any(keyword in msg_lower for keyword in ['link', 'panel', 'dashboard', 'tabla']):
@@ -3965,6 +3969,18 @@ Te falta: ${cobro['saldo']:,.0f}
                 resultado = borrar_gasto(from_number, incoming_msg)
                 resp.message(resultado)
                 return
+
+        # ==================== INGRESO O GASTO ESCRITO ====================
+        # "me pagaron 300 por una venta" -> ingreso; "pagué 50 de luz" -> gasto. Sin IA: el monto es el
+        # que escribió el usuario. Antes estos mensajes caían a Claude, que decía "¡registrado!" sin guardar nada.
+        movimiento = reportes.movimiento_de_texto(incoming_msg)
+        if movimiento:
+            responder(resp, guardar_movimiento_texto(from_number, movimiento, cuenta))
+            return
+        if reportes.menciona_movimiento(incoming_msg) and not reportes.parsear_periodo(reportes.sin_acentos(incoming_msg).lower()):
+            resp.message("Para no anotar nada mal, mándame un movimiento por mensaje con su monto.\n"
+                         "Ejemplos: \"me pagaron 300 por una venta\" (ingreso) o \"pagué 50 de luz\" (gasto).")
+            return
 
         # ==================== CORTE/REPORTE ====================
 
@@ -4101,27 +4117,12 @@ Dime cada dato claramente. NUNCA usaré números que no menciones explícitament
 
         # ==================== BUDGET & EXPENSE KEYWORDS ====================
 
-        # Detectar si el usuario pide "informe de gastos"
+        # "informe de gastos": el resumen REAL del mes (antes mandaba un PDF con datos de ejemplo:
+        # Alimentos $150, Transporte $80, Entretenimiento $50, Servicios $120, iguales para todos)
         if 'informe de gastos' in msg_lower:
             logger.info(f"Expense report request from {from_number}")
-            try:
-                generar_informe_gastos()
-                pdf_url = f"{server_url}/download/informe_gastos.pdf"
-                logger.info(f"Expense report generated: {pdf_url}")
-
-                twilio_client.messages.create(
-                    from_=os.environ.get('TWILIO_WHATSAPP_NUMBER'),
-                    to=from_number,
-                    body="Aquí está tu informe de gastos:",
-                    media_url=[pdf_url]
-                )
-                logger.info(f"Expense report sent to {from_number}")
-                resp.message("Informe de gastos enviado. Descárgalo desde el enlace.")
-                return
-            except Exception as e:
-                logger.error(f"Error generando informe de gastos: {e}", exc_info=True)
-                resp.message(f"Error al generar informe: {str(e)}")
-                return
+            responder(resp, responder_resumen_periodo(from_number, reportes.parsear_periodo('este mes'), server_url))
+            return
 
         # Detectar palabras clave para asesor financiero
         financial_keywords = ['presupuesto', 'gastos', 'asesor', 'ahorro']
@@ -4167,7 +4168,7 @@ Dime cada dato claramente. NUNCA usaré números que no menciones explícitament
         response = client.messages.create(
             model=MODELO_CLAUDE,
             max_tokens=500,
-            system="Eres Yoly, un asistente virtual amable, útil, que responde corto y en español. Eres especialista en finanzas personales y ayudas a tus usuarios a gestionar sus metas financieras.",
+            system=SISTEMA_CHARLA,
             messages=[{"role": "user", "content": incoming_msg}]
         )
         bot_response = response.content[0].text

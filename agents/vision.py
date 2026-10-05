@@ -9,30 +9,33 @@ logger = logging.getLogger(__name__)
 
 PROMPT = """Eres OCR de libretita de cobros y facturas. Extrae TODO lo que veas en la imagen.
 
-Devuelve SOLO JSON valido, sin explicaciones:
+Devuelve SOLO JSON valido, sin explicaciones, con esta forma (los valores <...> son
+marcadores: reemplazalos por lo que VES en la imagen, o null si no aparece):
 
 {
-  "cliente": "Maria Cristina",
-  "deuda": 3000,
+  "cliente": <nombre escrito en la imagen o null>,
+  "deuda": <deuda total escrita o null>,
   "pagos": [
-    {"fecha": "2026-01-03", "monto": 200, "metodo": "efectivo", "nota": ""},
-    {"fecha": "2026-01-15", "monto": 120, "metodo": "transferencia", "nota": ""}
+    {"fecha": <YYYY-MM-DD o null>, "monto": <numero leido>, "metodo": <metodo o "no especificado">, "nota": ""}
   ],
-  "descripcion": "resumen breve de qué es",
-  "tipo": "libreta_cobros",
+  "descripcion": <resumen breve de que es>,
+  "tipo": <"libreta_cobros" | "factura_compra" | "transferencia" | "otro">,
   "tienda": null,
   "ciudad": null,
   "articulos": []
 }
 
+NUNCA copies valores de ejemplo: cada nombre, fecha y monto tiene que estar escrito en la foto.
+Si un monto no se lee claro, NO lo pongas en "pagos" (mejor vacio que inventado).
+
 Si es una FACTURA o TICKET DE COMPRA con productos (supermercado, farmacia, ferretería...):
   "tipo": "factura_compra",
-  "tienda": "Supermaxi",
-  "ciudad": "Quito",
-  "fecha": "2026-10-04",
-  "fecha_texto": "04/10/2026",
+  "tienda": <nombre impreso de la tienda>,
+  "ciudad": <ciudad impresa o null>,
+  "fecha": <YYYY-MM-DD o null>,
+  "fecha_texto": <fecha tal cual impresa o null>,
   "articulos": [
-    {"producto": "Arroz blanco", "producto_norm": "arroz blanco", "marca": "Balu", "medida": "2kg", "cantidad": 1, "precio": 3.50, "categoria": "granos"}
+    {"producto": <texto>, "producto_norm": <texto>, "marca": <texto o "">, "medida": <texto o "">, "cantidad": <numero>, "precio": <numero o null>, "categoria": <texto>}
   ]
 y en "pagos" pon el TOTAL de la factura como un solo pago, con la fecha de la factura.
 
@@ -48,10 +51,13 @@ junto a palabras como "Fecha", "Date", "Fecha de emisión", "Emitido", "Hora", "
 
 Si es una TRANSFERENCIA, deposito o comprobante de pago (captura de la app del banco, Zelle, Venmo, recibo de pago a una persona):
   "tipo": "transferencia",
-  "concepto": "el concepto, motivo, descripcion o memo TAL CUAL aparece (ej: Sueldo mensual)",
+  "concepto": "el concepto, motivo, descripcion o memo TAL CUAL aparece, o null",
   "beneficiario": "a quien se le envio el dinero",
   "ordenante": "quien envio el dinero",
-  "direccion": "enviada" si el dueño del celular mando el dinero, "recibida" si lo recibio, null si no se sabe,
+  "direccion": "recibida" si el dinero ENTRO a la cuenta del dueño del celular (palabras como "Recibiste",
+     "Te enviaron", "Te transfirieron", "Depósito recibido", "Abono a tu cuenta", "Crédito", monto con "+");
+     "enviada" si SALIO (palabras como "Enviaste", "Transferiste", "Pagaste", "Pago realizado", "Débito",
+     monto con "-"); null si la imagen no lo dice. No lo adivines por el nombre de las personas,
   "banco": "banco o app",
   "referencia": "numero de comprobante si aparece",
 y en "pagos" pon el monto como un solo pago con la fecha de la transferencia. No inventes el concepto: si no aparece, null.

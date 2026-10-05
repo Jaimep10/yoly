@@ -80,11 +80,10 @@ def test_publicar_pdf_rechaza_un_temporal_vacio(tmp_path):
     assert not temporal.exists()
 
 
-def test_download_informe_gastos_entrega_pdf():
-    main.generar_informe_gastos()
-    r = main.app.test_client().get("/download/informe_gastos.pdf")
-    assert r.status_code == 200 and r.data.startswith(b"%PDF-")
-    assert int(r.headers["Content-Length"]) == len(r.data) == os.path.getsize("/tmp/informe_gastos.pdf")
+def test_ya_no_existe_el_informe_de_gastos_de_ejemplo():
+    # Era un PDF con datos inventados (Alimentos $150, Transporte $80...) igual para todos los usuarios
+    assert not hasattr(main, "generar_informe_gastos")
+    assert main.app.test_client().get("/download/informe_gastos.pdf").status_code == 404
 
 
 def test_download_informe_metas_entrega_pdf():

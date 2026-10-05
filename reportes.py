@@ -212,12 +212,32 @@ def clasificar_transferencia(concepto, direccion=None, texto_usuario=''):
     Decide carpeta y si es ingreso o gasto.
     Lo que escribe el usuario junto a la foto manda sobre el concepto del banco.
     Recibida sin pista -> 'ingreso'. Enviada sin pista -> 'por_revisar' (no adivinamos).
+    Si no se sabe si entró o salió (ni la foto ni el usuario lo dicen) -> 'por_revisar' con
+    direccion_desconocida=True: no cuenta ni como ingreso ni como gasto hasta que el usuario diga.
     """
     carpeta = clasificar_concepto(texto_usuario) or clasificar_concepto(concepto)
-    recibida = (direccion or '').lower().startswith('recib')
+    direccion = direccion_por_texto(texto_usuario) or str(direccion or '').lower()
+    recibida = direccion.startswith('recib')
+    if not direccion.startswith(('recib', 'envi')):
+        return {"carpeta": CARPETA_REVISAR, "movimiento": 'gasto', "direccion_desconocida": True}
     if not carpeta:
         carpeta = CARPETA_INGRESO if recibida else CARPETA_REVISAR
-    return {"carpeta": carpeta, "movimiento": 'ingreso' if recibida else 'gasto'}
+    return {"carpeta": carpeta, "movimiento": 'ingreso' if recibida else 'gasto', "direccion_desconocida": False}
+
+
+_RE_ENTRA = re.compile(r'\b(recibi|recibido|recibida|me pagaron|me pago|me depositaron|me deposito|me transfirieron|'
+                       r'me transfirio|me enviaron|me envio|me mandaron|me mando|cobre|cobrado|vendi|venta|ventas|'
+                       r'ingreso|ingresos|entrada|gane|abonaron)\b')
+_RE_SALE = re.compile(r'\b(pague|pagado|gaste|compre|envie|mande|transferi|deposite|egreso|salida|gasto|gastos|compra)\b')
+
+
+def direccion_por_texto(texto):
+    """'recibida' / 'enviada' según lo que escribió el usuario; '' si no lo dice o dice las dos cosas."""
+    t = _normalizar(texto)
+    entra, sale = bool(_RE_ENTRA.search(t)), bool(_RE_SALE.search(t))
+    if entra == sale:
+        return ''
+    return 'recibida' if entra else 'enviada'
 
 
 def ruta_carpeta(data_dir, telefono, carpeta, cuenta="principal"):
@@ -317,6 +337,8 @@ def mover_transaccion(data_dir, telefono, nueva_carpeta, cuenta="principal"):
     _escribir(origen, [x for x in _leer(origen) if x.get('id') != t.get('id')])
     if nueva_carpeta == CARPETA_INGRESO:
         t['movimiento'] = 'ingreso'
+    # El usuario ya dijo qué es: deja de estar en duda
+    t['direccion_desconocida'] = False
     destino = os.path.join(base, nueva_carpeta, 'transacciones.json')
     _escribir(destino, _leer(destino) + [dict(t, carpeta=nueva_carpeta, revisar=False)])
 
@@ -329,7 +351,8 @@ def mover_transaccion(data_dir, telefono, nueva_carpeta, cuenta="principal"):
             if not movido:
                 continue
             restantes = [x for x in lista if x.get('id') != t.get('id')]
-            movido = dict(movido, categoria=nueva_carpeta, movimiento=t.get('movimiento'), revisar=False)
+            movido = dict(movido, categoria=nueva_carpeta, movimiento=t.get('movimiento'), revisar=False,
+                          direccion_desconocida=False)
             nombre_destino = 'ingresos.json' if t.get('movimiento') == 'ingreso' else 'gastos.json'
             if nombre_destino == nombre:
                 _escribir(archivo, restantes + [movido])
@@ -360,6 +383,88 @@ def pedido_mover(texto):
     if palabra.startswith('servicio'):
         return 'servicios'
     return clasificar_concepto(palabra)
+
+
+# ==================== MOVIMIENTO ESCRITO ("me pagaron 300", "gasté 45.50 en comida") ====================
+
+# Solo verbos en pasado: "gano 1200 al mes" es un presupuesto, no un movimiento de hoy.
+_RE_VERBO_ENTRA = re.compile(r'\b(recibi|me pagaron|me pago|me depositaron|me deposito|me transfirieron|me transfirio|'
+                             r'me enviaron|me envio|me mandaron|me mando|cobre|vendi|gane|me entraron|entraron)\b')
+_RE_VERBO_SALE = re.compile(r'\b(pague|gaste|compre|envie|mande|transferi|deposite)\b')
+_RE_FECHA_NUM = re.compile(r'\b\d{1,2}[/-]\d{1,2}(?:[/-]\d{2,4})?\b')
+_RE_FECHA_MES = re.compile(r'\b(\d{1,2})\s+de\s+' + _MES_RE + r'(?:\s+(?:de|del)\s+(\d{4}))?')
+_RE_MONTO = re.compile(r'(\d{1,3}(?:[.,]\d{3})+(?:[.,]\d{1,2})?|\d+(?:[.,]\d{1,2})?)')
+
+
+def _monto_texto(numero):
+    """'1.200' -> 1200, '1,200.50' -> 1200.5, '45,50' -> 45.5, '45.50' -> 45.5"""
+    partes = re.split(r'[.,]', numero)
+    if len(partes) > 1 and len(partes[-1]) in (1, 2):
+        return float(''.join(partes[:-1]) + '.' + partes[-1])
+    return float(''.join(partes))
+
+
+def menciona_movimiento(texto):
+    """True si el mensaje dice que entró o salió plata ("pagué...", "me pagaron..."), aunque no esté claro cuánto."""
+    t = _normalizar(texto)
+    return bool(_RE_VERBO_ENTRA.search(t) or _RE_VERBO_SALE.search(t))
+
+
+def movimiento_de_texto(texto, hoy=None):
+    """
+    Un ingreso o un gasto escrito en una sola frase, sin IA:
+    "me pagaron 300 por una venta" -> {"tipo": "ingreso", "monto": 300.0, ...}
+    "gasté 45.50 en comida ayer"   -> {"tipo": "gasto", "monto": 45.5, ...}
+    Devuelve None si no está claro (sin verbo, verbos de entrada y salida juntos, ningún monto o
+    varios montos distintos): en ese caso no se guarda nada en vez de adivinar.
+    """
+    t = _normalizar(texto)
+    entra, sale = bool(_RE_VERBO_ENTRA.search(t)), bool(_RE_VERBO_SALE.search(t))
+    if entra == sale:
+        return None
+    hoy = hoy or hoy_fecha()
+
+    fecha = hoy
+    m = _RE_FECHA_MES.search(t)
+    if m:
+        anio = int(m.group(3)) if m.group(3) else hoy.year
+        try:
+            fecha = date(anio, MESES[m.group(2)], int(m.group(1)))
+        except ValueError:
+            return None
+        t_sin_fecha = t[:m.start()] + ' ' + t[m.end():]
+    else:
+        t_sin_fecha = t
+        f = _RE_FECHA_NUM.search(t)
+        if f:
+            partes = [int(x) for x in re.split(r'[/-]', f.group(0))]
+            anio = partes[2] if len(partes) == 3 else hoy.year
+            anio = anio + 2000 if anio < 100 else anio
+            try:
+                fecha = date(anio, partes[1], partes[0])
+            except ValueError:
+                return None
+            t_sin_fecha = t[:f.start()] + ' ' + t[f.end():]
+        elif re.search(r'\bayer\b', t):
+            fecha = hoy - timedelta(days=1)
+        elif re.search(r'\banteayer\b', t):
+            fecha = hoy - timedelta(days=2)
+
+    montos = {_monto_texto(n) for n in _RE_MONTO.findall(t_sin_fecha)}
+    montos.discard(0.0)
+    if len(montos) != 1:
+        return None
+    monto = montos.pop()
+
+    tipo = 'ingreso' if entra else 'gasto'
+    categoria = clasificar_concepto(t)
+    if not categoria:
+        if tipo == 'ingreso':
+            categoria = 'ventas' if re.search(r'\b(vendi|venta|ventas)\b', t) else CARPETA_INGRESO
+        else:
+            categoria = 'otro'
+    return {"tipo": tipo, "monto": round(monto, 2), "fecha": fecha.isoformat(), "categoria": categoria,
+            "descripcion": re.sub(r'\s+', ' ', str(texto)).strip()[:80]}
 
 
 # ==================== RESUMEN DEL PERÍODO ====================
@@ -413,7 +518,8 @@ def movimientos_periodo(gastos, ingresos, inicio, fin):
                 movs.append({"fecha": f, "tipo": "gasto", "categoria": "reserva", "descripcion": desc,
                              "monto": reserva, "revisar": False})
             continue
-        movs.append({"fecha": f, "tipo": "gasto", "categoria": (g.get('categoria') or 'otro').lower(),
+        movs.append({"fecha": f, "tipo": "por_revisar" if g.get('direccion_desconocida') else "gasto",
+                     "categoria": (g.get('categoria') or 'otro').lower(),
                      "descripcion": desc, "monto": _a_numero(g.get('monto')), "revisar": bool(g.get('revisar')),
                      "aproximada": bool(g.get('fecha_aproximada'))})
     for i in ingresos:
@@ -444,7 +550,7 @@ def resumir(movs):
         return sorted(((c, round(v, 2)) for c, v in acc.items()), key=lambda x: -x[1])
 
     semanas = {}
-    for m in movs:
+    for m in gastos + ingresos:
         lunes = m['fecha'] - timedelta(days=m['fecha'].weekday())
         s = semanas.setdefault(lunes, {"lunes": lunes, "domingo": lunes + timedelta(days=6), "ingresos": 0.0, "gastos": 0.0})
         s['ingresos' if m['tipo'] == 'ingreso' else 'gastos'] += m['monto']
@@ -455,6 +561,9 @@ def resumir(movs):
         "gastos_por_categoria": por_cat(gastos), "ingresos_por_categoria": por_cat(ingresos),
         "semanas": semanas, "movimientos": movs, "num_gastos": len(gastos), "num_ingresos": len(ingresos),
         "por_revisar": sum(1 for m in movs if m.get('revisar') or m['categoria'] == CARPETA_REVISAR),
+        # Sin saber si entró o salió: fuera de los totales hasta que el usuario lo diga
+        "sin_direccion": len([m for m in movs if m['tipo'] == 'por_revisar']),
+        "monto_sin_direccion": round(sum(m['monto'] for m in movs if m['tipo'] == 'por_revisar'), 2),
     }
 
 
@@ -499,6 +608,9 @@ def texto_resumen(resumen, periodo, sin_fecha=0):
     lineas.append(f"{resumen['num_gastos']} gastos y {resumen['num_ingresos']} ingresos en el período.")
     if resumen['por_revisar']:
         lineas.append(f"❓ {resumen['por_revisar']} sin clasificar (marcados para revisar).")
+    if resumen.get('sin_direccion'):
+        lineas.append(f"❓ {resumen['sin_direccion']} movimiento(s) por {dinero(resumen['monto_sin_direccion'])} "
+                      "no entraron en los totales: no sé si fueron ingreso o gasto.")
     if sin_fecha:
         lineas.append(f"⚠️ {sin_fecha} registros sin fecha no entraron.")
     return "\n".join(lineas)
