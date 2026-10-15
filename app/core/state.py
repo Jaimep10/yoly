@@ -2,10 +2,14 @@
 import os
 import json
 import logging
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+import almacen
 
 logger = logging.getLogger(__name__)
 
-DATA_DIR = os.getenv('DATA_DIR', '/home/claude/yoly/data')
+DATA_DIR = almacen.elegir_data_dir()
 
 
 def obtener_ruta_datos(telefono, cuenta="principal"):

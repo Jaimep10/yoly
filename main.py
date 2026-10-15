@@ -28,7 +28,9 @@ from groq import Groq
 import zipfile
 import html
 from urllib.parse import quote_plus
+import almacen
 import precios
+import registro_texto
 import reportes
 from agents import reporter as agent_reporter
 from orchestrator import Contexto, OrquestadorYoly  # el jefe de los 4 agentes
@@ -78,6 +80,18 @@ def escribir_json(archivo, datos, **opciones):
         with open(temporal, 'w', encoding='utf-8') as f:
             json.dump(datos, f, **opciones)
         os.replace(temporal, archivo)
+
+# Carpeta de datos: variable DATA_DIR, o el disco de Render en /var/data, o ./data (ver almacen.py).
+# Antes estaba fija en /home/claude/yoly/data: en Render eso es disco temporal y se borraba todo.
+DATA_DIR = almacen.elegir_data_dir()
+ESTADO_ALMACEN = almacen.revisar(DATA_DIR)
+if not ESTADO_ALMACEN["escribible"]:
+    logger.error(f"[STORAGE] No puedo escribir en {DATA_DIR}: {ESTADO_ALMACEN['error']}. NO se guardará nada.")
+elif not ESTADO_ALMACEN["persistente"]:
+    logger.warning(f"[STORAGE] {DATA_DIR} NO es un disco persistente: los datos se borran en cada deploy o "
+                   "reinicio de Render. Agrega un Disk en Render montado en /var/data.")
+else:
+    logger.info(f"[STORAGE] Datos guardados en {DATA_DIR} (persistente)")
 
 # ==================== ENVIRONMENT VALIDATION ====================
 
@@ -207,7 +221,6 @@ else:
 print("[STARTUP] Yoly Bot initialization complete")
 
 GOALS_FILE = 'goals.json'
-FINANCIAL_CONTEXT_FILE = 'financial_context.json'
 
 # ==================== TEMPORARY EXPENSES FOR CONFIRMATION FLOW ====================
 # Global dict to store expenses temporarily until user confirms with SI/NO
@@ -234,7 +247,7 @@ def cargar_memoria(phone_clean="", cuenta="principal"):
         memoria_archivo = f'{ruta}/memoria_{phone_clean}_{cuenta}.json'
     else:
         # Old global memory (for backward compatibility)
-        memoria_archivo = '/app/data/memoria_global.json'
+        memoria_archivo = f'{DATA_DIR}/memoria_global.json'
 
     if os.path.exists(memoria_archivo):
         try:
@@ -252,7 +265,7 @@ def guardar_memoria(memoria, phone_clean="", cuenta="principal"):
         memoria_archivo = f'{ruta}/memoria_{phone_clean}_{cuenta}.json'
     else:
         # Old global memory (for backward compatibility)
-        memoria_archivo = '/app/data/memoria_global.json'
+        memoria_archivo = f'{DATA_DIR}/memoria_global.json'
 
     try:
         os.makedirs(os.path.dirname(memoria_archivo), exist_ok=True)
@@ -266,8 +279,12 @@ memoria_usuarios = cargar_memoria()
 
 # ==================== FINANCIAL CONTEXT PERSISTENCE ====================
 
+def ruta_contexto_financiero():
+    return f'{DATA_DIR}/financial_context.json'
+
 def cargar_contexto_financiero():
     """Carga el contexto financiero acumulado"""
+    FINANCIAL_CONTEXT_FILE = ruta_contexto_financiero()
     if os.path.exists(FINANCIAL_CONTEXT_FILE):
         try:
             with open(FINANCIAL_CONTEXT_FILE, 'r', encoding='utf-8') as f:
@@ -280,8 +297,8 @@ def cargar_contexto_financiero():
 def guardar_contexto_financiero(contexto):
     """Guarda el contexto financiero acumulado"""
     try:
-        with open(FINANCIAL_CONTEXT_FILE, 'w', encoding='utf-8') as f:
-            json.dump(contexto, f, ensure_ascii=False, indent=2)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        escribir_json(ruta_contexto_financiero(), contexto, ensure_ascii=False, indent=2)
         return True
     except Exception as e:
         print(f"Error guardando contexto financiero: {e}")
@@ -289,7 +306,6 @@ def guardar_contexto_financiero(contexto):
 
 # ==================== SMART FILING SYSTEM WITH CLAUDE VISION ====================
 
-DATA_DIR = '/home/claude/yoly/data'
 
 def obtener_ruta_datos(telefono, cuenta="principal"):
     """Obtiene la ruta de la carpeta de datos del usuario (por defecto cuenta 'principal')"""
@@ -781,7 +797,8 @@ BADGE_APROXIMADA = ('<span title="No se vio la fecha impresa en la factura" styl
                     'font-size:12px;white-space:nowrap">📅 Fecha aproximada</span>')
 
 NOMBRES_CARPETA = {"sueldo": "Sueldos", "renta": "Renta", "deuda": "Deudas", "servicios": "Servicios",
-                   "ingreso": "Ingresos", "compras": "Compras", "por_revisar": "Por revisar"}
+                   "ingreso": "Ingresos", "compras": "Compras", "gastos_generales": "Gastos generales",
+                   "por_revisar": "Por revisar"}
 
 
 def guardar_transferencia(telefono, vision_response, pagos, monto, ruta_archivo, texto_usuario="", cuenta="principal"):
@@ -870,6 +887,85 @@ def mover_transferencia(telefono, carpeta, server_url, cuenta="principal"):
     return (f"Listo ✅ Moví la transferencia de ${t.get('monto', 0):,.2f} ({t.get('descripcion', '')}) "
             f"de *{NOMBRES_CARPETA.get(anterior, anterior)}* a *{NOMBRES_CARPETA[carpeta]}*.\n\n"
             f"📁 Tus carpetas: {server_url}/dashboard/{phone_clean}/carpetas")
+
+
+# ==================== PAGOS ESCRITOS POR TEXTO ("pagué 50 de luz") ====================
+
+def _es_del_cobro(cobro, rubro):
+    """El rubro nombra a la persona de la deuda guardada ("deuda de Alan" y cobro de Alan)."""
+    if not cobro:
+        return False
+    cliente = registro_texto.clave_rubro(cobro.get('cliente') or '').split()
+    return bool(cliente) and cliente != ['cliente'] and all(p in rubro.split() for p in cliente)
+
+
+def _texto_cobro(cobro):
+    return (f"💳 Deuda con {cobro['cliente']}: {reportes.dinero(cobro['deuda'])}\n"
+            f"Pagado ({len(cobro['pagos'])} pagos): {reportes.dinero(cobro['pagado'])}\n"
+            f"Te falta: {reportes.dinero(cobro['saldo'])}")
+
+
+def _cambiar_pagos_cobro(phone_clean, cuenta, cambiar):
+    """Lee el cobro guardado, le aplica cambiar(pagos) y lo vuelve a guardar. Devuelve el cobro nuevo o None."""
+    cobro = obtener_cobro(phone_clean, cuenta)
+    if not cobro:
+        return None
+    datos = {"tipo": "cobro_deuda", "cliente": cobro['cliente'], "deuda": cobro['deuda'],
+             "pagos": cambiar(list(cobro['pagos'])), "fecha": cobro.get('fecha', '')}
+    guardar_cobro(phone_clean, datos, cuenta)
+    return armar_cobro(datos)
+
+
+def atender_registro_texto(incoming_msg, from_number, server_url, cuenta="principal"):
+    """
+    "pagué 50 de luz" / "recibí 500 de sueldo" -> guarda en su carpeta y dice cuánto lleva en ese rubro.
+    "¿cuánto he pagado de luz?" -> total y lista. "mis carpetas" -> ingresos vs egresos por rubro.
+    "borrar último" -> deshace el último pago escrito. Devuelve el texto de respuesta o None.
+    """
+    phone_clean = normalizar_telefono(from_number)
+
+    if registro_texto.pide_deshacer(incoming_msg):
+        t = registro_texto.deshacer_ultimo(DATA_DIR, phone_clean, cuenta)
+        if not t:
+            return "No encuentro ningún pago que me hayas escrito para borrar 🤔"
+        _cambiar_pagos_cobro(phone_clean, cuenta,
+                             lambda pagos: [p for p in pagos if p.get('nota') != f"texto:{t.get('id')}"])
+        return (f"🗑️ Listo, borré {reportes.dinero(reportes._a_numero(t.get('monto')))} de "
+                f"*{t.get('descripcion', '')}* ({registro_texto._fecha_corta(t.get('fecha'))}).")
+
+    if registro_texto.pide_carpetas(incoming_msg):
+        texto = registro_texto.texto_carpetas(registro_texto.movimientos_usuario(DATA_DIR, phone_clean, cuenta),
+                                              server_url, phone_clean)
+        cobro = obtener_cobro(phone_clean, cuenta)
+        return texto + ("\n\n" + _texto_cobro(cobro) if cobro else "")
+
+    pregunta = registro_texto.parsear_pregunta(incoming_msg)
+    if pregunta:
+        cobro = obtener_cobro(phone_clean, cuenta)
+        if pregunta['movimiento'] == 'gasto' and _es_del_cobro(cobro, pregunta['rubro']):
+            return _texto_cobro(cobro) + f"\n\n📊 Detalle: {server_url}/dashboard/{phone_clean}"
+        movs = registro_texto.buscar(DATA_DIR, phone_clean, pregunta, cuenta)
+        if not movs and cobro and 'deuda' in pregunta['rubro'].split():
+            return None  # lo contesta el balance de la deuda guardada
+        return registro_texto.texto_pregunta(movs, pregunta, server_url, phone_clean)
+
+    registro = registro_texto.parsear_registro(incoming_msg)
+    if not registro:
+        return None
+    t = registro_texto.guardar_registro(DATA_DIR, phone_clean, registro, escribir_json, cuenta)
+    logger.info(f"[{phone_clean}][{cuenta}] Registro por texto: {t['movimiento']} ${t['monto']} "
+                f"rubro={t['rubro']!r} carpeta={t['carpeta']}")
+    total, cantidad = registro_texto.total_rubro(DATA_DIR, phone_clean, t['rubro'], t['movimiento'], cuenta) \
+        if t['rubro'] else (t['monto'], 1)
+    texto = registro_texto.texto_registro(t, total, cantidad)
+
+    cobro = obtener_cobro(phone_clean, cuenta)
+    if t['movimiento'] == 'gasto' and _es_del_cobro(cobro, t['rubro']):
+        nuevo = _cambiar_pagos_cobro(phone_clean, cuenta, lambda pagos: pagos + [
+            {"fecha": t['fecha'], "monto": t['monto'], "metodo": t.get('metodo') or None, "nota": f"texto:{t['id']}"}])
+        if nuevo:
+            texto += "\n\n" + _texto_cobro(nuevo)
+    return texto
 
 
 # Palabras que piden un resumen; además el mensaje tiene que traer un período ("del 1 al 20 de junio")
@@ -2181,7 +2277,8 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "Yoly Bot",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "almacen": almacen.revisar(DATA_DIR),
     }), 200
 
 @app.route("/download/informe_gastos.pdf", methods=["GET"])
@@ -2970,6 +3067,15 @@ def dashboard_carpetas(phone, cuenta="principal"):
                               f'<div>{_e(NOMBRES_CARPETA.get(nombre, nombre))}</div><div class="total">{reportes.dinero(total)}</div>'
                               f'<div class="chico">{len(lista)} movimiento{"s" if len(lista) != 1 else ""}</div></a>')
             partes.append('</div>')
+            # Cuánto va pagado por rubro o deuda (luz, deuda de Alan...) y cuánto entró por rubro
+            rubros = registro_texto.resumen_rubros(registro_texto.movimientos_usuario(DATA_DIR, phone_clean, cuenta))
+            for mov, titulo in (('gasto', '📤 Pagado por rubro / deuda'), ('ingreso', '💰 Ingresos por rubro')):
+                filas = sorted((v for (m, _), v in rubros.items() if m == mov), key=lambda v: -v['total'])
+                if filas:
+                    partes.append(f"<h2>{titulo}</h2><div class='tabla'><table><tr><th>Rubro</th><th>Movimientos</th><th>Total</th></tr>")
+                    partes += [f"<tr><td>{_e(v['nombre'])}</td><td>{v['cantidad']}</td>"
+                               f"<td class='price'>{reportes.dinero(round(v['total'], 2))}</td></tr>" for v in filas]
+                    partes.append("</table></div>")
             mostrar = [elegida] if elegida in carpetas else [c for c in reportes.TODAS_CARPETAS if c in carpetas]
             for nombre in mostrar:
                 partes.append(f"<h2>{reportes.EMOJI_CARPETA.get(nombre, '📁')} {_e(NOMBRES_CARPETA.get(nombre, nombre))}</h2>"
@@ -3639,12 +3745,21 @@ def obtener_ultima_pregunta(phone_clean, cuenta="principal"):
                     return pregunta
     return ''
 
-def limpiar_ultima_pregunta(phone_clean):
+def limpiar_ultima_pregunta(phone_clean, cuenta="principal"):
+    """Borra la pregunta pendiente en la memoria global Y en la de la cuenta (ahí la guarda guardar_cobro)."""
     ultimos10 = phone_clean[-10:]
     for clave, datos in memoria_usuarios.items():
         if normalizar_telefono(clave)[-10:] == ultimos10 and isinstance(datos, dict):
             datos['ultima_pregunta'] = ''
     guardar_memoria(memoria_usuarios)
+    memoria_cuenta = cargar_memoria(phone_clean, cuenta)
+    cambio = False
+    for clave, datos in memoria_cuenta.items():
+        if normalizar_telefono(clave)[-10:] == ultimos10 and isinstance(datos, dict) and datos.get('ultima_pregunta'):
+            datos['ultima_pregunta'] = ''
+            cambio = True
+    if cambio:
+        guardar_memoria(memoria_cuenta, phone_clean, cuenta)
 
 def tiene_datos(phone_clean):
     try:
@@ -3682,6 +3797,14 @@ def procesar_mensaje(incoming_msg, from_number, server_url, resp):
     temp_key = _make_temp_key(phone_clean, cuenta)  # Llave para aislar temp data
 
     try:
+        # ==================== PAGOS / INGRESOS ESCRITOS Y SUS CARPETAS ====================
+        # "pagué 50 de luz", "recibí 500 de sueldo", "¿cuánto he pagado de luz?", "mis carpetas", "borrar último".
+        # Va primero: antes "pagué" caía en las metas y "deuda" en el balance, y no se guardaba nada.
+        texto_registro = atender_registro_texto(incoming_msg, from_number, server_url, cuenta)
+        if texto_registro:
+            responder(resp, texto_registro)
+            return
+
         # ==================== RESUMEN POR PERÍODO ====================
         # "resumen del 1 al 20 de junio", "gastos de junio", "balance de septiembre", "informe de gastos"
         # Va antes del balance para que "balance de septiembre" no se quede en la deuda.

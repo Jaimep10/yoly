@@ -191,9 +191,10 @@ CARPETAS = [
 CARPETA_INGRESO = 'ingreso'
 CARPETA_REVISAR = 'por_revisar'
 CARPETA_COMPRAS = 'compras'
-TODAS_CARPETAS = [c for c, _ in CARPETAS] + [CARPETA_INGRESO, CARPETA_COMPRAS, CARPETA_REVISAR]
+CARPETA_GENERAL = 'gastos_generales'  # pagos escritos por texto que no son sueldo, renta, deuda ni servicios
+TODAS_CARPETAS = [c for c, _ in CARPETAS] + [CARPETA_INGRESO, CARPETA_COMPRAS, CARPETA_GENERAL, CARPETA_REVISAR]
 EMOJI_CARPETA = {'sueldo': '👷', 'renta': '🏠', 'deuda': '💳', 'servicios': '💡', 'ingreso': '💰',
-                 'compras': '🛒', 'por_revisar': '❓'}
+                 'compras': '🛒', 'gastos_generales': '🧾', 'por_revisar': '❓'}
 
 
 def clasificar_concepto(texto):

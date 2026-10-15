@@ -1,6 +1,7 @@
 """Guide bot for Yoly - menu generation and command parsing."""
 import sys
-sys.path.insert(0, '/home/claude/yoly')
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from agents.guide import Guía as GuiaAgent
 
